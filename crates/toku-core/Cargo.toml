@@ -1,0 +1,14 @@
+[package]
+name = "toku-core"
+description = "Domain models, traits, and state machine for Toku book manager"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true

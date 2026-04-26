@@ -1,0 +1,17 @@
+[package]
+name = "toku-meta"
+description = "Book metadata fetching from Open Library and Google Books for Toku"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+toku-core = { path = "../toku-core", version = "0.1.0" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+sha2 = "0.10"

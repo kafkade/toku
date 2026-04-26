@@ -18,5 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Contributing guide with importer contribution instructions
 - GitHub issue templates for bug reports and feature requests
 - PR template with data integrity checklist
+- Cargo workspace with `toku-core`, `toku-db`, and `toku-cli` crates
+- Book domain model: books, authors (with roles), series, reading status, and book format types
+- ISBN-10 and ISBN-13 validation with check digit verification and bidirectional conversion
+- SQLite database with FTS5 full-text search, auto-synced via triggers
+- Book persistence: create, list, search, delete books; manage authors and ISBNs
+- `toku --version` CLI entry point
 
 [Unreleased]: https://github.com/kafkade/toku/compare/v0.1.0...HEAD

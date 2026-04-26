@@ -24,7 +24,7 @@ well-documented. It is a first-class product, not a debug tool.
 
 ## Command Hierarchy
 
-```
+```sh
 toku add [--isbn <isbn> | --title <title> --author <author>]
 toku show <book>
 toku list [--status <status>] [--shelf <shelf>] [--sort <field>]

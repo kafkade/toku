@@ -104,7 +104,7 @@
 
 ### 2.1 — Layered Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
 │                  Frontend Adapters               │
 │  ┌─────┐  ┌─────┐  ┌──────┐  ┌──────┐  ┌─────┐│
@@ -127,6 +127,7 @@
 ```
 
 **Domain core layer** — Pure Rust, no I/O dependencies. Compiles to native, WASM, and C FFI. Contains:
+
 - Book/Author/Series models with validation
 - Reading state machine (WantToRead → Reading → Read | Abandoned | OnHold)
 - Statistics computation engine (all calculations are pure functions over data)
@@ -134,18 +135,21 @@
 - Import/export trait definitions (not implementations)
 
 **Data layer** — SQLite via `rusqlite`. Compiles to native (WASM via `sql.js` in future).
+
 - Schema management with `refinery` for migrations
 - FTS5 full-text search index
 - Import implementations (Goodreads CSV, Calibre DB)
 - Cover image filesystem management
 
 **Metadata enrichment layer** — Network-dependent, always optional.
+
 - Open Library and Google Books API clients
 - Cover image downloading
 - Rate limiting + response caching
 - Merge logic: fill empty fields only; never overwrite user edits
 
 **Frontend adapters** — Each is a separate crate/binary:
+
 - `toku-cli`: Primary interface (Phase 0+)
 - `toku-web`: Axum server + HTMX or Leptos frontend (Phase 4)
 - `toku-ffi`: C FFI bindings for Swift/Kotlin (Phase 5)
@@ -156,7 +160,7 @@
 
 The crate count is small enough (4–6 crates) that the overhead is minimal, and the boundaries enforce the layered architecture. A monolith-first approach risks coupling the CLI to the core in ways that are painful to untangle when the web UI arrives.
 
-```
+```sh
 kafkade/toku/
 ├── Cargo.toml              # Workspace root
 ├── crates/
@@ -219,7 +223,7 @@ a supported workflow for power users who want multi-device today.
 
 **Architecture**: Changeset-based sync over a thin REST API.
 
-```
+```text
 ┌──────────┐    ┌──────────┐    ┌──────────┐
 │ CLI      │    │ iOS App  │    │ Web App  │
 │ (local   │    │ (local   │    │(connected│
@@ -304,36 +308,32 @@ exchange). Instead:
 - The user sets a sync passphrase during setup: `toku sync init --passphrase`.
 - A key is derived from the passphrase using **Argon2id** (memory-hard KDF).
 - All ops are encrypted client-side with **AES-256-GCM** before upload.
-- The server stores only opaque encrypted blobs + unencrypted metadata (op ID,
-  device ID, timestamp, entity type — not entity content).
+- The server stores only opaque encrypted blobs + unencrypted metadata (op ID, device ID, timestamp, entity type — not entity content).
 - The server **cannot** read book titles, ratings, notes, or any content.
 
 **What the server CAN see** (metadata leakage — accepted trade-off):
+
 - How many books are in the library (op count)
 - When sync happens (timestamps)
 - Which devices sync (device IDs)
 - Entity types being synced (book, session, shelf — but not content)
 
 **What the server CANNOT see**:
+
 - Book titles, authors, ISBNs
 - Ratings, reviews, notes
 - Reading progress
 - Shelf names, tag names
 - Any content field
 
-**This is NOT zero-knowledge** — the server knows *that* you have books, but not
-*which* books. For a personal book manager, this is a reasonable trade-off. Users who
-want stronger privacy can self-host the server.
+**This is NOT zero-knowledge** — the server knows *that* you have books, but not *which* books. For a personal book manager, this is a reasonable trade-off. Users who want stronger privacy can self-host the server.
 
 **Key lifecycle** (kept simple):
+
 - **Setup**: User picks a passphrase → Argon2id → encryption key stored in OS keychain.
-- **New device**: User enters their passphrase on the new device. No key exchange
-  protocol — the passphrase IS the shared secret.
-- **Passphrase change**: Client pulls all ops, re-encrypts with new key, pushes a
-  re-encrypted snapshot. Old ops are purged.
-- **Forgotten passphrase**: **Data on the server is unrecoverable.** The local SQLite
-  on any device is the recovery path. This is documented clearly: "Your passphrase is
-  your key. We cannot recover it."
+- **New device**: User enters their passphrase on the new device. No key exchange protocol — the passphrase IS the shared secret.
+- **Passphrase change**: Client pulls all ops, re-encrypts with new key, pushes a re-encrypted snapshot. Old ops are purged.
+- **Forgotten passphrase**: **Data on the server is unrecoverable.** The local SQLite on any device is the recovery path. This is documented clearly: "Your passphrase is your key. We cannot recover it."
 - **No passphrase (opt-out)**: If the user skips encryption, ops are stored as plaintext
   JSON on the server. Self-hosters may prefer this for simplicity.
 
@@ -359,18 +359,15 @@ want stronger privacy can self-host the server.
   self-hosted path must work first.
 
 Rejected sync alternatives:
-- **cr-sqlite**: Elegant but experimental. iOS/WASM support is unproven. Kept as a
-  research branch — if it matures, it could replace the op-log approach for native
-  clients. Not the roadmap bet.
-- **File-based sync (iCloud/Dropbox)**: SQLite files + cloud sync = corruption risk.
-  Documented as a manual backup workflow, not a sync strategy.
+
+- **cr-sqlite**: Elegant but experimental. iOS/WASM support is unproven. Kept as a research branch — if it matures, it could replace the op-log approach for native clients. Not the roadmap bet.
+- **File-based sync (iCloud/Dropbox)**: SQLite files + cloud sync = corruption risk. Documented as a manual backup workflow, not a sync strategy.
 - **Turso/libSQL**: Adds a mandatory cloud dependency. Conflicts with local-first.
-- **Full zero-knowledge (Pildora model)**: Overkill for book data. 3x the engineering
-  effort for marginal privacy gain.
+- **Full zero-knowledge (Pildora model)**: Overkill for book data. 3x the engineering effort for marginal privacy gain.
 
 #### Sync protocol — technical summary
 
-```
+```sh
 POST /sync/push     — Client sends new ops (encrypted or plaintext)
 GET  /sync/pull     — Client receives ops since cursor
 GET  /sync/snapshot — Client downloads latest compacted snapshot
@@ -381,6 +378,7 @@ POST /sync/rekey    — Upload re-encrypted snapshot after passphrase change
 ```
 
 Each op:
+
 ```json
 {
   "op_id": "uuid-v7",
@@ -414,6 +412,7 @@ Each op:
 **Goodreads import detail** — This is the MVP killer feature. The Goodreads CSV export `[Validation Required]` typically contains these columns: Book Id, Title, Author, Author l-f, Additional Authors, ISBN, ISBN13, My Rating, Average Rating, Publisher, Binding, Number of Pages, Year Published, Original Publication Year, Date Read, Date Added, Bookshelves, Bookshelves with positions, Exclusive Shelf, My Review, Spoiler, Private Notes, Read Count, Owned Copies.
 
 **Mapping strategy**:
+
 - `Exclusive Shelf` → Reading status (read, currently-reading, to-read)
 - `Bookshelves` → User shelves/tags
 - `My Rating` → Rating (multiply by 2 for 0–10 scale)
@@ -444,7 +443,7 @@ Every importer implements the `ImportEngine` trait with these capabilities:
 
 **Recommendation**: ZIP archive containing JSON + cover images.
 
-```
+```text
 toku-backup-2025-07-14.zip
 ├── manifest.json          # Version, export date, book count
 ├── library.json           # Full data model as structured JSON
@@ -460,6 +459,7 @@ toku-backup-2025-07-14.zip
 - **Round-trip**: `toku export backup` → `toku import backup toku-backup.zip` = identical library.
 
 Rejected alternatives:
+
 - SQLite dump: portable but opaque — users can't inspect without SQLite tools.
 - JSON-only: doesn't include cover images.
 
@@ -478,6 +478,7 @@ Rejected alternatives:
 ### 3.3 — Book Metadata Sources
 
 **Primary: Open Library API** `[Validated]`
+
 - Free, no API key required, community-maintained.
 - REST API: `https://openlibrary.org/isbn/{isbn}.json`
 - Good coverage for popular titles. Gaps for non-English, self-published, and niche academic works.
@@ -485,6 +486,7 @@ Rejected alternatives:
 - Rate limits: generous (100 req/min stated, practically higher) `[Validation Required]`
 
 **Fallback: Google Books API** `[Validation Required]`
+
 - 1,000 requests/day free tier (no key), higher with API key.
 - Broader coverage than Open Library, especially for recent releases.
 - Terms of service: allows caching for offline use `[Validation Required]`
@@ -493,6 +495,7 @@ Rejected alternatives:
 **Merge strategy**: Query Open Library first. If no result or missing fields, query Google Books. User edits always take precedence. Empty fields filled from the highest-quality available source.
 
 Rejected alternatives:
+
 - ISBNdb: paid — violates $0 budget constraint.
 - WorldCat: Search API terms unclear for open-source use `[Validation Required]`.
 - BookBrainz: growing but sparse coverage.
@@ -532,7 +535,8 @@ Rejected alternatives:
 ### 3A.2 — Contributor Modeling
 
 **Data model** (MVP):
-```
+
+```sql
 contributors (id, name, sort_name, external_ids_json)
 book_contributors (book_id, contributor_id, role, position)
 ```
@@ -540,6 +544,7 @@ book_contributors (book_id, contributor_id, role, position)
 **Roles** (enum): `author`, `co_author`, `editor`, `translator`, `illustrator`, `narrator`, `foreword`, `compiler`, `contributor`.
 
 **Name handling**:
+
 - `name`: Display name ("Ursula K. Le Guin")
 - `sort_name`: Sort key ("Le Guin, Ursula K.")
 - Pseudonyms: stored as separate contributor entries linked via `alias_of` nullable FK.
@@ -592,6 +597,7 @@ metadata_provenance (
 ```
 
 **Rules**:
+
 1. User edits set `is_user_override = TRUE`. Auto-enrichment skips fields where `is_user_override = TRUE`.
 2. Re-import updates non-overridden fields with newer source data.
 3. `toku book provenance "Dune"` shows the source of every field.
@@ -787,7 +793,7 @@ File management lives in a new `toku-files` crate that depends on `toku-core` an
 
 ### Entity Relationship Diagram (Text)
 
-```
+```text
 works (1) ──── (M) books
 books (1) ──── (M) book_contributors ──── (M) contributors
 books (1) ──── (M) book_series ──── (M) series
@@ -1059,6 +1065,7 @@ toku enrich --isbn-only                    # fetch metadata for books with ISBNs
 ```
 
 **Output formatting**:
+
 - Default: rich terminal tables with color (via `tabled` or `comfy-table` crate)
 - `--format json`: machine-readable JSON output
 - `--format csv`: CSV output
@@ -1068,6 +1075,7 @@ toku enrich --isbn-only                    # fetch metadata for books with ISBNs
 **CLI framework**: `clap` v4 with derive macros. Auto-generates help, shell completions (bash/zsh/fish/PowerShell), and man pages.
 
 **Configuration**: TOML file at `{data_dir}/config.toml`:
+
 ```toml
 [display]
 default_format = "table"
@@ -1131,7 +1139,7 @@ default_status = "want_to_read"
 
 ### 10.3 — Differentiation Matrix
 
-```
+```text
                     High Data Ownership
                           │
               Toku ●      │
@@ -1147,6 +1155,7 @@ default_status = "want_to_read"
 ```
 
 **Why Toku wins now**:
+
 1. **Goodreads is rotting**: No API since 2020, UI unchanged for years, Amazon integration concerns growing.
 2. **Privacy wave**: Post-GDPR, readers increasingly care about data ownership.
 3. **CLI renaissance**: Tools like `ripgrep`, `fd`, `bat`, `jq` prove terminal-first tools find audiences.
@@ -1158,7 +1167,7 @@ default_status = "want_to_read"
 
 ### 11.1 — License Selection
 
-**Recommendation: MIT License**
+#### Recommendation: MIT License
 
 | License | Verdict | Reasoning |
 |---------|---------|-----------|
@@ -1183,6 +1192,7 @@ default_status = "want_to_read"
 This is a personal tool, not a SaaS. There is no natural paywall that doesn't betray the open-source philosophy. GitHub Sponsors is the lowest-friction option: no infrastructure, no premium features to maintain, no user segmentation.
 
 Rejected alternatives:
+
 - Premium features: What feature would be premium? Every core feature must be free (principles 1–3).
 - Hosted sync server: Possible post-1.0, but premature to plan.
 - Open Collective: viable alternative, but GitHub Sponsors has better discoverability.
@@ -1238,11 +1248,13 @@ Before committing to the architecture, validate:
 **Goal**: Add one book from the CLI, store it in SQLite, retrieve it. Validate the entire stack.
 
 **Deliverables** (3):
+
 1. Cargo workspace with `toku-core`, `toku-db`, `toku-cli` crates
 2. `toku add --isbn <isbn>` → fetch metadata from Open Library → store in SQLite
 3. `toku show <title>` and `toku list` → display book details
 
 **Acceptance criteria**:
+
 - `toku add --isbn 9780441013593` fetches "Dune" metadata and stores it
 - `toku show "Dune"` displays title, author, ISBN, page count, cover status
 - `toku list` displays a formatted table of all books
@@ -1260,6 +1272,7 @@ Before committing to the architecture, validate:
 **Goal**: Import a full Goodreads library, track reading status, search and organize.
 
 **Deliverables** (5):
+
 1. **Goodreads CSV import** with dry-run, dedup, field mapping report
 2. **Reading status management** (`toku start`, `toku finish`, `toku abandon`)
 3. **Shelves and tags** (`toku shelf create`, `toku tag add`)
@@ -1267,6 +1280,7 @@ Before committing to the architecture, validate:
 5. **Configuration file** + shell completions + `--format json` output
 
 **Acceptance criteria**:
+
 - Import 300 books from Goodreads CSV in <10 seconds, >95% field accuracy
 - `toku start "Dune"` → `toku finish "Dune" --rating 9` works end-to-end
 - `toku search "sci-fi"` returns relevant results in <100ms
@@ -1288,6 +1302,7 @@ Before committing to the architecture, validate:
 **Goal**: Page-by-page progress tracking, reading sessions (including re-reads), basic statistics, Calibre import, export.
 
 **Deliverables** (5):
+
 1. **Reading progress logging** (`toku update "Dune" --page 145`) with session tracking
 2. **Re-read support** with separate sessions and per-session ratings
 3. **Basic statistics** (`toku stats` — books read this year, reading pace, format breakdown)
@@ -1295,6 +1310,7 @@ Before committing to the architecture, validate:
 5. **Export** (CSV, JSON, canonical ZIP backup)
 
 **Acceptance criteria**:
+
 - `toku update "Dune" --page 145` logs progress with timestamp
 - `toku stats --year 2025` shows books read, pages read, average rating
 - Calibre import handles 1,000+ book library with covers
@@ -1312,6 +1328,7 @@ Before committing to the architecture, validate:
 **Goal**: Full statistics, mood/pace tags, goals, work grouping, smart shelves, StoryGraph import.
 
 **Deliverables** (5):
+
 1. **Full statistics engine** (genre distribution, rating histogram, reading streaks, mood trends, yearly wrap-up)
 2. **Mood tags, pace ratings, content warnings**
 3. **Work grouping** (link editions of the same book) + merge duplicates
@@ -1319,6 +1336,7 @@ Before committing to the architecture, validate:
 5. **StoryGraph import** `[Validation Required]`
 
 **Acceptance criteria**:
+
 - `toku stats --year 2024` produces a comprehensive report rivaling StoryGraph
 - Mood tags from StoryGraph import are preserved
 - Smart shelf "Unread sci-fi over 300 pages" auto-updates when new books match
@@ -1333,6 +1351,7 @@ Before committing to the architecture, validate:
 **Goal**: Web UI for library browsing, book management, statistics, and import.
 
 **Deliverables** (4):
+
 1. Axum web server serving the library as a web app
 2. Library grid/list view with search and filters
 3. Statistics dashboard with charts
@@ -1345,7 +1364,9 @@ Before committing to the architecture, validate:
 ### Phase 5: Native Apps 🔴
 
 **Theme**: "Toku on every device."
+
 **Deliverables** (3):
+
 1. iOS app (SwiftUI) with barcode scanning
 2. macOS app (SwiftUI)
 3. Windows app (Tauri v2 wrapping web UI)
@@ -1430,7 +1451,7 @@ Before committing to the architecture, validate:
 
 ## Section 15: Dependency Map
 
-```
+```text
 Phase 0: First Book
   ├── toku-core (models, traits)
   ├── toku-db (SQLite, migrations)
@@ -1495,6 +1516,7 @@ Phase 3: Analytics & Polish (1.0)
 ### 17.1 — Naming Criteria
 
 The name must satisfy:
+
 - ≤6 characters (ideal for CLI: `toku add "Dune"`)
 - Pronounceable, memorable, unique on GitHub and crates.io
 - Evokes reading, books, or personal knowledge
@@ -1534,6 +1556,7 @@ The name must satisfy:
 6. **International**: Non-English origin satisfies the developer's explicit request. Pronounceable in most languages (TOH-koo).
 
 **Runner-ups**:
+
 - **Lira** — beautiful, international, 4 chars. Risk: may collide with cryptocurrency "Lira" or music terms.
 - **Verso** — typographic elegance, 5 chars. Risk: niche reference, less immediately evocative of "reading."
 

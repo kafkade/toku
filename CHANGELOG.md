@@ -24,5 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SQLite database with FTS5 full-text search, auto-synced via triggers
 - Book persistence: create, list, search, delete books; manage authors and ISBNs
 - `toku --version` CLI entry point
+- Open Library metadata fetching: `toku add --isbn <isbn>` fetches title, author, pages, language, and cover image
+- Cover image downloading with content-addressed local storage (SHA-256)
+- `toku add --title <title> --author <author>` for manual book entry
+- `toku show <book>` with full detail view (title, author, status, pages, cover, description)
+- `toku list` with formatted table output, filterable by `--status`
+- `toku search <query>` with FTS5 full-text search
+- `--format table|json|csv` output modes for all list/search commands
+- Goodreads CSV import: `toku import goodreads <file>` with dry-run, idempotent re-import, ISBN cleaning, rating conversion, status mapping, and format detection
+- Import rollback: `toku import undo <import-id>` removes all books from a specific import
+- Import provenance tracking per field for future re-import safety
 
 [Unreleased]: https://github.com/kafkade/toku/compare/v0.1.0...HEAD

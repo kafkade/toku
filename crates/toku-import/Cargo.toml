@@ -1,0 +1,21 @@
+[package]
+name = "toku-import"
+description = "Import implementations for Toku: Goodreads CSV, Calibre, StoryGraph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+toku-core = { path = "../toku-core", version = "0.1.0" }
+toku-db = { path = "../toku-db", version = "0.1.0" }
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true
+rusqlite.workspace = true
+csv = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/toku-core",
     "crates/toku-db",
+    "crates/toku-meta",
+    "crates/toku-import",
     "crates/toku-cli",
 ]
 
@@ -20,3 +22,5 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 rusqlite = { version = "0.35", features = ["bundled", "column_decltype"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "macros"] }

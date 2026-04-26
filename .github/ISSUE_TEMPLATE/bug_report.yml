@@ -1,0 +1,76 @@
+name: Bug Report
+description: Report a bug in Toku
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the form below to help us investigate.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Crate / Component
+      description: Which part of Toku is affected?
+      options:
+        - CLI (toku-cli)
+        - Core library (toku-core)
+        - Database / search (toku-db)
+        - Import (toku-import)
+        - Metadata fetch (toku-meta)
+        - Export (toku-export)
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "Toku version or commit hash (`toku --version`)"
+      placeholder: "0.1.0 or abc1234"
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug. What did you observe?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce this behavior?
+      placeholder: |
+        1. Run `toku add --isbn 9780441013593`
+        2. Run `toku show "Dune"`
+        3. See error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste any relevant terminal output or error messages
+      render: shell
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any other information that might help (library size, import source, etc.)

@@ -1,0 +1,6 @@
+{
+  "config": {
+    "extends": ".github/.markdownlint.json"
+  },
+  "ignores": ["target/", "node_modules/", "pkg/"]
+}

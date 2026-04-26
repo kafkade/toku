@@ -1,0 +1,66 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please describe your idea below.
+
+        **Note:** Toku is a personal, offline-first tool with no social features.
+        Features that require a server for core functionality or add social
+        interactions (friends, feeds, shared reviews) are out of scope.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is this related to a problem?
+      description: A clear description of the problem this would solve
+      placeholder: "I'm frustrated when..."
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the feature
+      description: A clear description of what you'd like to happen
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe any alternatives you've considered
+  - type: dropdown
+    id: component
+    attributes:
+      label: Crate / Component
+      description: Which part of Toku would this affect?
+      options:
+        - CLI (toku-cli)
+        - Core library (toku-core)
+        - Database / search (toku-db)
+        - Import (toku-import) — new import source
+        - Metadata fetch (toku-meta)
+        - Export (toku-export) — new export format
+        - Documentation
+        - Not sure
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Which roadmap phase does this relate to?
+      description: See ROADMAP.md for phase details
+      options:
+        - "Phase 0: First Book"
+        - "Phase 1: MVP"
+        - "Phase 2: Reading Tracker"
+        - "Phase 3: Analytics & Polish (1.0)"
+        - "Phase 4: Web Interface"
+        - "Phase 5: Native Apps"
+        - "Phase 6: File Management"
+        - "Phase 7: Sync"
+        - "Phase 8: Moonshots"
+        - "Not sure"
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Any other information, mockups, or screenshots

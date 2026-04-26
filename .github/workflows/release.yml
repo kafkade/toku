@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (for cross-compilation)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p toku-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p toku-cli
+          fi
+        shell: bash
+
+      - name: Package binary (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../toku-${{ github.ref_name }}-${{ matrix.target }}.tar.gz toku
+          cd ../../..
+          sha256sum toku-${{ github.ref_name }}-${{ matrix.target }}.tar.gz > toku-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Package binary (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/toku.exe" -DestinationPath "toku-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          $hash = (Get-FileHash "toku-${{ github.ref_name }}-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  toku-${{ github.ref_name }}-${{ matrix.target }}.zip" | Out-File -Encoding ascii "toku-${{ github.ref_name }}-${{ matrix.target }}.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: toku-${{ matrix.target }}
+          path: |
+            toku-*.tar.gz
+            toku-*.zip
+            toku-*.sha256
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract release notes from CHANGELOG.md
+        id: extract
+        uses: ffurrer2/extract-release-notes@v3
+
+      - name: Determine pre-release status
+        id: prerelease
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MAJOR="${VERSION%%.*}"
+          if [ "$MAJOR" = "0" ]; then
+            echo "flag=--prerelease" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NOTES: ${{ steps.extract.outputs.release_notes }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "$RELEASE_NOTES" \
+            ${{ steps.prerelease.outputs.flag }} \
+            artifacts/*
+
+  publish:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      # Publish crates in dependency order:
+      # toku-core (no deps) → toku-db → toku-import, toku-meta, toku-export → toku-cli
+      # Each `cargo publish` needs a brief pause for crates.io index to update.
+      - name: Publish workspace crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          publish_crate() {
+            local crate=$1
+            echo "📦 Publishing $crate..."
+            cargo publish -p "$crate" --no-verify
+            echo "⏳ Waiting for crates.io index to update..."
+            sleep 30
+          }
+
+          publish_crate toku-core
+          publish_crate toku-db
+          publish_crate toku-import
+          publish_crate toku-meta
+          publish_crate toku-export
+          publish_crate toku-cli
+          echo "✅ All crates published"

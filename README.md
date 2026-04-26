@@ -24,7 +24,7 @@ toku stats --year 2025                 # See your reading stats
 
 ## Why "Toku"?
 
-**Toku** (読く) comes from the Japanese kanji **読** — meaning *to read*.
+**Toku** (読く) comes from the Japanese kanji **読** — meaning _to read_.
 
 The name is also a nod to **積ん読 (tsundoku)** — a Japanese word with no English
 equivalent that describes the act of acquiring books and letting them pile up unread.
@@ -79,4 +79,4 @@ their ever-growing libraries.
 
 ---
 
-*Built by [kafkade](https://github.com/kafkade).*
+_Built by [kafkade](https://github.com/kafkade)._

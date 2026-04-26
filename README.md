@@ -9,7 +9,7 @@ tracking of [Goodreads](https://www.goodreads.com/), and the analytics of
 [StoryGraph](https://www.thestorygraph.com/) — in a single CLI tool that keeps everything
 on your machine.
 
-```
+```sh
 toku add --isbn 9780441013593          # Add a book by ISBN
 toku import goodreads ~/export.csv     # Import your Goodreads library
 toku reading start "Dune" --page 1     # Start tracking progress

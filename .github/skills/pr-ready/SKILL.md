@@ -46,6 +46,9 @@ Prepare a branch for pull request: generate a PR description from the diff AND u
    npx markdownlint-cli2 "**/*.md"
    ```
 
+   The repo-root `.markdownlint-cli2.jsonc` auto-configures rules and excludes
+   build artifacts (`target/`, `node_modules/`, `pkg/`).
+
    If there are errors, **fix them before proceeding**. Do not generate the PR description until linting passes.
 
 2. **Always run Rust checks if any Rust file changed** (or if any Cargo workspace member is affected):

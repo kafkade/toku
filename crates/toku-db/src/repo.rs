@@ -265,6 +265,21 @@ impl<'a> BookRepository<'a> {
         Ok(())
     }
 
+    /// Get all ISBNs for a book.
+    pub fn get_book_isbns(&self, book_id: &Uuid) -> Result<Vec<String>, DbError> {
+        let mut stmt = self
+            .db
+            .conn
+            .prepare("SELECT isbn FROM isbns WHERE book_id = ?1 ORDER BY isbn")?;
+
+        let isbns = stmt
+            .query_map(params![book_id.to_string()], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(isbns)
+    }
+
     /// Find a book by ISBN.
     pub fn find_by_isbn(&self, isbn: &str) -> Result<Option<Book>, DbError> {
         let result = self.db.conn.query_row(
@@ -726,6 +741,102 @@ impl<'a> BookRepository<'a> {
             .collect();
 
         Ok(tags)
+    }
+
+    // --- Stats operations ---
+
+    /// List all reading sessions.
+    pub fn list_reading_sessions(&self) -> Result<Vec<ReadingSession>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, book_id, started_at, finished_at, start_page, end_page,
+             rating, notes, created_at
+             FROM reading_sessions
+             ORDER BY started_at DESC",
+        )?;
+
+        let sessions = stmt
+            .query_map([], |row| Ok(row_to_reading_session(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(sessions)
+    }
+
+    /// List reading sessions finished in a given year.
+    pub fn list_reading_sessions_in_year(&self, year: i32) -> Result<Vec<ReadingSession>, DbError> {
+        let start = format!("{year}-01-01T00:00:00+00:00");
+        let end = format!("{}-01-01T00:00:00+00:00", year + 1);
+
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, book_id, started_at, finished_at, start_page, end_page,
+             rating, notes, created_at
+             FROM reading_sessions
+             WHERE finished_at IS NOT NULL
+               AND finished_at >= ?1
+               AND finished_at < ?2
+             ORDER BY finished_at DESC",
+        )?;
+
+        let sessions = stmt
+            .query_map(params![start, end], |row| Ok(row_to_reading_session(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(sessions)
+    }
+
+    /// Count books grouped by reading status.
+    pub fn count_books_by_status(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, DbError> {
+        let mut stmt = self
+            .db
+            .conn
+            .prepare("SELECT status, COUNT(*) FROM books GROUP BY status")?;
+
+        let mut map = std::collections::HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            let status: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((status, count as usize))
+        })?;
+
+        for row in rows.flatten() {
+            map.insert(row.0, row.1);
+        }
+
+        Ok(map)
+    }
+
+    /// Get books with status=Reading, their latest progress, and authors.
+    #[allow(clippy::type_complexity)]
+    pub fn get_currently_reading_details(
+        &self,
+    ) -> Result<Vec<(Book, Option<ReadingProgress>, Vec<(Author, BookAuthor)>)>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, title, subtitle, description, page_count, pub_date,
+             language, format, duration_minutes, cover_hash, work_id, status,
+             rating, created_at, updated_at
+             FROM books WHERE status = 'reading'
+             ORDER BY updated_at DESC",
+        )?;
+
+        let books: Vec<Book> = stmt
+            .query_map([], |row| Ok(row_to_book(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut results = Vec::new();
+        for book in books {
+            let progress = self.get_latest_progress(&book.id)?;
+            let authors = self.get_book_authors(&book.id)?;
+            results.push((book, progress, authors));
+        }
+
+        Ok(results)
     }
 }
 

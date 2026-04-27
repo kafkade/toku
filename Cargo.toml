@@ -5,6 +5,7 @@ members = [
     "crates/toku-db",
     "crates/toku-meta",
     "crates/toku-import",
+    "crates/toku-export",
     "crates/toku-cli",
 ]
 

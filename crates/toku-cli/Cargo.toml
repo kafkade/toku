@@ -16,9 +16,11 @@ toku-core = { path = "../toku-core", version = "0.1.0" }
 toku-db = { path = "../toku-db", version = "0.1.0" }
 toku-meta = { path = "../toku-meta", version = "0.1.0" }
 toku-import = { path = "../toku-import", version = "0.1.0" }
+toku-export = { path = "../toku-export", version = "0.1.0" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 anyhow = "1"
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

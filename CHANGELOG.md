@@ -50,5 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Calibre library import: `toku import calibre <path>` with books, authors, series, tags, covers, and ISBNs
 - Calibre import supports `--dry-run` and `--no-covers` flags
 - Calibre HTML descriptions automatically stripped to plain text
+- Reading statistics: `toku stats` with books/pages read, average rating, reading pace, and format breakdown
+- `toku stats --year 2025` for year-filtered analytics
+- Currently reading list with progress percentages in stats output
+- Export to CSV: `toku export csv` with flat book table (title, authors, status, rating, shelves, tags)
+- Export to JSON: `toku export json` with full structured library data
+- Export to Markdown: `toku export markdown` with books grouped by reading status and star ratings
+- Canonical backup: `toku export backup --output toku-backup.zip` with library data + cover images in a self-contained ZIP
 
 [Unreleased]: https://github.com/kafkade/toku/compare/v0.1.0...HEAD

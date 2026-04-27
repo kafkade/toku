@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
-use toku_core::{Author, Book, BookFormat, ContributorRole, Isbn};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
+use toku_core::{
+    Author, Book, BookFormat, ContributorRole, Isbn, ReadingSession, ReadingStatus, TokuConfig,
+};
 use toku_db::{BookRepository, Database};
 
 /// Toku — a private, offline-first personal book manager.
@@ -53,18 +56,73 @@ enum Commands {
         /// Filter by reading status
         #[arg(long, short)]
         status: Option<String>,
+
+        /// Filter by shelf name
+        #[arg(long)]
+        shelf: Option<String>,
+
+        /// Filter by tag name
+        #[arg(long)]
+        tag: Option<String>,
     },
 
     /// Search your library
     Search {
         /// Search query
         query: String,
+
+        /// Filter by reading status
+        #[arg(long, short)]
+        status: Option<String>,
+
+        /// Filter by shelf name
+        #[arg(long)]
+        shelf: Option<String>,
+
+        /// Filter by tag name
+        #[arg(long)]
+        tag: Option<String>,
     },
 
     /// Import books from external sources
     Import {
         #[command(subcommand)]
         source: ImportSource,
+    },
+
+    /// Show or edit configuration
+    Config {
+        /// Print the config file path
+        #[arg(long)]
+        path: bool,
+
+        /// Open the config file in your editor
+        #[arg(long)]
+        edit: bool,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
+
+    /// Manage reading status (start, finish, abandon, hold, resume)
+    Reading {
+        #[command(subcommand)]
+        action: ReadingAction,
+    },
+
+    /// Manage shelves for organizing books
+    Shelf {
+        #[command(subcommand)]
+        action: ShelfAction,
+    },
+
+    /// Manage tags for categorizing books
+    Tag {
+        #[command(subcommand)]
+        action: TagAction,
     },
 }
 
@@ -87,6 +145,99 @@ enum ImportSource {
     },
 }
 
+#[derive(Subcommand)]
+enum ReadingAction {
+    /// Start reading a book (WantToRead → Reading)
+    Start {
+        /// Book title
+        book: String,
+    },
+
+    /// Finish reading a book (Reading → Read)
+    Finish {
+        /// Book title
+        book: String,
+
+        /// Rating (0–10, displayed as 5★ with half-star increments)
+        #[arg(long, short)]
+        rating: Option<i32>,
+    },
+
+    /// Abandon a book (Reading → Abandoned)
+    Abandon {
+        /// Book title
+        book: String,
+    },
+
+    /// Put a book on hold (Reading → OnHold)
+    Hold {
+        /// Book title
+        book: String,
+    },
+
+    /// Resume reading a book (OnHold/Abandoned → Reading)
+    Resume {
+        /// Book title
+        book: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ShelfAction {
+    /// Create a new shelf
+    Create {
+        /// Shelf name
+        name: String,
+    },
+
+    /// Add books to a shelf
+    Add {
+        /// Shelf name
+        shelf: String,
+
+        /// Book titles to add
+        #[arg(required = true)]
+        books: Vec<String>,
+    },
+
+    /// Remove a book from a shelf
+    Remove {
+        /// Shelf name
+        shelf: String,
+
+        /// Book title to remove
+        book: String,
+    },
+
+    /// List all shelves
+    List,
+}
+
+#[derive(Subcommand)]
+enum TagAction {
+    /// Add a tag to books
+    Add {
+        /// Tag name
+        tag: String,
+
+        /// Book titles to tag
+        #[arg(required = true)]
+        books: Vec<String>,
+    },
+
+    /// Remove a tag from a book
+    Remove {
+        /// Tag name
+        tag: String,
+
+        /// Book title
+        book: String,
+    },
+
+    /// List all tags with book counts
+    List,
+}
+
 #[derive(Clone, ValueEnum)]
 enum OutputFormat {
     Table,
@@ -97,11 +248,22 @@ enum OutputFormat {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let db_path = match &cli.data_dir {
-        Some(dir) => dir.join("toku.db"),
-        None => Database::default_db_path().context("could not determine data directory")?,
+    let data_dir = match &cli.data_dir {
+        Some(dir) => dir.clone(),
+        None => Database::default_data_dir().context("could not determine data directory")?,
     };
 
+    // Commands that don't need the database
+    match &cli.command {
+        Commands::Config { path, edit } => return cmd_config(&data_dir, *path, *edit),
+        Commands::Completions { shell } => {
+            clap_complete::generate(*shell, &mut Cli::command(), "toku", &mut std::io::stdout());
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let db_path = data_dir.join("toku.db");
     let db = Database::open(&db_path)
         .with_context(|| format!("failed to open database at {}", db_path.display()))?;
     let repo = BookRepository::new(&db);
@@ -122,10 +284,74 @@ fn main() -> Result<()> {
             &cli.format,
         ),
         Commands::Show { query } => cmd_show(&repo, &query, &cli.format),
-        Commands::List { status } => cmd_list(&repo, status.as_deref(), &cli.format),
-        Commands::Search { query } => cmd_search(&repo, &query, &cli.format),
+        Commands::List { status, shelf, tag } => cmd_list(
+            &repo,
+            status.as_deref(),
+            shelf.as_deref(),
+            tag.as_deref(),
+            &cli.format,
+        ),
+        Commands::Search {
+            query,
+            status,
+            shelf,
+            tag,
+        } => cmd_search(
+            &repo,
+            &query,
+            status.as_deref(),
+            shelf.as_deref(),
+            tag.as_deref(),
+            &cli.format,
+        ),
         Commands::Import { source } => cmd_import(&db, &repo, source, &cli.format),
+        Commands::Reading { action } => cmd_reading(&repo, action),
+        Commands::Shelf { action } => cmd_shelf(&repo, action, &cli.format),
+        Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
+        // Already handled above
+        Commands::Config { .. } | Commands::Completions { .. } => unreachable!(),
     }
+}
+
+fn cmd_config(data_dir: &Path, show_path: bool, open_edit: bool) -> Result<()> {
+    let config_path = TokuConfig::config_path(data_dir);
+
+    if show_path {
+        println!("{}", config_path.display());
+        return Ok(());
+    }
+
+    if open_edit {
+        // Ensure the config file exists with defaults
+        if !config_path.exists() {
+            TokuConfig::default()
+                .save(data_dir)
+                .context("failed to create default config")?;
+            eprintln!("Created default config at {}", config_path.display());
+        }
+
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| {
+                if cfg!(windows) {
+                    "notepad".to_string()
+                } else {
+                    "nano".to_string()
+                }
+            });
+
+        std::process::Command::new(&editor)
+            .arg(&config_path)
+            .status()
+            .with_context(|| format!("failed to open editor: {editor}"))?;
+        return Ok(());
+    }
+
+    // Default: show current config
+    let config = TokuConfig::load(data_dir).context("failed to load config")?;
+    let toml_str = toml::to_string_pretty(&config).context("failed to serialize config")?;
+    println!("{toml_str}");
+    Ok(())
 }
 
 fn cmd_add(
@@ -243,9 +469,18 @@ fn cmd_show(repo: &BookRepository, query: &str, output_format: &OutputFormat) ->
 fn cmd_list(
     repo: &BookRepository,
     status: Option<&str>,
+    shelf: Option<&str>,
+    tag: Option<&str>,
     output_format: &OutputFormat,
 ) -> Result<()> {
-    let books = repo.list_books()?;
+    let books = if let Some(shelf_name) = shelf {
+        repo.list_books_in_shelf(shelf_name)?
+    } else if let Some(tag_name) = tag {
+        repo.list_books_by_tag(tag_name)?
+    } else {
+        repo.list_books()?
+    };
+
     let filtered: Vec<Book> = if let Some(s) = status {
         let target: toku_core::ReadingStatus = s.parse().context("invalid status")?;
         books.into_iter().filter(|b| b.status == target).collect()
@@ -263,8 +498,15 @@ fn cmd_list(
     Ok(())
 }
 
-fn cmd_search(repo: &BookRepository, query: &str, output_format: &OutputFormat) -> Result<()> {
-    let books = repo.search_books(query)?;
+fn cmd_search(
+    repo: &BookRepository,
+    query: &str,
+    status: Option<&str>,
+    shelf: Option<&str>,
+    tag: Option<&str>,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    let books = repo.search_books_filtered(query, status, shelf, tag)?;
     if books.is_empty() {
         eprintln!("No results for \"{query}\"");
         return Ok(());
@@ -506,6 +748,318 @@ fn cmd_import(
                 eprintln!("No books found for import ID {import_id}");
             }
 
+            Ok(())
+        }
+    }
+}
+
+/// Resolve a book title to a Book, returning a user-friendly error if not found.
+fn resolve_book(repo: &BookRepository, title: &str) -> Result<Book> {
+    if let Some(book) = repo.find_book_by_title(title)? {
+        return Ok(book);
+    }
+
+    // Fall back to substring search
+    let all = repo.list_books()?;
+    let matches: Vec<&Book> = all
+        .iter()
+        .filter(|b| b.title.to_lowercase().contains(&title.to_lowercase()))
+        .collect();
+
+    match matches.len() {
+        0 => anyhow::bail!("no book found matching \"{title}\""),
+        1 => Ok(matches[0].clone()),
+        _ => {
+            eprintln!("Multiple books match \"{title}\":");
+            for b in &matches {
+                eprintln!("  • {} ({})", b.title, b.status);
+            }
+            anyhow::bail!("be more specific or use the exact title")
+        }
+    }
+}
+
+fn cmd_reading(repo: &BookRepository, action: ReadingAction) -> Result<()> {
+    match action {
+        ReadingAction::Start { book: title } => {
+            let book = resolve_book(repo, &title)?;
+            let target = ReadingStatus::Reading;
+
+            if !book.status.can_transition_to(&target) {
+                anyhow::bail!(
+                    "cannot start: \"{}\" is currently {} (expected want-to-read, on-hold, abandoned, or read)",
+                    book.title,
+                    book.status
+                );
+            }
+
+            repo.update_book_status(&book.id, target)?;
+
+            let session = ReadingSession::new(book.id);
+            repo.create_reading_session(&session)?;
+
+            eprintln!("✓ Started reading \"{}\"", book.title);
+            Ok(())
+        }
+
+        ReadingAction::Finish {
+            book: title,
+            rating,
+        } => {
+            let book = resolve_book(repo, &title)?;
+            let target = ReadingStatus::Read;
+
+            if !book.status.can_transition_to(&target) {
+                anyhow::bail!(
+                    "cannot finish: \"{}\" is currently {} (expected reading)",
+                    book.title,
+                    book.status
+                );
+            }
+
+            if let Some(r) = rating {
+                if !(0..=10).contains(&r) {
+                    anyhow::bail!("rating must be between 0 and 10, got {r}");
+                }
+                repo.update_book_rating(&book.id, r)?;
+            }
+
+            repo.update_book_status(&book.id, target)?;
+
+            match rating {
+                Some(r) => eprintln!(
+                    "✓ Finished \"{}\" — rated {:.1}★",
+                    book.title,
+                    r as f32 / 2.0
+                ),
+                None => eprintln!("✓ Finished \"{}\"", book.title),
+            }
+            Ok(())
+        }
+
+        ReadingAction::Abandon { book: title } => {
+            let book = resolve_book(repo, &title)?;
+            let target = ReadingStatus::Abandoned;
+
+            if !book.status.can_transition_to(&target) {
+                anyhow::bail!(
+                    "cannot abandon: \"{}\" is currently {} (expected reading)",
+                    book.title,
+                    book.status
+                );
+            }
+
+            repo.update_book_status(&book.id, target)?;
+            eprintln!("✓ Abandoned \"{}\"", book.title);
+            Ok(())
+        }
+
+        ReadingAction::Hold { book: title } => {
+            let book = resolve_book(repo, &title)?;
+            let target = ReadingStatus::OnHold;
+
+            if !book.status.can_transition_to(&target) {
+                anyhow::bail!(
+                    "cannot hold: \"{}\" is currently {} (expected reading)",
+                    book.title,
+                    book.status
+                );
+            }
+
+            repo.update_book_status(&book.id, target)?;
+            eprintln!("✓ Put \"{}\" on hold", book.title);
+            Ok(())
+        }
+
+        ReadingAction::Resume { book: title } => {
+            let book = resolve_book(repo, &title)?;
+            let target = ReadingStatus::Reading;
+
+            if !book.status.can_transition_to(&target) {
+                anyhow::bail!(
+                    "cannot resume: \"{}\" is currently {} (expected on-hold or abandoned)",
+                    book.title,
+                    book.status
+                );
+            }
+
+            repo.update_book_status(&book.id, target)?;
+
+            let session = ReadingSession::new(book.id);
+            repo.create_reading_session(&session)?;
+
+            eprintln!("✓ Resumed reading \"{}\"", book.title);
+            Ok(())
+        }
+    }
+}
+
+fn cmd_shelf(
+    repo: &BookRepository,
+    action: ShelfAction,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    match action {
+        ShelfAction::Create { name } => {
+            repo.create_shelf(&name)?;
+            eprintln!("✓ Created shelf \"{name}\"");
+            Ok(())
+        }
+        ShelfAction::Add { shelf, books } => {
+            for title in &books {
+                let book = resolve_book(repo, title)?;
+                repo.add_book_to_shelf(&book.id, &shelf)?;
+                eprintln!("✓ Added \"{}\" to shelf \"{shelf}\"", book.title);
+            }
+            Ok(())
+        }
+        ShelfAction::Remove { shelf, book: title } => {
+            let book = resolve_book(repo, &title)?;
+            repo.remove_book_from_shelf(&book.id, &shelf)?;
+            eprintln!("✓ Removed \"{}\" from shelf \"{shelf}\"", book.title);
+            Ok(())
+        }
+        ShelfAction::List => {
+            let shelves = repo.list_shelves()?;
+            if shelves.is_empty() {
+                eprintln!("No shelves yet. Create one with: toku shelf create <name>");
+                return Ok(());
+            }
+
+            match output_format {
+                OutputFormat::Json => {
+                    #[derive(serde::Serialize)]
+                    struct ShelfOut {
+                        name: String,
+                        books: usize,
+                    }
+                    let out: Vec<ShelfOut> = shelves
+                        .iter()
+                        .map(|s| {
+                            let count = repo
+                                .list_books_in_shelf(&s.name)
+                                .map(|b| b.len())
+                                .unwrap_or(0);
+                            ShelfOut {
+                                name: s.name.clone(),
+                                books: count,
+                            }
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+                OutputFormat::Csv => {
+                    println!("name,books");
+                    for s in &shelves {
+                        let count = repo
+                            .list_books_in_shelf(&s.name)
+                            .map(|b| b.len())
+                            .unwrap_or(0);
+                        println!("\"{}\",{}", s.name.replace('"', "\"\""), count);
+                    }
+                }
+                OutputFormat::Table => {
+                    use tabled::{Table, Tabled};
+
+                    #[derive(Tabled)]
+                    struct Row {
+                        #[tabled(rename = "Shelf")]
+                        name: String,
+                        #[tabled(rename = "Books")]
+                        books: usize,
+                    }
+
+                    let rows: Vec<Row> = shelves
+                        .iter()
+                        .map(|s| {
+                            let count = repo
+                                .list_books_in_shelf(&s.name)
+                                .map(|b| b.len())
+                                .unwrap_or(0);
+                            Row {
+                                name: s.name.clone(),
+                                books: count,
+                            }
+                        })
+                        .collect();
+
+                    println!("{}", Table::new(rows));
+                }
+            }
+            eprintln!("\n{} shelf(s)", shelves.len());
+            Ok(())
+        }
+    }
+}
+
+fn cmd_tag(repo: &BookRepository, action: TagAction, output_format: &OutputFormat) -> Result<()> {
+    match action {
+        TagAction::Add { tag, books } => {
+            for title in &books {
+                let book = resolve_book(repo, title)?;
+                repo.add_tag_to_book(&book.id, &tag)?;
+                eprintln!("✓ Tagged \"{}\" with \"{tag}\"", book.title);
+            }
+            Ok(())
+        }
+        TagAction::Remove { tag, book: title } => {
+            let book = resolve_book(repo, &title)?;
+            repo.remove_tag_from_book(&book.id, &tag)?;
+            eprintln!("✓ Removed tag \"{tag}\" from \"{}\"", book.title);
+            Ok(())
+        }
+        TagAction::List => {
+            let tags = repo.list_tags_with_counts()?;
+            if tags.is_empty() {
+                eprintln!("No tags yet. Add one with: toku tag add <tag> <book>");
+                return Ok(());
+            }
+
+            match output_format {
+                OutputFormat::Json => {
+                    #[derive(serde::Serialize)]
+                    struct TagOut {
+                        name: String,
+                        books: i64,
+                    }
+                    let out: Vec<TagOut> = tags
+                        .iter()
+                        .map(|(t, count)| TagOut {
+                            name: t.name.clone(),
+                            books: *count,
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+                OutputFormat::Csv => {
+                    println!("tag,books");
+                    for (t, count) in &tags {
+                        println!("\"{}\",{}", t.name.replace('"', "\"\""), count);
+                    }
+                }
+                OutputFormat::Table => {
+                    use tabled::{Table, Tabled};
+
+                    #[derive(Tabled)]
+                    struct Row {
+                        #[tabled(rename = "Tag")]
+                        name: String,
+                        #[tabled(rename = "Books")]
+                        books: i64,
+                    }
+
+                    let rows: Vec<Row> = tags
+                        .iter()
+                        .map(|(t, count)| Row {
+                            name: t.name.clone(),
+                            books: *count,
+                        })
+                        .collect();
+
+                    println!("{}", Table::new(rows));
+                }
+            }
+            eprintln!("\n{} tag(s)", tags.len());
             Ok(())
         }
     }

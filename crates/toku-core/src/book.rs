@@ -85,6 +85,37 @@ impl std::str::FromStr for BookFormat {
     }
 }
 
+/// A reading session tracks a single reading attempt of a book.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadingSession {
+    pub id: Uuid,
+    pub book_id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub start_page: Option<i32>,
+    pub end_page: Option<i32>,
+    pub rating: Option<i32>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ReadingSession {
+    pub fn new(book_id: Uuid) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::now_v7(),
+            book_id,
+            started_at: now,
+            finished_at: None,
+            start_page: None,
+            end_page: None,
+            rating: None,
+            notes: None,
+            created_at: now,
+        }
+    }
+}
+
 /// Reading lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadingStatus {
@@ -104,6 +135,20 @@ impl ReadingStatus {
             Self::Abandoned => "abandoned",
             Self::OnHold => "on-hold",
         }
+    }
+
+    /// Returns whether a transition from this status to `target` is valid.
+    pub fn can_transition_to(&self, target: &ReadingStatus) -> bool {
+        matches!(
+            (self, target),
+            (ReadingStatus::WantToRead, ReadingStatus::Reading)
+                | (ReadingStatus::Reading, ReadingStatus::Read)
+                | (ReadingStatus::Reading, ReadingStatus::Abandoned)
+                | (ReadingStatus::Reading, ReadingStatus::OnHold)
+                | (ReadingStatus::OnHold, ReadingStatus::Reading)
+                | (ReadingStatus::Abandoned, ReadingStatus::Reading)
+                | (ReadingStatus::Read, ReadingStatus::Reading) // re-read
+        )
     }
 }
 
@@ -202,6 +247,43 @@ fn guess_sort_name(name: &str) -> String {
     format!("{}, {}", last, rest.join(" "))
 }
 
+/// A user-defined shelf for organizing books (e.g. "Favorites", "To Re-read").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Shelf {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Shelf {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            name: name.into(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+/// A user-defined tag for categorizing books (e.g. "sci-fi", "Hugo winner").
+/// Tag names are case-insensitive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tag {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Tag {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            name: name.into(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
 /// A book-to-author relationship with role and ordering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookAuthor {
@@ -295,5 +377,60 @@ mod tests {
             "dnf".parse::<ReadingStatus>().unwrap(),
             ReadingStatus::Abandoned
         );
+    }
+
+    // --- State machine tests ---
+
+    #[test]
+    fn valid_transitions() {
+        let valid = [
+            (ReadingStatus::WantToRead, ReadingStatus::Reading),
+            (ReadingStatus::Reading, ReadingStatus::Read),
+            (ReadingStatus::Reading, ReadingStatus::Abandoned),
+            (ReadingStatus::Reading, ReadingStatus::OnHold),
+            (ReadingStatus::OnHold, ReadingStatus::Reading),
+            (ReadingStatus::Abandoned, ReadingStatus::Reading),
+            (ReadingStatus::Read, ReadingStatus::Reading), // re-read
+        ];
+
+        for (from, to) in &valid {
+            assert!(from.can_transition_to(to), "{from} → {to} should be valid");
+        }
+    }
+
+    #[test]
+    fn invalid_transitions() {
+        let invalid = [
+            (ReadingStatus::WantToRead, ReadingStatus::Read),
+            (ReadingStatus::WantToRead, ReadingStatus::Abandoned),
+            (ReadingStatus::WantToRead, ReadingStatus::OnHold),
+            (ReadingStatus::Read, ReadingStatus::Abandoned),
+            (ReadingStatus::Read, ReadingStatus::OnHold),
+            (ReadingStatus::Read, ReadingStatus::WantToRead),
+            (ReadingStatus::Abandoned, ReadingStatus::Read),
+            (ReadingStatus::Abandoned, ReadingStatus::OnHold),
+            (ReadingStatus::OnHold, ReadingStatus::Read),
+            (ReadingStatus::OnHold, ReadingStatus::Abandoned),
+            // Self-transitions
+            (ReadingStatus::Reading, ReadingStatus::Reading),
+            (ReadingStatus::WantToRead, ReadingStatus::WantToRead),
+        ];
+
+        for (from, to) in &invalid {
+            assert!(
+                !from.can_transition_to(to),
+                "{from} → {to} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_session_new_defaults() {
+        let book_id = Uuid::now_v7();
+        let session = ReadingSession::new(book_id);
+        assert_eq!(session.book_id, book_id);
+        assert!(session.finished_at.is_none());
+        assert!(session.rating.is_none());
+        assert!(session.notes.is_none());
     }
 }

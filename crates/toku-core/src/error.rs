@@ -11,4 +11,13 @@ pub enum TokuError {
 
     #[error("invalid ISBN: {0}")]
     InvalidIsbn(String),
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("invalid transition: cannot move from {from} to {to}")]
+    InvalidTransition {
+        from: &'static str,
+        to: &'static str,
+    },
 }

@@ -116,6 +116,120 @@ impl ReadingSession {
     }
 }
 
+/// Type of reading progress entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProgressType {
+    Page,
+    Percent,
+    Chapter,
+    /// Duration in minutes (for audiobooks).
+    Duration,
+}
+
+impl ProgressType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::Percent => "percent",
+            Self::Chapter => "chapter",
+            Self::Duration => "duration",
+        }
+    }
+}
+
+impl std::fmt::Display for ProgressType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProgressType {
+    type Err = crate::TokuError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "page" => Ok(Self::Page),
+            "percent" => Ok(Self::Percent),
+            "chapter" => Ok(Self::Chapter),
+            "duration" => Ok(Self::Duration),
+            _ => Err(crate::TokuError::InvalidProgressType(s.to_string())),
+        }
+    }
+}
+
+/// A timestamped reading progress entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadingProgress {
+    pub id: Uuid,
+    pub book_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub progress_type: ProgressType,
+    pub value: i32,
+    pub note: Option<String>,
+    pub logged_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ReadingProgress {
+    pub fn new(book_id: Uuid, progress_type: ProgressType, value: i32) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::now_v7(),
+            book_id,
+            session_id: None,
+            progress_type,
+            value,
+            note: None,
+            logged_at: now,
+            created_at: now,
+        }
+    }
+}
+
+/// Parse a human-friendly duration string into total minutes.
+///
+/// Accepted formats: `5h30m`, `330m`, `5.5h`, `5h`, `90`.
+pub fn parse_duration_to_minutes(s: &str) -> Result<i32, crate::TokuError> {
+    let s = s.trim();
+
+    // Try `Xh Ym` or `XhYm`
+    if let Some(h_pos) = s.find('h') {
+        let hours_str = &s[..h_pos];
+        let rest = s[h_pos + 1..].trim();
+
+        if rest.is_empty() {
+            // Could be fractional hours like "5.5h"
+            let hours: f64 = hours_str
+                .parse()
+                .map_err(|_| crate::TokuError::InvalidDuration(s.to_string()))?;
+            return Ok((hours * 60.0).round() as i32);
+        }
+
+        let mins_str = rest.trim_end_matches('m');
+        let hours: f64 = hours_str
+            .parse()
+            .map_err(|_| crate::TokuError::InvalidDuration(s.to_string()))?;
+        let mins: f64 = mins_str
+            .parse()
+            .map_err(|_| crate::TokuError::InvalidDuration(s.to_string()))?;
+        return Ok((hours * 60.0 + mins).round() as i32);
+    }
+
+    // Try `Xm`
+    if let Some(m_str) = s.strip_suffix('m') {
+        let mins: f64 = m_str
+            .parse()
+            .map_err(|_| crate::TokuError::InvalidDuration(s.to_string()))?;
+        return Ok(mins.round() as i32);
+    }
+
+    // Plain number = minutes
+    let mins: f64 = s
+        .parse()
+        .map_err(|_| crate::TokuError::InvalidDuration(s.to_string()))?;
+    Ok(mins.round() as i32)
+}
+
 /// Reading lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadingStatus {
@@ -432,5 +546,71 @@ mod tests {
         assert!(session.finished_at.is_none());
         assert!(session.rating.is_none());
         assert!(session.notes.is_none());
+    }
+
+    #[test]
+    fn progress_type_roundtrip() {
+        for pt in [
+            ProgressType::Page,
+            ProgressType::Percent,
+            ProgressType::Chapter,
+            ProgressType::Duration,
+        ] {
+            let parsed: ProgressType = pt.as_str().parse().unwrap();
+            assert_eq!(parsed, pt);
+        }
+    }
+
+    #[test]
+    fn progress_type_display() {
+        assert_eq!(ProgressType::Page.to_string(), "page");
+        assert_eq!(ProgressType::Duration.to_string(), "duration");
+    }
+
+    #[test]
+    fn progress_type_invalid() {
+        assert!("invalid".parse::<ProgressType>().is_err());
+    }
+
+    #[test]
+    fn reading_progress_new_defaults() {
+        let book_id = Uuid::now_v7();
+        let progress = ReadingProgress::new(book_id, ProgressType::Page, 42);
+        assert_eq!(progress.book_id, book_id);
+        assert_eq!(progress.progress_type, ProgressType::Page);
+        assert_eq!(progress.value, 42);
+        assert!(progress.session_id.is_none());
+        assert!(progress.note.is_none());
+    }
+
+    #[test]
+    fn parse_duration_hours_minutes() {
+        assert_eq!(parse_duration_to_minutes("5h30m").unwrap(), 330);
+        assert_eq!(parse_duration_to_minutes("1h0m").unwrap(), 60);
+        assert_eq!(parse_duration_to_minutes("0h45m").unwrap(), 45);
+    }
+
+    #[test]
+    fn parse_duration_minutes_only() {
+        assert_eq!(parse_duration_to_minutes("330m").unwrap(), 330);
+        assert_eq!(parse_duration_to_minutes("90m").unwrap(), 90);
+    }
+
+    #[test]
+    fn parse_duration_hours_only() {
+        assert_eq!(parse_duration_to_minutes("5h").unwrap(), 300);
+        assert_eq!(parse_duration_to_minutes("5.5h").unwrap(), 330);
+        assert_eq!(parse_duration_to_minutes("2.25h").unwrap(), 135);
+    }
+
+    #[test]
+    fn parse_duration_plain_number() {
+        assert_eq!(parse_duration_to_minutes("90").unwrap(), 90);
+    }
+
+    #[test]
+    fn parse_duration_invalid() {
+        assert!(parse_duration_to_minutes("abc").is_err());
+        assert!(parse_duration_to_minutes("").is_err());
     }
 }

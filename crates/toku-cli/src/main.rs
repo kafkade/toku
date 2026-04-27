@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use toku_core::{
-    Author, Book, BookFormat, ContributorRole, Isbn, ReadingSession, ReadingStatus, TokuConfig,
+    Author, Book, BookFormat, ContributorRole, Isbn, ProgressType, ReadingProgress, ReadingSession,
+    ReadingStatus, TokuConfig, parse_duration_to_minutes,
 };
 use toku_db::{BookRepository, Database};
 
@@ -138,6 +139,20 @@ enum ImportSource {
         dry_run: bool,
     },
 
+    /// Import from a Calibre library (metadata.db)
+    Calibre {
+        /// Path to the Calibre library directory (contains metadata.db)
+        path: PathBuf,
+
+        /// Preview what would be imported without writing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip importing cover images
+        #[arg(long)]
+        no_covers: bool,
+    },
+
     /// Undo a previous import by its ID
     Undo {
         /// Import ID (shown after a successful import)
@@ -177,6 +192,38 @@ enum ReadingAction {
 
     /// Resume reading a book (OnHold/Abandoned → Reading)
     Resume {
+        /// Book title
+        book: String,
+    },
+
+    /// Log reading progress (page, percent, chapter, or duration)
+    Update {
+        /// Book title
+        book: String,
+
+        /// Page number reached
+        #[arg(long)]
+        page: Option<i32>,
+
+        /// Percentage completed (0–100)
+        #[arg(long)]
+        percent: Option<i32>,
+
+        /// Chapter number reached
+        #[arg(long)]
+        chapter: Option<i32>,
+
+        /// Duration listened (e.g. 5h30m, 330m, 5.5h)
+        #[arg(long)]
+        duration: Option<String>,
+
+        /// Optional note
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Show reading log for a book
+    Log {
         /// Book title
         book: String,
     },
@@ -305,7 +352,7 @@ fn main() -> Result<()> {
             &cli.format,
         ),
         Commands::Import { source } => cmd_import(&db, &repo, source, &cli.format),
-        Commands::Reading { action } => cmd_reading(&repo, action),
+        Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Shelf { action } => cmd_shelf(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
         // Already handled above
@@ -738,6 +785,45 @@ fn cmd_import(
 
             Ok(())
         }
+        ImportSource::Calibre {
+            path,
+            dry_run,
+            no_covers,
+        } => {
+            if !path.exists() {
+                anyhow::bail!("directory not found: {}", path.display());
+            }
+
+            let opts = toku_import::CalibreImportOptions {
+                dry_run,
+                import_covers: !no_covers,
+            };
+
+            if dry_run {
+                eprintln!("Dry run — no changes will be made:\n");
+            } else {
+                eprintln!("Importing from Calibre library: {}\n", path.display());
+            }
+
+            let report =
+                toku_import::import_calibre(db, &path, &opts).context("Calibre import failed")?;
+
+            eprintln!("\n{report}");
+
+            if let Some(ref id) = report.import_id {
+                eprintln!("Import ID: {id}");
+                eprintln!("To undo: toku import undo {id}");
+            }
+
+            if !dry_run && report.imported > 0 {
+                eprintln!();
+                let books = repo.list_books()?;
+                print_books(&books, repo, output_format)?;
+                eprintln!("\n{} book(s) in library", books.len());
+            }
+
+            Ok(())
+        }
         ImportSource::Undo { import_id } => {
             let count =
                 toku_import::undo_import(db, &import_id).context("failed to undo import")?;
@@ -779,7 +865,11 @@ fn resolve_book(repo: &BookRepository, title: &str) -> Result<Book> {
     }
 }
 
-fn cmd_reading(repo: &BookRepository, action: ReadingAction) -> Result<()> {
+fn cmd_reading(
+    repo: &BookRepository,
+    action: ReadingAction,
+    output_format: &OutputFormat,
+) -> Result<()> {
     match action {
         ReadingAction::Start { book: title } => {
             let book = resolve_book(repo, &title)?;
@@ -889,6 +979,158 @@ fn cmd_reading(repo: &BookRepository, action: ReadingAction) -> Result<()> {
             repo.create_reading_session(&session)?;
 
             eprintln!("✓ Resumed reading \"{}\"", book.title);
+            Ok(())
+        }
+
+        ReadingAction::Update {
+            book: title,
+            page,
+            percent,
+            chapter,
+            duration,
+            note,
+        } => {
+            let book = resolve_book(repo, &title)?;
+
+            if book.status != ReadingStatus::Reading {
+                anyhow::bail!(
+                    "cannot update progress: \"{}\" is currently {} (expected reading)",
+                    book.title,
+                    book.status
+                );
+            }
+
+            let (progress_type, value) = if let Some(p) = page {
+                (ProgressType::Page, p)
+            } else if let Some(pct) = percent {
+                if !(0..=100).contains(&pct) {
+                    anyhow::bail!("percentage must be between 0 and 100, got {pct}");
+                }
+                (ProgressType::Percent, pct)
+            } else if let Some(ch) = chapter {
+                (ProgressType::Chapter, ch)
+            } else if let Some(dur_str) = duration {
+                let minutes = parse_duration_to_minutes(&dur_str)
+                    .with_context(|| format!("invalid duration: {dur_str}"))?;
+                (ProgressType::Duration, minutes)
+            } else {
+                anyhow::bail!("specify one of --page, --percent, --chapter, or --duration");
+            };
+
+            let active_session = repo.get_active_session(&book.id)?;
+
+            let mut progress = ReadingProgress::new(book.id, progress_type, value);
+            progress.session_id = active_session.map(|s| s.id);
+            progress.note = note;
+            repo.log_progress(&progress)?;
+
+            let label = match progress_type {
+                ProgressType::Page => format!("Page {value}"),
+                ProgressType::Percent => format!("{value}%"),
+                ProgressType::Chapter => format!("Chapter {value}"),
+                ProgressType::Duration => {
+                    let h = value / 60;
+                    let m = value % 60;
+                    if h > 0 {
+                        format!("{h}h {m}m")
+                    } else {
+                        format!("{m}m")
+                    }
+                }
+            };
+
+            eprintln!("✓ {label} of \"{}\" logged", book.title);
+            Ok(())
+        }
+
+        ReadingAction::Log { book: title } => {
+            let book = resolve_book(repo, &title)?;
+            let log = repo.get_reading_log(&book.id)?;
+
+            if log.is_empty() {
+                eprintln!("No reading progress logged for \"{}\"", book.title);
+                return Ok(());
+            }
+
+            match output_format {
+                OutputFormat::Json => {
+                    #[derive(serde::Serialize)]
+                    struct ProgressOut {
+                        date: String,
+                        progress_type: String,
+                        value: i32,
+                        note: Option<String>,
+                    }
+                    let out: Vec<ProgressOut> = log
+                        .iter()
+                        .map(|p| ProgressOut {
+                            date: p.logged_at.format("%Y-%m-%d %H:%M").to_string(),
+                            progress_type: p.progress_type.as_str().to_string(),
+                            value: p.value,
+                            note: p.note.clone(),
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+                OutputFormat::Csv => {
+                    println!("date,type,value,note");
+                    for p in &log {
+                        println!(
+                            "{},{},{},\"{}\"",
+                            p.logged_at.format("%Y-%m-%d %H:%M"),
+                            p.progress_type.as_str(),
+                            p.value,
+                            p.note.as_deref().unwrap_or("").replace('"', "\"\""),
+                        );
+                    }
+                }
+                OutputFormat::Table => {
+                    use tabled::{Table, Tabled};
+
+                    #[derive(Tabled)]
+                    struct Row {
+                        #[tabled(rename = "Date")]
+                        date: String,
+                        #[tabled(rename = "Type")]
+                        progress_type: String,
+                        #[tabled(rename = "Value")]
+                        value: String,
+                        #[tabled(rename = "Note")]
+                        note: String,
+                    }
+
+                    let rows: Vec<Row> = log
+                        .iter()
+                        .map(|p| {
+                            let value_str = match p.progress_type {
+                                ProgressType::Page => format!("p. {}", p.value),
+                                ProgressType::Percent => format!("{}%", p.value),
+                                ProgressType::Chapter => format!("ch. {}", p.value),
+                                ProgressType::Duration => {
+                                    let h = p.value / 60;
+                                    let m = p.value % 60;
+                                    if h > 0 {
+                                        format!("{h}h {m}m")
+                                    } else {
+                                        format!("{m}m")
+                                    }
+                                }
+                            };
+
+                            Row {
+                                date: p.logged_at.format("%Y-%m-%d %H:%M").to_string(),
+                                progress_type: p.progress_type.as_str().to_string(),
+                                value: value_str,
+                                note: p.note.clone().unwrap_or_default(),
+                            }
+                        })
+                        .collect();
+
+                    println!("{}", Table::new(rows));
+                }
+            }
+
+            eprintln!("\n{} entries for \"{}\"", log.len(), book.title);
             Ok(())
         }
     }

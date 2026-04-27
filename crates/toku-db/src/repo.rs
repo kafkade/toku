@@ -1,6 +1,7 @@
 use rusqlite::params;
 use toku_core::{
-    Author, Book, BookAuthor, ContributorRole, ReadingSession, ReadingStatus, Shelf, Tag,
+    Author, Book, BookAuthor, ContributorRole, ReadingProgress, ReadingSession, ReadingStatus,
+    Shelf, Tag,
 };
 use uuid::Uuid;
 
@@ -345,6 +346,89 @@ impl<'a> BookRepository<'a> {
             ],
         )?;
         Ok(())
+    }
+
+    // --- Reading progress operations ---
+
+    /// Insert a reading progress entry.
+    pub fn log_progress(&self, progress: &ReadingProgress) -> Result<(), DbError> {
+        self.db.conn.execute(
+            "INSERT INTO reading_progress (id, book_id, session_id, progress_type,
+             value, note, logged_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                progress.id.to_string(),
+                progress.book_id.to_string(),
+                progress.session_id.map(|u| u.to_string()),
+                progress.progress_type.as_str(),
+                progress.value,
+                progress.note,
+                progress.logged_at.to_rfc3339(),
+                progress.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get all progress entries for a book, ordered by `logged_at` DESC.
+    pub fn get_reading_log(&self, book_id: &Uuid) -> Result<Vec<ReadingProgress>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, book_id, session_id, progress_type, value, note, logged_at, created_at
+             FROM reading_progress
+             WHERE book_id = ?1
+             ORDER BY logged_at DESC",
+        )?;
+
+        let entries = stmt
+            .query_map(params![book_id.to_string()], |row| {
+                Ok(row_to_reading_progress(row))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(entries)
+    }
+
+    /// Get the most recent progress entry for a book.
+    pub fn get_latest_progress(&self, book_id: &Uuid) -> Result<Option<ReadingProgress>, DbError> {
+        let result = self.db.conn.query_row(
+            "SELECT id, book_id, session_id, progress_type, value, note, logged_at, created_at
+             FROM reading_progress
+             WHERE book_id = ?1
+             ORDER BY logged_at DESC
+             LIMIT 1",
+            params![book_id.to_string()],
+            |row| Ok(row_to_reading_progress(row)),
+        );
+
+        match result {
+            Ok(Ok(progress)) => Ok(Some(progress)),
+            Ok(Err(_)) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(DbError::Sqlite(e)),
+        }
+    }
+
+    /// Get the active (unfinished) reading session for a book.
+    pub fn get_active_session(&self, book_id: &Uuid) -> Result<Option<ReadingSession>, DbError> {
+        let result = self.db.conn.query_row(
+            "SELECT id, book_id, started_at, finished_at, start_page, end_page,
+             rating, notes, created_at
+             FROM reading_sessions
+             WHERE book_id = ?1 AND finished_at IS NULL
+             ORDER BY started_at DESC
+             LIMIT 1",
+            params![book_id.to_string()],
+            |row| Ok(row_to_reading_session(row)),
+        );
+
+        match result {
+            Ok(Ok(session)) => Ok(Some(session)),
+            Ok(Err(_)) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(DbError::Sqlite(e)),
+        }
     }
 
     // --- Shelf operations ---
@@ -703,11 +787,69 @@ fn row_to_book(row: &rusqlite::Row<'_>) -> Result<Book, String> {
     })
 }
 
+fn row_to_reading_progress(row: &rusqlite::Row<'_>) -> Result<ReadingProgress, String> {
+    let id_str: String = row.get(0).map_err(|e| e.to_string())?;
+    let book_id_str: String = row.get(1).map_err(|e| e.to_string())?;
+    let session_id_str: Option<String> = row.get(2).map_err(|e| e.to_string())?;
+    let progress_type_str: String = row.get(3).map_err(|e| e.to_string())?;
+    let logged_str: String = row.get(6).map_err(|e| e.to_string())?;
+    let created_str: String = row.get(7).map_err(|e| e.to_string())?;
+
+    Ok(ReadingProgress {
+        id: Uuid::parse_str(&id_str).map_err(|e| e.to_string())?,
+        book_id: Uuid::parse_str(&book_id_str).map_err(|e| e.to_string())?,
+        session_id: session_id_str
+            .map(|s| Uuid::parse_str(&s))
+            .transpose()
+            .map_err(|e| e.to_string())?,
+        progress_type: progress_type_str
+            .parse()
+            .map_err(|e: toku_core::TokuError| e.to_string())?,
+        value: row.get(4).map_err(|e| e.to_string())?,
+        note: row.get(5).map_err(|e| e.to_string())?,
+        logged_at: chrono::DateTime::parse_from_rfc3339(&logged_str)
+            .map_err(|e| e.to_string())?
+            .with_timezone(&chrono::Utc),
+        created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+            .map_err(|e| e.to_string())?
+            .with_timezone(&chrono::Utc),
+    })
+}
+
+fn row_to_reading_session(row: &rusqlite::Row<'_>) -> Result<ReadingSession, String> {
+    let id_str: String = row.get(0).map_err(|e| e.to_string())?;
+    let book_id_str: String = row.get(1).map_err(|e| e.to_string())?;
+    let started_str: String = row.get(2).map_err(|e| e.to_string())?;
+    let finished_str: Option<String> = row.get(3).map_err(|e| e.to_string())?;
+    let created_str: String = row.get(8).map_err(|e| e.to_string())?;
+
+    Ok(ReadingSession {
+        id: Uuid::parse_str(&id_str).map_err(|e| e.to_string())?,
+        book_id: Uuid::parse_str(&book_id_str).map_err(|e| e.to_string())?,
+        started_at: chrono::DateTime::parse_from_rfc3339(&started_str)
+            .map_err(|e| e.to_string())?
+            .with_timezone(&chrono::Utc),
+        finished_at: finished_str
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&chrono::Utc))
+            })
+            .transpose()
+            .map_err(|e| e.to_string())?,
+        start_page: row.get(4).map_err(|e| e.to_string())?,
+        end_page: row.get(5).map_err(|e| e.to_string())?,
+        rating: row.get(6).map_err(|e| e.to_string())?,
+        notes: row.get(7).map_err(|e| e.to_string())?,
+        created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+            .map_err(|e| e.to_string())?
+            .with_timezone(&chrono::Utc),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Database;
-    use toku_core::ReadingStatus;
+    use toku_core::{ProgressType, ReadingStatus};
 
     fn test_db() -> Database {
         Database::open_in_memory().unwrap()
@@ -1136,5 +1278,90 @@ mod tests {
 
         let results = repo.search_books("xyzzyplugh").unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn log_progress_and_get_reading_log() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Dune");
+        repo.create_book(&book).unwrap();
+
+        let mut p1 = ReadingProgress::new(book.id, ProgressType::Page, 50);
+        p1.note = Some("Getting interesting".to_string());
+        repo.log_progress(&p1).unwrap();
+
+        let p2 = ReadingProgress::new(book.id, ProgressType::Page, 100);
+        repo.log_progress(&p2).unwrap();
+
+        let log = repo.get_reading_log(&book.id).unwrap();
+        assert_eq!(log.len(), 2);
+        // DESC order — most recent first
+        assert_eq!(log[0].value, 100);
+        assert_eq!(log[1].value, 50);
+        assert_eq!(log[1].note.as_deref(), Some("Getting interesting"));
+        assert_eq!(log[0].progress_type, ProgressType::Page);
+    }
+
+    #[test]
+    fn get_latest_progress_returns_most_recent() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Dune");
+        repo.create_book(&book).unwrap();
+
+        // No progress yet
+        assert!(repo.get_latest_progress(&book.id).unwrap().is_none());
+
+        let p1 = ReadingProgress::new(book.id, ProgressType::Page, 50);
+        repo.log_progress(&p1).unwrap();
+
+        let p2 = ReadingProgress::new(book.id, ProgressType::Page, 150);
+        repo.log_progress(&p2).unwrap();
+
+        let latest = repo.get_latest_progress(&book.id).unwrap().unwrap();
+        assert_eq!(latest.value, 150);
+    }
+
+    #[test]
+    fn get_active_session_returns_unfinished() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Dune");
+        repo.create_book(&book).unwrap();
+
+        // No sessions yet
+        assert!(repo.get_active_session(&book.id).unwrap().is_none());
+
+        let session = ReadingSession::new(book.id);
+        repo.create_reading_session(&session).unwrap();
+
+        let active = repo.get_active_session(&book.id).unwrap();
+        assert!(active.is_some());
+        assert_eq!(active.unwrap().id, session.id);
+    }
+
+    #[test]
+    fn progress_with_session_link() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Dune");
+        repo.create_book(&book).unwrap();
+
+        let session = ReadingSession::new(book.id);
+        repo.create_reading_session(&session).unwrap();
+
+        let mut progress = ReadingProgress::new(book.id, ProgressType::Percent, 45);
+        progress.session_id = Some(session.id);
+        repo.log_progress(&progress).unwrap();
+
+        let log = repo.get_reading_log(&book.id).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].session_id, Some(session.id));
+        assert_eq!(log[0].progress_type, ProgressType::Percent);
     }
 }

@@ -9,6 +9,12 @@ pub enum TokuError {
     #[error("invalid contributor role: {0}")]
     InvalidRole(String),
 
+    #[error("invalid progress type: {0}")]
+    InvalidProgressType(String),
+
+    #[error("invalid duration format: {0}")]
+    InvalidDuration(String),
+
     #[error("invalid ISBN: {0}")]
     InvalidIsbn(String),
 

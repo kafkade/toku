@@ -44,5 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration file (`config.toml`): default output format, color mode, metadata source
 - `toku config` to view settings, `toku config --edit` to open in editor
 - `toku completions bash|zsh|fish|powershell` for shell completion generation
+- Reading progress tracking: `toku reading update --page|--percent|--chapter|--duration` with timestamped log entries
+- `toku reading log <book>` to view reading progress history
+- Duration parsing for audiobooks (`5h30m`, `330m`, `5.5h`)
+- Calibre library import: `toku import calibre <path>` with books, authors, series, tags, covers, and ISBNs
+- Calibre import supports `--dry-run` and `--no-covers` flags
+- Calibre HTML descriptions automatically stripped to plain text
 
 [Unreleased]: https://github.com/kafkade/toku/compare/v0.1.0...HEAD

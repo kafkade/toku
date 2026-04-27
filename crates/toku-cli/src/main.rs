@@ -1494,22 +1494,29 @@ fn cmd_stats(repo: &BookRepository, year: Option<i32>, output_format: &OutputFor
                 + stats.format_breakdown.audiobook;
 
             if total_formats > 0 {
+                let pct_physical = (stats.format_breakdown.physical * 100)
+                    .checked_div(total_formats)
+                    .unwrap_or(0);
+                let pct_ebook = (stats.format_breakdown.ebook * 100)
+                    .checked_div(total_formats)
+                    .unwrap_or(0);
+                let pct_audiobook = (stats.format_breakdown.audiobook * 100)
+                    .checked_div(total_formats)
+                    .unwrap_or(0);
+
                 println!();
                 println!("  Format breakdown:");
                 println!(
-                    "    Physical:  {:>3} ({}%)",
+                    "    Physical:  {:>3} ({pct_physical}%)",
                     stats.format_breakdown.physical,
-                    stats.format_breakdown.physical * 100 / total_formats
                 );
                 println!(
-                    "    Ebook:     {:>3} ({}%)",
+                    "    Ebook:     {:>3} ({pct_ebook}%)",
                     stats.format_breakdown.ebook,
-                    stats.format_breakdown.ebook * 100 / total_formats
                 );
                 println!(
-                    "    Audiobook: {:>3} ({}%)",
+                    "    Audiobook: {:>3} ({pct_audiobook}%)",
                     stats.format_breakdown.audiobook,
-                    stats.format_breakdown.audiobook * 100 / total_formats
                 );
             }
 

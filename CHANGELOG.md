@@ -34,5 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Goodreads CSV import: `toku import goodreads <file>` with dry-run, idempotent re-import, ISBN cleaning, rating conversion, status mapping, and format detection
 - Import rollback: `toku import undo <import-id>` removes all books from a specific import
 - Import provenance tracking per field for future re-import safety
+- Reading status management: `toku reading start|finish|abandon|hold|resume` with state machine validation and automatic date tracking
+- Reading sessions with per-session ratings and notes
+- Shelves: `toku shelf create|add|remove|list` for user-defined book collections
+- Tags: `toku tag add|remove|list` with case-insensitive matching
+- `toku list --shelf <name>` and `toku list --tag <name>` filters
+- Full-text search now includes author names alongside title and description
+- `toku search` with `--status`, `--shelf`, and `--tag` filters for narrowing results
+- Configuration file (`config.toml`): default output format, color mode, metadata source
+- `toku config` to view settings, `toku config --edit` to open in editor
+- `toku completions bash|zsh|fish|powershell` for shell completion generation
 
 [Unreleased]: https://github.com/kafkade/toku/compare/v0.1.0...HEAD

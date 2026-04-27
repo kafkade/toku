@@ -4,8 +4,9 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use toku_core::{
-    Author, Book, BookFormat, ContributorRole, Isbn, ProgressType, ReadingProgress, ReadingSession,
-    ReadingStatus, TokuConfig, parse_duration_to_minutes,
+    Author, Book, BookFormat, ContributorRole, CurrentlyReadingInput, Isbn, ProgressType,
+    ReadingProgress, ReadingSession, ReadingStatus, TokuConfig, compute_stats,
+    parse_duration_to_minutes,
 };
 use toku_db::{BookRepository, Database};
 
@@ -124,6 +125,19 @@ enum Commands {
     Tag {
         #[command(subcommand)]
         action: TagAction,
+    },
+
+    /// Export your library (csv, json, markdown, backup)
+    Export {
+        #[command(subcommand)]
+        target: ExportTarget,
+    },
+
+    /// Show reading statistics
+    Stats {
+        /// Show stats for a specific year only
+        #[arg(long)]
+        year: Option<i32>,
     },
 }
 
@@ -285,6 +299,37 @@ enum TagAction {
     List,
 }
 
+#[derive(Subcommand)]
+enum ExportTarget {
+    /// Export as CSV
+    Csv {
+        /// Output file path (stdout if omitted)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
+
+    /// Export as JSON
+    Json {
+        /// Output file path (stdout if omitted)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
+
+    /// Export as Markdown
+    Markdown {
+        /// Output file path (stdout if omitted)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
+
+    /// Create a canonical backup (ZIP archive with library data and covers)
+    Backup {
+        /// Output file path (required)
+        #[arg(long, short)]
+        output: PathBuf,
+    },
+}
+
 #[derive(Clone, ValueEnum)]
 enum OutputFormat {
     Table,
@@ -355,6 +400,8 @@ fn main() -> Result<()> {
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Shelf { action } => cmd_shelf(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
+        Commands::Export { target } => cmd_export(&db, &data_dir, target),
+        Commands::Stats { year } => cmd_stats(&repo, year, &cli.format),
         // Already handled above
         Commands::Config { .. } | Commands::Completions { .. } => unreachable!(),
     }
@@ -839,6 +886,50 @@ fn cmd_import(
     }
 }
 
+fn cmd_export(db: &Database, data_dir: &Path, target: ExportTarget) -> Result<()> {
+    match target {
+        ExportTarget::Csv { output } => {
+            if let Some(path) = output {
+                let file = std::fs::File::create(&path)
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+                toku_export::export_csv(db, file).context("CSV export failed")?;
+                eprintln!("✓ Exported CSV to {}", path.display());
+            } else {
+                toku_export::export_csv(db, std::io::stdout()).context("CSV export failed")?;
+            }
+            Ok(())
+        }
+        ExportTarget::Json { output } => {
+            if let Some(path) = output {
+                let file = std::fs::File::create(&path)
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+                toku_export::export_json(db, file).context("JSON export failed")?;
+                eprintln!("✓ Exported JSON to {}", path.display());
+            } else {
+                toku_export::export_json(db, std::io::stdout()).context("JSON export failed")?;
+            }
+            Ok(())
+        }
+        ExportTarget::Markdown { output } => {
+            if let Some(path) = output {
+                let file = std::fs::File::create(&path)
+                    .with_context(|| format!("failed to create {}", path.display()))?;
+                toku_export::export_markdown(db, file).context("Markdown export failed")?;
+                eprintln!("✓ Exported Markdown to {}", path.display());
+            } else {
+                toku_export::export_markdown(db, std::io::stdout())
+                    .context("Markdown export failed")?;
+            }
+            Ok(())
+        }
+        ExportTarget::Backup { output } => {
+            toku_export::export_backup(db, data_dir, &output).context("backup export failed")?;
+            eprintln!("✓ Backup saved to {}", output.display());
+            Ok(())
+        }
+    }
+}
+
 /// Resolve a book title to a Book, returning a user-friendly error if not found.
 fn resolve_book(repo: &BookRepository, title: &str) -> Result<Book> {
     if let Some(book) = repo.find_book_by_title(title)? {
@@ -1305,4 +1396,161 @@ fn cmd_tag(repo: &BookRepository, action: TagAction, output_format: &OutputForma
             Ok(())
         }
     }
+}
+
+fn cmd_stats(repo: &BookRepository, year: Option<i32>, output_format: &OutputFormat) -> Result<()> {
+    let books = repo.list_books()?;
+
+    let sessions = match year {
+        Some(y) => repo.list_reading_sessions_in_year(y)?,
+        None => repo.list_reading_sessions()?,
+    };
+
+    let currently_reading_details = repo.get_currently_reading_details()?;
+    let currently_reading_input: Vec<CurrentlyReadingInput> = currently_reading_details
+        .into_iter()
+        .map(|(book, progress, authors)| {
+            let author = authors
+                .into_iter()
+                .map(|(a, _)| a.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            CurrentlyReadingInput {
+                title: book.title,
+                author,
+                page_count: book.page_count,
+                latest_progress: progress,
+            }
+        })
+        .collect();
+
+    let now = chrono::Utc::now();
+    let stats = compute_stats(&books, &sessions, &currently_reading_input, now);
+
+    match output_format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&stats)?);
+        }
+        OutputFormat::Csv => {
+            println!("metric,value");
+            println!("total_books,{}", stats.total_books);
+            println!("books_read,{}", stats.books_read);
+            println!("books_reading,{}", stats.books_reading);
+            println!("books_want_to_read,{}", stats.books_want_to_read);
+            println!("books_abandoned,{}", stats.books_abandoned);
+            println!("total_pages_read,{}", stats.total_pages_read);
+            println!(
+                "average_rating,{}",
+                stats
+                    .average_rating
+                    .map_or("-".to_string(), |r| format!("{r:.1}"))
+            );
+            println!(
+                "average_rating_stars,{}",
+                stats
+                    .average_rating_stars
+                    .map_or("-".to_string(), |r| format!("{r:.1}"))
+            );
+            println!("books_per_month,{:.1}", stats.books_per_month);
+            println!("pages_per_day,{:.1}", stats.pages_per_day);
+            println!("format_physical,{}", stats.format_breakdown.physical);
+            println!("format_ebook,{}", stats.format_breakdown.ebook);
+            println!("format_audiobook,{}", stats.format_breakdown.audiobook);
+        }
+        OutputFormat::Table => {
+            let header = match year {
+                Some(y) => format!("📊 Reading Statistics ({y})"),
+                None => "📊 Reading Statistics (All Time)".to_string(),
+            };
+            println!("\n{header}\n");
+
+            println!("  Books read:        {:>5}", stats.books_read);
+            println!("  Currently reading: {:>5}", stats.books_reading);
+            println!("  Want to read:      {:>5}", stats.books_want_to_read);
+            println!("  Abandoned:         {:>5}", stats.books_abandoned);
+            println!();
+
+            println!(
+                "  Pages read:        {:>5}",
+                format_number(stats.total_pages_read)
+            );
+            println!(
+                "  Average rating:    {:>5}",
+                stats
+                    .average_rating_stars
+                    .map_or("—".to_string(), |r| format!("{r:.1}★"))
+            );
+            println!(
+                "  Reading pace:      {:>5} books/month",
+                format!("{:.1}", stats.books_per_month)
+            );
+            println!(
+                "                     {:>5} pages/day",
+                format!("{:.1}", stats.pages_per_day)
+            );
+
+            let total_formats = stats.format_breakdown.physical
+                + stats.format_breakdown.ebook
+                + stats.format_breakdown.audiobook;
+
+            if total_formats > 0 {
+                println!();
+                println!("  Format breakdown:");
+                println!(
+                    "    Physical:  {:>3} ({}%)",
+                    stats.format_breakdown.physical,
+                    stats.format_breakdown.physical * 100 / total_formats
+                );
+                println!(
+                    "    Ebook:     {:>3} ({}%)",
+                    stats.format_breakdown.ebook,
+                    stats.format_breakdown.ebook * 100 / total_formats
+                );
+                println!(
+                    "    Audiobook: {:>3} ({}%)",
+                    stats.format_breakdown.audiobook,
+                    stats.format_breakdown.audiobook * 100 / total_formats
+                );
+            }
+
+            if !stats.currently_reading.is_empty() {
+                println!();
+                println!("  Currently reading:");
+                for cr in &stats.currently_reading {
+                    let progress = match (cr.latest_page, cr.total_pages, cr.percent) {
+                        (Some(page), Some(total), Some(pct)) => {
+                            format!(" (page {page}/{total}, {pct:.0}%)")
+                        }
+                        (Some(page), None, _) => format!(" (page {page})"),
+                        _ => String::new(),
+                    };
+                    let author = if cr.author.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", cr.author)
+                    };
+                    println!("    {}{author}{progress}", cr.title);
+                }
+            }
+
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+fn format_number(n: i64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }

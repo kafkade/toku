@@ -1,0 +1,22 @@
+[package]
+name = "toku-export"
+description = "Export implementations for Toku: CSV, JSON, Markdown, canonical backup"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+toku-core = { path = "../toku-core", version = "0.1.0" }
+toku-db = { path = "../toku-db", version = "0.1.0" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+csv = "1"
+zip = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -25,4 +25,4 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
-tabled = "0.17"
+tabled = "0.20"

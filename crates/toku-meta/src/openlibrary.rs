@@ -91,7 +91,13 @@ pub async fn fetch_cover(isbn: &str, covers_dir: &Path) -> Result<Option<String>
         return Ok(None);
     }
 
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let hash = Sha256::digest(&bytes)
+        .iter()
+        .fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            write!(acc, "{b:02x}").unwrap();
+            acc
+        });
     let hash_short = &hash[..16];
     let filename = format!("{hash_short}.jpg");
 

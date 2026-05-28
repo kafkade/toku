@@ -15,6 +15,41 @@ pub struct GoodreadsImportOptions {
     pub dry_run: bool,
 }
 
+/// The outcome of processing a single row.
+#[derive(Debug, Clone)]
+pub enum RowOutcome {
+    Imported,
+    Skipped,
+    Error(String),
+}
+
+/// Progress event emitted for each row during import.
+#[derive(Debug, Clone)]
+pub struct ImportEvent {
+    pub row: usize,
+    pub total: usize,
+    pub title: String,
+    pub author: String,
+    pub status: String,
+    pub outcome: RowOutcome,
+}
+
+/// Trait for observing import progress. Implement this to receive per-row
+/// events during an import (e.g. to drive a progress bar).
+pub trait ImportObserver {
+    fn on_event(&mut self, event: &ImportEvent) -> Result<(), ImportError>;
+}
+
+/// A short summary of a skipped or imported row, kept for the final report.
+#[derive(Debug, Clone)]
+pub struct RowSummary {
+    pub title: String,
+    pub author: String,
+    pub status: String,
+}
+
+const MAX_REPORT_SAMPLES: usize = 20;
+
 /// Summary report of an import operation.
 #[derive(Debug, Default)]
 pub struct ImportReport {
@@ -24,6 +59,12 @@ pub struct ImportReport {
     pub errors: usize,
     pub error_details: Vec<String>,
     pub import_id: Option<String>,
+    /// Bounded sample of imported books (capped at 20).
+    pub imported_samples: Vec<RowSummary>,
+    /// Bounded sample of skipped (duplicate) books (capped at 20).
+    pub skipped_samples: Vec<RowSummary>,
+    /// Counts of imported books by reading status.
+    pub status_counts: HashMap<String, usize>,
 }
 
 impl std::fmt::Display for ImportReport {
@@ -46,19 +87,46 @@ impl std::fmt::Display for ImportReport {
     }
 }
 
+/// Count the number of data rows in a CSV file (excludes the header).
+fn count_csv_rows(csv_path: &Path) -> Result<usize, ImportError> {
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_path(csv_path)?;
+    Ok(rdr.records().count())
+}
+
 /// Import books from a Goodreads CSV export.
+///
+/// If an `observer` is provided, it will be called with progress events for
+/// each row processed, enabling progress bars and live feedback.
 pub fn import_goodreads(
     db: &Database,
     csv_path: &Path,
     opts: &GoodreadsImportOptions,
+    observer: Option<&mut dyn ImportObserver>,
+) -> Result<ImportReport, ImportError> {
+    let total_rows = count_csv_rows(csv_path)?;
+    import_goodreads_inner(db, csv_path, opts, observer, total_rows)
+}
+
+fn import_goodreads_inner(
+    db: &Database,
+    csv_path: &Path,
+    opts: &GoodreadsImportOptions,
+    mut observer: Option<&mut dyn ImportObserver>,
+    total_rows: usize,
 ) -> Result<ImportReport, ImportError> {
     let repo = BookRepository::new(db);
     let mut report = ImportReport::default();
 
     let import_id = Uuid::now_v7().to_string();
 
-    // Create import log entry (unless dry run)
+    // Wrap non-dry-run imports in a transaction for atomicity
     if !opts.dry_run {
+        db.conn.execute_batch("BEGIN IMMEDIATE")?;
+
+        // Create import log entry (rows will reference this via FK)
         db.conn.execute(
             "INSERT INTO import_logs (id, source, file_path, started_at, total_rows)
              VALUES (?1, 'goodreads', ?2, ?3, 0)",
@@ -70,6 +138,57 @@ pub fn import_goodreads(
         )?;
     }
 
+    let result = import_rows(
+        db,
+        &repo,
+        csv_path,
+        opts,
+        &mut report,
+        &import_id,
+        &mut observer,
+        total_rows,
+    );
+
+    if !opts.dry_run {
+        match &result {
+            Ok(()) => {
+                // Finalize import log and commit
+                db.conn.execute(
+                    "UPDATE import_logs SET finished_at = ?1, total_rows = ?2,
+                     imported = ?3, skipped = ?4, errors = ?5 WHERE id = ?6",
+                    params![
+                        Utc::now().to_rfc3339(),
+                        report.total_rows as i64,
+                        report.imported as i64,
+                        report.skipped as i64,
+                        report.errors as i64,
+                        import_id,
+                    ],
+                )?;
+                report.import_id = Some(import_id);
+                db.conn.execute_batch("COMMIT")?;
+            }
+            Err(_) => {
+                db.conn.execute_batch("ROLLBACK").ok();
+            }
+        }
+    }
+
+    result?;
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_rows(
+    db: &Database,
+    repo: &BookRepository,
+    csv_path: &Path,
+    opts: &GoodreadsImportOptions,
+    report: &mut ImportReport,
+    import_id: &str,
+    observer: &mut Option<&mut dyn ImportObserver>,
+    total_rows: usize,
+) -> Result<(), ImportError> {
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -126,10 +245,20 @@ pub fn import_goodreads(
         let record = match result {
             Ok(r) => r,
             Err(e) => {
+                let err_msg = format!("Row {}: CSV parse error: {e}", report.total_rows);
                 report.errors += 1;
-                report
-                    .error_details
-                    .push(format!("Row {}: CSV parse error: {e}", report.total_rows));
+                if report.error_details.len() < MAX_REPORT_SAMPLES {
+                    report.error_details.push(err_msg);
+                }
+                emit_event(
+                    observer,
+                    report.total_rows,
+                    total_rows,
+                    "",
+                    "",
+                    "",
+                    RowOutcome::Error(format!("CSV parse error: {e}")),
+                )?;
                 continue;
             }
         };
@@ -144,33 +273,73 @@ pub fn import_goodreads(
             Some(t) => t,
             None => {
                 report.errors += 1;
-                report
-                    .error_details
-                    .push(format!("Row {}: missing title", report.total_rows));
+                if report.error_details.len() < MAX_REPORT_SAMPLES {
+                    report
+                        .error_details
+                        .push(format!("Row {}: missing title", report.total_rows));
+                }
+                emit_event(
+                    observer,
+                    report.total_rows,
+                    total_rows,
+                    "",
+                    "",
+                    "",
+                    RowOutcome::Error("missing title".to_string()),
+                )?;
                 continue;
             }
         };
 
         let gr_id = get(col_book_id);
+        let author_name = get(col_author).unwrap_or_default();
+        let status_str = get(col_exclusive)
+            .map(|s| map_shelf_to_status(&s).as_str().to_string())
+            .unwrap_or_else(|| "want-to-read".to_string());
 
         // Dedup: skip if goodreads_id already exists
         if let Some(ref id) = gr_id
             && existing_gr_ids.contains_key(id)
         {
             report.skipped += 1;
+            if report.skipped_samples.len() < MAX_REPORT_SAMPLES {
+                report.skipped_samples.push(RowSummary {
+                    title: title.clone(),
+                    author: author_name.clone(),
+                    status: status_str.clone(),
+                });
+            }
+            emit_event(
+                observer,
+                report.total_rows,
+                total_rows,
+                &title,
+                &author_name,
+                &status_str,
+                RowOutcome::Skipped,
+            )?;
             continue;
         }
 
         if opts.dry_run {
-            let author = get(col_author).unwrap_or_default();
-            let status = get(col_exclusive)
-                .map(|s| map_shelf_to_status(&s).as_str().to_string())
-                .unwrap_or_else(|| "want-to-read".to_string());
-            eprintln!(
-                "  [dry-run] Would import: \"{}\" by {} ({})",
-                title, author, status
-            );
             report.imported += 1;
+            *report.status_counts.entry(status_str.clone()).or_insert(0) += 1;
+            if report.imported_samples.len() < MAX_REPORT_SAMPLES {
+                report.imported_samples.push(RowSummary {
+                    title: title.clone(),
+                    author: author_name.clone(),
+                    status: status_str.clone(),
+                });
+            }
+            emit_event(
+                observer,
+                report.total_rows,
+                total_rows,
+                &title,
+                &author_name,
+                &status_str,
+                RowOutcome::Imported,
+            )?;
             continue;
         }
 
@@ -209,7 +378,7 @@ pub fn import_goodreads(
             book.format = map_binding_to_format(&binding);
         }
 
-        // Set goodreads_id
+        // Insert book with goodreads_id
         db.conn.execute(
             "INSERT INTO books (id, title, subtitle, description, page_count, pub_date,
              language, format, duration_minutes, cover_hash, work_id, status, rating,
@@ -254,7 +423,7 @@ pub fn import_goodreads(
         }
 
         // Author
-        if let Some(author_name) = get(col_author) {
+        if let Some(ref author_name) = get(col_author) {
             let a = Author::new(author_name.as_str());
             repo.add_book_author(&a, &book.id, ContributorRole::Author, 0)?;
         }
@@ -292,27 +461,51 @@ pub fn import_goodreads(
             existing_gr_ids.insert(id.clone(), book.id);
         }
 
+        let book_status = book.status.as_str().to_string();
         report.imported += 1;
-    }
+        *report.status_counts.entry(book_status.clone()).or_insert(0) += 1;
+        if report.imported_samples.len() < MAX_REPORT_SAMPLES {
+            report.imported_samples.push(RowSummary {
+                title: title.clone(),
+                author: author_name.clone(),
+                status: book_status.clone(),
+            });
+        }
 
-    // Finalize import log
-    if !opts.dry_run {
-        db.conn.execute(
-            "UPDATE import_logs SET finished_at = ?1, total_rows = ?2,
-             imported = ?3, skipped = ?4, errors = ?5 WHERE id = ?6",
-            params![
-                Utc::now().to_rfc3339(),
-                report.total_rows as i64,
-                report.imported as i64,
-                report.skipped as i64,
-                report.errors as i64,
-                import_id,
-            ],
+        emit_event(
+            observer,
+            report.total_rows,
+            total_rows,
+            &title,
+            &author_name,
+            &book_status,
+            RowOutcome::Imported,
         )?;
-        report.import_id = Some(import_id);
     }
 
-    Ok(report)
+    Ok(())
+}
+
+fn emit_event(
+    observer: &mut Option<&mut dyn ImportObserver>,
+    row: usize,
+    total: usize,
+    title: &str,
+    author: &str,
+    status: &str,
+    outcome: RowOutcome,
+) -> Result<(), ImportError> {
+    if let Some(obs) = observer {
+        obs.on_event(&ImportEvent {
+            row,
+            total,
+            title: title.to_string(),
+            author: author.to_string(),
+            status: status.to_string(),
+            outcome,
+        })?;
+    }
+    Ok(())
 }
 
 /// Undo an import by removing all books added by it.
@@ -392,8 +585,13 @@ mod tests {
         let csv_path = write_test_csv(tmp.path());
         let db = Database::open_in_memory().unwrap();
 
-        let report =
-            import_goodreads(&db, &csv_path, &GoodreadsImportOptions { dry_run: false }).unwrap();
+        let report = import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
 
         assert_eq!(report.total_rows, 3);
         assert_eq!(report.imported, 3);
@@ -431,12 +629,22 @@ mod tests {
         let csv_path = write_test_csv(tmp.path());
         let db = Database::open_in_memory().unwrap();
 
-        let r1 =
-            import_goodreads(&db, &csv_path, &GoodreadsImportOptions { dry_run: false }).unwrap();
+        let r1 = import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
         assert_eq!(r1.imported, 3);
 
-        let r2 =
-            import_goodreads(&db, &csv_path, &GoodreadsImportOptions { dry_run: false }).unwrap();
+        let r2 = import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
         assert_eq!(r2.imported, 0);
         assert_eq!(r2.skipped, 3);
 
@@ -450,8 +658,13 @@ mod tests {
         let csv_path = write_test_csv(tmp.path());
         let db = Database::open_in_memory().unwrap();
 
-        let report =
-            import_goodreads(&db, &csv_path, &GoodreadsImportOptions { dry_run: true }).unwrap();
+        let report = import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: true },
+            None,
+        )
+        .unwrap();
         assert_eq!(report.imported, 3);
 
         let repo = BookRepository::new(&db);
@@ -464,8 +677,13 @@ mod tests {
         let csv_path = write_test_csv(tmp.path());
         let db = Database::open_in_memory().unwrap();
 
-        let report =
-            import_goodreads(&db, &csv_path, &GoodreadsImportOptions { dry_run: false }).unwrap();
+        let report = import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
         assert_eq!(report.imported, 3);
         let import_id = report.import_id.unwrap();
 
@@ -483,7 +701,13 @@ mod tests {
         let csv_path = write_test_csv(tmp.path());
         let db = Database::open_in_memory().unwrap();
 
-        import_goodreads(&db, &csv_path, &GoodreadsImportOptions { dry_run: false }).unwrap();
+        import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
 
         let repo = BookRepository::new(&db);
         let books = repo.list_books().unwrap();

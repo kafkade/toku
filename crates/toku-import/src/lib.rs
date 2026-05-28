@@ -4,4 +4,7 @@ mod goodreads;
 
 pub use calibre::{CalibreImportOptions, import_calibre};
 pub use error::ImportError;
-pub use goodreads::{GoodreadsImportOptions, ImportReport, import_goodreads, undo_import};
+pub use goodreads::{
+    GoodreadsImportOptions, ImportEvent, ImportObserver, ImportReport, RowOutcome, RowSummary,
+    import_goodreads, undo_import,
+};

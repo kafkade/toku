@@ -24,6 +24,64 @@ pub struct OpenLibraryBook {
     pub cover_id: Option<i64>,
 }
 
+/// A single result from an Open Library search.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub title: String,
+    pub authors: Vec<String>,
+    pub first_publish_year: Option<i32>,
+    pub edition_count: i32,
+    pub isbn: Option<String>,
+    pub page_count: Option<i32>,
+    pub openlibrary_key: String,
+    pub languages: Vec<String>,
+}
+
+/// Search Open Library by free-text query. Returns up to `limit` results.
+pub async fn search_books(query: &str, limit: usize) -> Result<Vec<SearchResult>, MetaError> {
+    let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
+
+    let resp = client
+        .get("https://openlibrary.org/search.json")
+        .query(&[
+            ("q", query),
+            ("limit", &limit.to_string()),
+            ("fields", "title,author_name,first_publish_year,isbn,edition_count,key,number_of_pages_median,language"),
+        ])
+        .send()
+        .await?
+        .error_for_status()?;
+    let raw: RawSearchResponse = resp.json().await?;
+
+    let results = raw
+        .docs
+        .into_iter()
+        .map(|doc| {
+            // Pick the first ISBN-13 if available, else first ISBN-10
+            let isbn = doc.isbn.as_ref().and_then(|isbns| {
+                isbns
+                    .iter()
+                    .find(|i| i.len() == 13)
+                    .or(isbns.first())
+                    .cloned()
+            });
+
+            SearchResult {
+                title: doc.title,
+                authors: doc.author_name.unwrap_or_default(),
+                first_publish_year: doc.first_publish_year,
+                edition_count: doc.edition_count.unwrap_or(0),
+                isbn,
+                page_count: doc.number_of_pages_median,
+                openlibrary_key: doc.key,
+                languages: doc.language.unwrap_or_default(),
+            }
+        })
+        .collect();
+
+    Ok(results)
+}
+
 /// Fetch book metadata from Open Library by ISBN.
 pub async fn fetch_by_isbn(isbn: &str) -> Result<OpenLibraryBook, MetaError> {
     let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
@@ -116,6 +174,23 @@ async fn fetch_author_name(client: &reqwest::Client, key: &str) -> Result<String
 }
 
 // --- Raw API response structs ---
+
+#[derive(Deserialize)]
+struct RawSearchResponse {
+    docs: Vec<RawSearchDoc>,
+}
+
+#[derive(Deserialize)]
+struct RawSearchDoc {
+    title: String,
+    author_name: Option<Vec<String>>,
+    first_publish_year: Option<i32>,
+    edition_count: Option<i32>,
+    isbn: Option<Vec<String>>,
+    key: String,
+    number_of_pages_median: Option<i32>,
+    language: Option<Vec<String>>,
+}
 
 #[derive(Deserialize)]
 struct RawEdition {

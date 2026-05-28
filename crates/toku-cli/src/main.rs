@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -51,6 +52,14 @@ enum Commands {
         /// Book format
         #[arg(long, default_value = "physical")]
         book_format: String,
+
+        /// Tag(s) to apply (repeatable)
+        #[arg(long, short = 'T')]
+        tag: Vec<String>,
+
+        /// Initial reading status (want-to-read, reading, read, abandoned, on-hold)
+        #[arg(long)]
+        status: Option<String>,
     },
 
     /// Show details of a book
@@ -64,10 +73,6 @@ enum Commands {
         /// Filter by reading status
         #[arg(long, short)]
         status: Option<String>,
-
-        /// Filter by shelf name
-        #[arg(long)]
-        shelf: Option<String>,
 
         /// Filter by tag name
         #[arg(long)]
@@ -83,10 +88,6 @@ enum Commands {
         #[arg(long, short)]
         status: Option<String>,
 
-        /// Filter by shelf name
-        #[arg(long)]
-        shelf: Option<String>,
-
         /// Filter by tag name
         #[arg(long)]
         tag: Option<String>,
@@ -96,6 +97,16 @@ enum Commands {
     Import {
         #[command(subcommand)]
         source: ImportSource,
+    },
+
+    /// Search Open Library for books online
+    Lookup {
+        /// Search query (title, author, or keywords)
+        query: String,
+
+        /// Maximum number of results to show
+        #[arg(long, default_value = "10")]
+        limit: usize,
     },
 
     /// Show or edit configuration
@@ -121,12 +132,6 @@ enum Commands {
         action: ReadingAction,
     },
 
-    /// Manage shelves for organizing books
-    Shelf {
-        #[command(subcommand)]
-        action: ShelfAction,
-    },
-
     /// Manage tags for categorizing books
     Tag {
         #[command(subcommand)]
@@ -137,6 +142,12 @@ enum Commands {
     Export {
         #[command(subcommand)]
         target: ExportTarget,
+    },
+
+    /// Bulk operations on multiple books
+    Bulk {
+        #[command(subcommand)]
+        action: BulkAction,
     },
 
     /// Show reading statistics
@@ -250,37 +261,6 @@ enum ReadingAction {
 }
 
 #[derive(Subcommand)]
-enum ShelfAction {
-    /// Create a new shelf
-    Create {
-        /// Shelf name
-        name: String,
-    },
-
-    /// Add books to a shelf
-    Add {
-        /// Shelf name
-        shelf: String,
-
-        /// Book titles to add
-        #[arg(required = true)]
-        books: Vec<String>,
-    },
-
-    /// Remove a book from a shelf
-    Remove {
-        /// Shelf name
-        shelf: String,
-
-        /// Book title to remove
-        book: String,
-    },
-
-    /// List all shelves
-    List,
-}
-
-#[derive(Subcommand)]
 enum TagAction {
     /// Add a tag to books
     Add {
@@ -303,6 +283,60 @@ enum TagAction {
 
     /// List all tags with book counts
     List,
+}
+
+#[derive(Subcommand)]
+enum BulkAction {
+    /// Add a tag to all books matching a filter
+    Tag {
+        /// Tag name to apply
+        tag: String,
+
+        /// Filter by reading status
+        #[arg(long, short)]
+        status: Option<String>,
+
+        /// Filter by existing tag
+        #[arg(long)]
+        existing_tag: Option<String>,
+
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Change reading status for all books matching a filter
+    Status {
+        /// New reading status (want-to-read, reading, read, abandoned, on-hold)
+        new_status: String,
+
+        /// Filter by current reading status
+        #[arg(long, short)]
+        status: Option<String>,
+
+        /// Filter by tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Delete all books matching a filter
+    Delete {
+        /// Filter by reading status
+        #[arg(long, short)]
+        status: Option<String>,
+
+        /// Filter by tag
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Preview what would be deleted without actually deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -376,6 +410,8 @@ fn main() -> Result<()> {
             author,
             isbn,
             book_format,
+            tag,
+            status,
         } => cmd_add(
             &repo,
             &db_path,
@@ -383,34 +419,27 @@ fn main() -> Result<()> {
             author,
             isbn,
             &book_format,
+            &tag,
+            status.as_deref(),
             &cli.format,
         ),
         Commands::Show { query } => cmd_show(&repo, &query, &cli.format),
-        Commands::List { status, shelf, tag } => cmd_list(
-            &repo,
-            status.as_deref(),
-            shelf.as_deref(),
-            tag.as_deref(),
-            &cli.format,
-        ),
-        Commands::Search {
-            query,
-            status,
-            shelf,
-            tag,
-        } => cmd_search(
+        Commands::List { status, tag } => {
+            cmd_list(&repo, status.as_deref(), tag.as_deref(), &cli.format)
+        }
+        Commands::Search { query, status, tag } => cmd_search(
             &repo,
             &query,
             status.as_deref(),
-            shelf.as_deref(),
             tag.as_deref(),
             &cli.format,
         ),
         Commands::Import { source } => cmd_import(&db, &repo, source, &cli.format),
+        Commands::Lookup { query, limit } => cmd_lookup(&query, limit, &cli.format),
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
-        Commands::Shelf { action } => cmd_shelf(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
+        Commands::Bulk { action } => cmd_bulk(&repo, action),
         Commands::Stats { year } => cmd_stats(&repo, year, &cli.format),
         // Already handled above
         Commands::Config { .. } | Commands::Completions { .. } => unreachable!(),
@@ -458,6 +487,7 @@ fn cmd_config(data_dir: &Path, show_path: bool, open_edit: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_add(
     repo: &BookRepository,
     db_path: &Path,
@@ -465,11 +495,18 @@ fn cmd_add(
     author: Option<String>,
     isbn: Option<String>,
     book_format: &str,
+    tags: &[String],
+    initial_status: Option<&str>,
     output_format: &OutputFormat,
 ) -> Result<()> {
     let format: BookFormat = book_format
         .parse()
         .with_context(|| format!("invalid format: {book_format}"))?;
+
+    // Parse status early to fail fast before creating the book
+    let target_status = initial_status
+        .map(|s| ReadingStatus::from_str(s).map_err(|_| anyhow::anyhow!("invalid status: {s}")))
+        .transpose()?;
 
     if let Some(isbn_str) = &isbn {
         let validated = Isbn::parse(isbn_str).context("invalid ISBN")?;
@@ -477,7 +514,10 @@ fn cmd_add(
 
         // Check for existing book with this ISBN
         if let Some(existing) = repo.find_by_isbn(&isbn13)? {
-            eprintln!("Book already exists: {} ({})", existing.title, existing.id);
+            // Apply tags/status to existing book instead of silently ignoring
+            apply_post_add(repo, &existing, tags, target_status)?;
+            print_books(&[existing], repo, output_format)?;
+            eprintln!("Book already exists — applied tags/status updates");
             return Ok(());
         }
 
@@ -518,6 +558,7 @@ fn cmd_add(
                     repo.add_book_author(&a, &book.id, ContributorRole::Author, i as i32)?;
                 }
 
+                apply_post_add(repo, &book, tags, target_status)?;
                 print_books(&[book], repo, output_format)?;
                 eprintln!("✓ Added from Open Library");
             }
@@ -528,6 +569,7 @@ fn cmd_add(
                 book.format = format;
                 repo.create_book(&book)?;
                 repo.add_isbn(&isbn13, &book.id)?;
+                apply_post_add(repo, &book, tags, target_status)?;
                 print_books(&[book], repo, output_format)?;
             }
         }
@@ -541,12 +583,37 @@ fn cmd_add(
             repo.add_book_author(&a, &book.id, ContributorRole::Author, 0)?;
         }
 
+        apply_post_add(repo, &book, tags, target_status)?;
         print_books(&[book], repo, output_format)?;
         eprintln!("✓ Added manually");
     } else {
         anyhow::bail!("provide --isbn or --title to add a book");
     }
 
+    Ok(())
+}
+
+/// Apply tags and optional status change after creating/finding a book.
+fn apply_post_add(
+    repo: &BookRepository,
+    book: &Book,
+    tags: &[String],
+    status: Option<ReadingStatus>,
+) -> Result<()> {
+    for tag_name in tags {
+        let trimmed = tag_name.trim();
+        if !trimmed.is_empty() {
+            repo.add_tag_to_book(&book.id, trimmed)?;
+        }
+    }
+    if let Some(target) = status {
+        repo.update_book_status(&book.id, target)?;
+        // If marking as "reading", also create a reading session
+        if target == ReadingStatus::Reading {
+            let session = ReadingSession::new(book.id);
+            repo.create_reading_session(&session)?;
+        }
+    }
     Ok(())
 }
 
@@ -570,16 +637,123 @@ fn cmd_show(repo: &BookRepository, query: &str, output_format: &OutputFormat) ->
     Ok(())
 }
 
+fn cmd_lookup(query: &str, limit: usize, output_format: &OutputFormat) -> Result<()> {
+    eprintln!("Searching Open Library for \"{query}\"...\n");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let results = rt
+        .block_on(toku_meta::search_books(query, limit))
+        .context("Open Library search failed")?;
+
+    if results.is_empty() {
+        eprintln!("No results found.");
+        return Ok(());
+    }
+
+    match output_format {
+        OutputFormat::Json => {
+            let json_results: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "title": r.title,
+                        "authors": r.authors,
+                        "year": r.first_publish_year,
+                        "isbn": r.isbn,
+                        "pages": r.page_count,
+                        "editions": r.edition_count,
+                        "languages": r.languages,
+                        "openlibrary_key": r.openlibrary_key,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&json_results)?);
+        }
+        OutputFormat::Csv => {
+            let mut wtr = csv::Writer::from_writer(std::io::stdout());
+            wtr.write_record(["Title", "Author", "Year", "ISBN", "Pages", "Editions"])?;
+            for r in &results {
+                wtr.write_record([
+                    &r.title,
+                    &r.authors.join(", "),
+                    &r.first_publish_year
+                        .map_or("—".to_string(), |y| y.to_string()),
+                    r.isbn.as_deref().unwrap_or("—"),
+                    &r.page_count.map_or("—".to_string(), |p| p.to_string()),
+                    &r.edition_count.to_string(),
+                ])?;
+            }
+            wtr.flush()?;
+        }
+        OutputFormat::Table => {
+            use tabled::settings::Style;
+            use tabled::{Table, Tabled};
+
+            let term_width = crossterm::terminal::size()
+                .map(|(w, _)| w as usize)
+                .unwrap_or(120);
+
+            // #(3) + Title + Author + Year(4) + ISBN(13) + Pages(5) + Editions(4)
+            let fixed_overhead = 50;
+            let flexible = term_width.saturating_sub(fixed_overhead);
+            let title_max = (flexible * 3 / 5).max(15);
+            let author_max = flexible.saturating_sub(title_max).max(10);
+
+            #[derive(Tabled)]
+            struct Row {
+                #[tabled(rename = "#")]
+                idx: String,
+                #[tabled(rename = "Title")]
+                title: String,
+                #[tabled(rename = "Author")]
+                author: String,
+                #[tabled(rename = "Year")]
+                year: String,
+                #[tabled(rename = "ISBN")]
+                isbn: String,
+                #[tabled(rename = "Pages")]
+                pages: String,
+                #[tabled(rename = "Ed.")]
+                editions: String,
+            }
+
+            let rows: Vec<Row> = results
+                .iter()
+                .enumerate()
+                .map(|(i, r)| Row {
+                    idx: format!("{}", i + 1),
+                    title: import_ui::truncate_str(&r.title, title_max),
+                    author: import_ui::truncate_str(&r.authors.join(", "), author_max),
+                    year: r
+                        .first_publish_year
+                        .map_or("—".to_string(), |y| y.to_string()),
+                    isbn: r.isbn.clone().unwrap_or_else(|| "—".to_string()),
+                    pages: r.page_count.map_or("—".to_string(), |p| p.to_string()),
+                    editions: r.edition_count.to_string(),
+                })
+                .collect();
+
+            let mut table = Table::new(rows);
+            table.with(Style::rounded());
+            println!("{table}");
+
+            eprintln!("\nTo add a book: toku add --isbn <ISBN>",);
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_list(
     repo: &BookRepository,
     status: Option<&str>,
-    shelf: Option<&str>,
     tag: Option<&str>,
     output_format: &OutputFormat,
 ) -> Result<()> {
-    let books = if let Some(shelf_name) = shelf {
-        repo.list_books_in_shelf(shelf_name)?
-    } else if let Some(tag_name) = tag {
+    let books = if let Some(tag_name) = tag {
         repo.list_books_by_tag(tag_name)?
     } else {
         repo.list_books()?
@@ -606,11 +780,10 @@ fn cmd_search(
     repo: &BookRepository,
     query: &str,
     status: Option<&str>,
-    shelf: Option<&str>,
     tag: Option<&str>,
     output_format: &OutputFormat,
 ) -> Result<()> {
-    let books = repo.search_books_filtered(query, status, shelf, tag)?;
+    let books = repo.search_books_filtered(query, status, None, tag)?;
     if books.is_empty() {
         eprintln!("No results for \"{query}\"");
         return Ok(());
@@ -1229,104 +1402,6 @@ fn cmd_reading(
     }
 }
 
-fn cmd_shelf(
-    repo: &BookRepository,
-    action: ShelfAction,
-    output_format: &OutputFormat,
-) -> Result<()> {
-    match action {
-        ShelfAction::Create { name } => {
-            repo.create_shelf(&name)?;
-            eprintln!("✓ Created shelf \"{name}\"");
-            Ok(())
-        }
-        ShelfAction::Add { shelf, books } => {
-            for title in &books {
-                let book = resolve_book(repo, title)?;
-                repo.add_book_to_shelf(&book.id, &shelf)?;
-                eprintln!("✓ Added \"{}\" to shelf \"{shelf}\"", book.title);
-            }
-            Ok(())
-        }
-        ShelfAction::Remove { shelf, book: title } => {
-            let book = resolve_book(repo, &title)?;
-            repo.remove_book_from_shelf(&book.id, &shelf)?;
-            eprintln!("✓ Removed \"{}\" from shelf \"{shelf}\"", book.title);
-            Ok(())
-        }
-        ShelfAction::List => {
-            let shelves = repo.list_shelves()?;
-            if shelves.is_empty() {
-                eprintln!("No shelves yet. Create one with: toku shelf create <name>");
-                return Ok(());
-            }
-
-            match output_format {
-                OutputFormat::Json => {
-                    #[derive(serde::Serialize)]
-                    struct ShelfOut {
-                        name: String,
-                        books: usize,
-                    }
-                    let out: Vec<ShelfOut> = shelves
-                        .iter()
-                        .map(|s| {
-                            let count = repo
-                                .list_books_in_shelf(&s.name)
-                                .map(|b| b.len())
-                                .unwrap_or(0);
-                            ShelfOut {
-                                name: s.name.clone(),
-                                books: count,
-                            }
-                        })
-                        .collect();
-                    println!("{}", serde_json::to_string_pretty(&out)?);
-                }
-                OutputFormat::Csv => {
-                    println!("name,books");
-                    for s in &shelves {
-                        let count = repo
-                            .list_books_in_shelf(&s.name)
-                            .map(|b| b.len())
-                            .unwrap_or(0);
-                        println!("\"{}\",{}", s.name.replace('"', "\"\""), count);
-                    }
-                }
-                OutputFormat::Table => {
-                    use tabled::{Table, Tabled};
-
-                    #[derive(Tabled)]
-                    struct Row {
-                        #[tabled(rename = "Shelf")]
-                        name: String,
-                        #[tabled(rename = "Books")]
-                        books: usize,
-                    }
-
-                    let rows: Vec<Row> = shelves
-                        .iter()
-                        .map(|s| {
-                            let count = repo
-                                .list_books_in_shelf(&s.name)
-                                .map(|b| b.len())
-                                .unwrap_or(0);
-                            Row {
-                                name: s.name.clone(),
-                                books: count,
-                            }
-                        })
-                        .collect();
-
-                    println!("{}", Table::new(rows));
-                }
-            }
-            eprintln!("\n{} shelf(s)", shelves.len());
-            Ok(())
-        }
-    }
-}
-
 fn cmd_tag(repo: &BookRepository, action: TagAction, output_format: &OutputFormat) -> Result<()> {
     match action {
         TagAction::Add { tag, books } => {
@@ -1395,6 +1470,161 @@ fn cmd_tag(repo: &BookRepository, action: TagAction, output_format: &OutputForma
                 }
             }
             eprintln!("\n{} tag(s)", tags.len());
+            Ok(())
+        }
+    }
+}
+
+fn resolve_bulk_books(
+    repo: &BookRepository,
+    status: Option<&str>,
+    tag: Option<&str>,
+) -> Result<Vec<Book>> {
+    let status_filter = status
+        .map(|s| ReadingStatus::from_str(s).map_err(|_| anyhow::anyhow!("invalid status: {s}")))
+        .transpose()?;
+
+    let books = if let Some(tag_name) = tag {
+        repo.list_books_by_tag(tag_name)?
+    } else {
+        repo.list_books()?
+    };
+
+    let filtered: Vec<Book> = if let Some(st) = status_filter {
+        books.into_iter().filter(|b| b.status == st).collect()
+    } else {
+        books
+    };
+
+    Ok(filtered)
+}
+
+fn cmd_bulk(repo: &BookRepository, action: BulkAction) -> Result<()> {
+    match action {
+        BulkAction::Tag {
+            tag,
+            status,
+            existing_tag,
+            dry_run,
+        } => {
+            let books = resolve_bulk_books(repo, status.as_deref(), existing_tag.as_deref())?;
+
+            if books.is_empty() {
+                eprintln!("No books match the given filter.");
+                return Ok(());
+            }
+
+            let verb = if dry_run { "Would tag" } else { "Tagging" };
+            eprintln!("{verb} {} book(s) with \"{tag}\":\n", books.len());
+
+            for book in &books {
+                if dry_run {
+                    eprintln!("  [dry-run] \"{}\"", book.title);
+                } else {
+                    repo.add_tag_to_book(&book.id, &tag)?;
+                    eprintln!("  ✓ \"{}\"", book.title);
+                }
+            }
+
+            eprintln!(
+                "\n{} {} book(s).",
+                if dry_run { "Would tag" } else { "Tagged" },
+                books.len()
+            );
+            Ok(())
+        }
+        BulkAction::Status {
+            new_status,
+            status,
+            tag,
+            dry_run,
+        } => {
+            let target_status = ReadingStatus::from_str(&new_status)
+                .map_err(|_| anyhow::anyhow!("invalid status: {new_status}"))?;
+
+            let books = resolve_bulk_books(repo, status.as_deref(), tag.as_deref())?;
+
+            if books.is_empty() {
+                eprintln!("No books match the given filter.");
+                return Ok(());
+            }
+
+            let verb = if dry_run { "Would update" } else { "Updating" };
+            eprintln!(
+                "{verb} {} book(s) to status \"{}\":\n",
+                books.len(),
+                target_status.as_str()
+            );
+
+            let mut updated = 0;
+            let mut skipped = 0;
+            for book in &books {
+                if book.status == target_status {
+                    skipped += 1;
+                    continue;
+                }
+                if dry_run {
+                    eprintln!(
+                        "  [dry-run] \"{}\" ({} → {})",
+                        book.title,
+                        book.status.as_str(),
+                        target_status.as_str()
+                    );
+                } else {
+                    repo.update_book_status(&book.id, target_status)?;
+                    eprintln!(
+                        "  ✓ \"{}\" ({} → {})",
+                        book.title,
+                        book.status.as_str(),
+                        target_status.as_str()
+                    );
+                }
+                updated += 1;
+            }
+
+            let past = if dry_run { "Would update" } else { "Updated" };
+            eprintln!(
+                "\n{past} {updated} book(s), skipped {skipped} (already {}).",
+                target_status.as_str()
+            );
+            Ok(())
+        }
+        BulkAction::Delete {
+            status,
+            tag,
+            dry_run,
+        } => {
+            let books = resolve_bulk_books(repo, status.as_deref(), tag.as_deref())?;
+
+            if books.is_empty() {
+                eprintln!("No books match the given filter.");
+                return Ok(());
+            }
+
+            if !dry_run && status.is_none() && tag.is_none() {
+                anyhow::bail!(
+                    "Refusing to delete all books without a filter. \
+                     Use --status or --tag to narrow the scope."
+                );
+            }
+
+            let verb = if dry_run { "Would delete" } else { "Deleting" };
+            eprintln!("{verb} {} book(s):\n", books.len());
+
+            for book in &books {
+                if dry_run {
+                    eprintln!("  [dry-run] \"{}\"", book.title);
+                } else {
+                    repo.delete_book(&book.id)?;
+                    eprintln!("  ✗ \"{}\"", book.title);
+                }
+            }
+
+            eprintln!(
+                "\n{} {} book(s).",
+                if dry_run { "Would delete" } else { "Deleted" },
+                books.len()
+            );
             Ok(())
         }
     }

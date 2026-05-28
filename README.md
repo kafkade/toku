@@ -11,14 +11,17 @@ on your machine.
 
 ```sh
 toku add --isbn 9780441013593          # Add a book by ISBN
+toku add --title "Dune" -T sci-fi      # Add with tags
 toku import goodreads ~/export.csv     # Import your Goodreads library
 toku reading start "Dune" --page 1     # Start tracking progress
 toku reading update "Dune" --page 145  # Log where you are
 toku reading finish "Dune" --rating 5  # Done — rate it
 toku stats --year 2025                 # See your reading stats
+toku browse                            # Interactive TUI browser
 ```
 
-> **Status**: Early development. Not yet usable.
+> **Status**: Early development — functional CLI with import, tracking, search,
+> TUI browser, and export. Usable for personal reading management.
 
 ---
 
@@ -53,17 +56,17 @@ their ever-growing libraries.
   interfaces are planned for later — built on the same core library.
 - **Open source.** MIT licensed. Contributions welcome.
 
-## Features (Planned)
+## Features
 
-- 📖 Add books manually, by ISBN, or by search
+- 📖 Add books manually, by ISBN, or by Open Library search
 - 📊 Reading progress tracking (pages, percentage, chapters, audiobook time)
-- 🏷️ Shelves, tags, mood tags, and smart filters
-- 📈 Reading statistics and analytics (pace, streaks, genre distribution, yearly wrap-up)
-- 📥 Import from Goodreads CSV, Calibre, StoryGraph
-- 📤 Export to CSV, JSON, Markdown, BibTeX
-- 🔍 Full-text search across your entire library
-- 🎯 Reading goals and challenges
-- 🎧 Audiobook support (narrator, duration, time-based progress)
+- 🏷️ Tags for organizing your library (imported Goodreads shelves become tags)
+- 📈 Reading statistics and analytics (pace, format breakdown, yearly filtering)
+- 📥 Import from Goodreads CSV and Calibre (with dry-run, dedup, and tag preservation)
+- 📤 Export to CSV, JSON, Markdown, and canonical backup (ZIP)
+- 🔍 Full-text search across your entire library (titles, authors, descriptions)
+- 🖥️ Interactive TUI browser with split-pane layout, filters, and live detail view
+- 🔄 Bulk operations for tagging, status changes, and deletions across filtered sets
 
 ## Tech Stack
 

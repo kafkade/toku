@@ -17,8 +17,8 @@ Every importer implements a common `ImportEngine` trait with these capabilities:
 
 1. **Dry-run mode**: `--dry-run` shows what would happen without writing to the database.
 2. **Idempotent re-import**: Each imported record stores a source identifier (e.g.,
-   `goodreads_id`, `calibre_id`). Re-importing the same file skips existing entries and
-   updates changed fields (respecting user edits).
+   `goodreads_id`, `calibre_id`). Re-importing the same file updates tags on existing
+   entries and imports new ones (respecting user edits).
 3. **Match confidence levels**:
    - Exact: ISBN match → auto-merge
    - High: Title + Author exact match → auto-merge with summary
@@ -30,7 +30,11 @@ Every importer implements a common `ImportEngine` trait with these capabilities:
 6. **Provenance tracking**: Every imported field records `(source, timestamp)`. User
    edits clear provenance and set `user_override`.
 7. **Rollback**: `toku import undo <import-id>` removes books added by that import.
+   Note: tags applied to pre-existing books during re-import are not rolled back.
 8. **Import log**: `import_logs` table records every operation.
+9. **Shelf-to-tag conversion**: Goodreads `Bookshelves` column values are imported as
+   tags. Non-standard exclusive shelves are also preserved as tags. Standard exclusive
+   shelves (`read`, `to-read`, `currently-reading`) map to `ReadingStatus`.
 
 ### Import priority
 

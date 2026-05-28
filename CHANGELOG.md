@@ -10,15 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Interactive TUI library browser (`toku browse`, or just `toku` with no subcommand) with split-pane layout: scrollable book list on the left, live detail view on the right
-- Filter popup in TUI browser to narrow books by reading status, shelf, or tag
+- Tag display in TUI book detail pane with styled cyan labels
+- Filter popup in TUI browser to narrow books by reading status or tag
 - Ratatui-based import progress UI with live progress bar, per-row activity log, and colored status indicators
-- Structured import summary with status breakdown, sample lists of imported/skipped books, and undo instructions
+- Structured import summary with status breakdown, sample lists of imported/skipped/updated books, and undo instructions
 - Width-aware `toku list` table output that adapts columns to terminal width with modern rounded borders
+- Open Library search: `toku search --online <query>` searches the Open Library API and displays results with ISBNs for easy adding
+- Bulk operations: `toku bulk tag|status|delete` for applying tags, changing status, or deleting multiple books at once, with `--dry-run` and filter flags (`--status`, `--tag`)
+- `toku add --tag <tag>` (`-T`) flag to apply tags when adding a book
+- `toku add --status <status>` flag to set reading status when adding a book (creates a reading session automatically for `--status reading`)
+- Goodreads import now converts the `Bookshelves` CSV column into tags, preserving user shelf organization
+- Goodreads re-import updates tags on existing books instead of silently skipping them (shown as `Updated` in progress UI)
+- Non-standard Goodreads exclusive shelves (e.g., custom shelves like "favorites") are preserved as tags to avoid data loss
 
 ### Changed
 
 - Goodreads importer now uses observer pattern for progress reporting and wraps non-dry-run imports in a transaction for atomicity
-- Import report includes bounded sample lists (up to 20) of imported and skipped books with status counts
+- Import report includes bounded sample lists (up to 20) of imported, updated, and skipped books with status counts
+- Shelves merged into tags — all user-created groupings are now tags; `ReadingStatus` remains as the separate state machine for tracking reading progress
+- Removed `toku shelf` command — use `toku tag` instead (existing shelf data migrated to tags via DB migration V8)
+- Removed `--shelf` filter from `toku list` and `toku search` — use `--tag` instead
 
 ### Fixed
 

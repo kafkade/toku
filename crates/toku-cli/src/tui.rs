@@ -1,7 +1,7 @@
 //! Interactive TUI browser for the Toku book library.
 //!
 //! Split-pane layout: left = scrollable book list, right = book details.
-//! Supports filtering by status, shelf, and tag via a popup overlay.
+//! Supports filtering by status and tag via a popup overlay.
 
 use std::io::{self, IsTerminal};
 
@@ -21,7 +21,6 @@ use crate::import_ui::truncate_str;
 enum Filter {
     All,
     Status(ReadingStatus),
-    Shelf(String),
     Tag(String),
 }
 
@@ -30,7 +29,6 @@ impl std::fmt::Display for Filter {
         match self {
             Filter::All => write!(f, "All Books"),
             Filter::Status(s) => write!(f, "Status: {s}"),
-            Filter::Shelf(n) => write!(f, "Shelf: {n}"),
             Filter::Tag(n) => write!(f, "Tag: {n}"),
         }
     }
@@ -44,7 +42,6 @@ enum Mode {
 struct BookDetail {
     authors: Vec<String>,
     isbns: Vec<String>,
-    shelves: Vec<String>,
     tags: Vec<String>,
 }
 
@@ -74,7 +71,6 @@ struct App<'a> {
 
     // Data
     books: Vec<toku_core::Book>,
-    shelves: Vec<toku_core::Shelf>,
     tags: Vec<(toku_core::Tag, i64)>,
 
     // Active filter
@@ -98,7 +94,6 @@ struct App<'a> {
 impl<'a> App<'a> {
     fn new(repo: &'a BookRepository<'a>) -> Result<Self> {
         let books = repo.list_books().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let shelves = repo.list_shelves().map_err(|e| anyhow::anyhow!("{e}"))?;
         let tags = repo
             .list_tags_with_counts()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -106,7 +101,6 @@ impl<'a> App<'a> {
         let mut app = Self {
             repo,
             books,
-            shelves,
             tags,
             active_filter: Filter::All,
             list_state: ListState::default(),
@@ -137,7 +131,6 @@ impl<'a> App<'a> {
                     .list_books()
                     .map(|books| books.into_iter().filter(|b| b.status == target).collect())
             }
-            Filter::Shelf(name) => self.repo.list_books_in_shelf(name),
             Filter::Tag(name) => self.repo.list_books_by_tag(name),
         };
 
@@ -182,14 +175,6 @@ impl<'a> App<'a> {
 
         let isbns = self.repo.get_book_isbns(&book_id).unwrap_or_default();
 
-        let shelves = self
-            .repo
-            .get_book_shelves(&book_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
-
         let tags = self
             .repo
             .get_book_tags(&book_id)
@@ -201,7 +186,6 @@ impl<'a> App<'a> {
         self.detail = Some(BookDetail {
             authors,
             isbns,
-            shelves,
             tags,
         });
         self.detail_idx = Some(idx);
@@ -341,22 +325,6 @@ impl<'a> App<'a> {
                 filter: Filter::Status(status),
                 selectable: true,
             });
-        }
-
-        // ── Shelves section
-        if !self.shelves.is_empty() {
-            items.push(FilterItem {
-                label: "── Shelves ──".to_string(),
-                filter: Filter::All,
-                selectable: false,
-            });
-            for shelf in &self.shelves {
-                items.push(FilterItem {
-                    label: format!("  📚 {}", shelf.name),
-                    filter: Filter::Shelf(shelf.name.clone()),
-                    selectable: true,
-                });
-            }
         }
 
         // ── Tags section
@@ -617,23 +585,35 @@ fn draw_book_detail(frame: &mut Frame, area: Rect, app: &App) {
         ]));
     }
 
-    // Shelves & Tags
-    if !detail.shelves.is_empty() || !detail.tags.is_empty() {
-        lines.push(Line::from(""));
-    }
-
-    if !detail.shelves.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Shelves   ", Style::default().fg(Color::DarkGray)),
-            Span::raw(detail.shelves.join(", ")),
-        ]));
-    }
-
+    // Tags
     if !detail.tags.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Tags      ", Style::default().fg(Color::DarkGray)),
-            Span::raw(detail.tags.join(", ")),
-        ]));
+        lines.push(Line::from(""));
+        let tag_spans: Vec<Span> = detail
+            .tags
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| {
+                let mut spans = Vec::new();
+                if i > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(
+                    format!(" {t} "),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans
+            })
+            .collect();
+        lines.push(Line::from(
+            std::iter::once(Span::styled(
+                "Tags      ",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .chain(tag_spans)
+            .collect::<Vec<_>>(),
+        ));
     }
 
     // Description (word-wrapped by Paragraph)

@@ -25,18 +25,24 @@ well-documented. It is a first-class product, not a debug tool.
 ## Command Hierarchy
 
 ```sh
-toku add [--isbn <isbn> | --title <title> --author <author>]
+toku                                            # Launch TUI browser (default)
+toku browse                                     # Launch TUI browser (explicit)
+toku add [--isbn <isbn> | --title <title> --author <author>] [-T <tag>...] [--status <status>]
 toku show <book>
-toku list [--status <status>] [--shelf <shelf>] [--sort <field>]
-toku search <query>
+toku list [--status <status>] [--tag <tag>] [--sort <field>]
+toku search <query> [--status <status>] [--tag <tag>] [--online]
 toku reading start|update|finish|abandon <book> [--page N] [--rating N]
 toku import goodreads|calibre|storygraph <path> [--dry-run]
 toku export csv|json|backup [--output <path>]
 toku stats [--year <year>]
-toku shelf create|add|remove|list <shelf> [<books>...]
 toku tag add|remove|list <tag> [<books>...]
+toku bulk tag|status|delete [--status <s>] [--tag <t>] [--dry-run]
 toku config [--edit]
 ```
+
+> **Note**: Shelves were merged into tags (see migration V8). Use `toku tag`
+> for all user-defined book groupings. `ReadingStatus` remains a separate
+> per-book state machine.
 
 ## Rationale
 

@@ -69,6 +69,7 @@ struct ImportProgressState {
     current: usize,
     total: usize,
     imported: usize,
+    updated: usize,
     skipped: usize,
     errors: usize,
     recent: Vec<ActivityEntry>,
@@ -81,6 +82,7 @@ impl ImportProgressState {
             current: 0,
             total,
             imported: 0,
+            updated: 0,
             skipped: 0,
             errors: 0,
             recent: Vec::with_capacity(ACTIVITY_LOG_SIZE),
@@ -92,6 +94,7 @@ impl ImportProgressState {
         self.current = event.row;
         match &event.outcome {
             RowOutcome::Imported => self.imported += 1,
+            RowOutcome::Updated => self.updated += 1,
             RowOutcome::Skipped => self.skipped += 1,
             RowOutcome::Error(_) => self.errors += 1,
         }
@@ -204,6 +207,7 @@ fn render_progress_bar(frame: &mut Frame, area: Rect, state: &ImportProgressStat
 
 fn render_stats(frame: &mut Frame, area: Rect, state: &ImportProgressState) {
     let imported_style = Style::default().fg(Color::Green).bold();
+    let updated_style = Style::default().fg(Color::Cyan).bold();
     let skipped_style = Style::default().fg(Color::Yellow).bold();
     let error_style = Style::default().fg(Color::Red).bold();
     let label_style = Style::default().fg(Color::Gray);
@@ -213,6 +217,10 @@ fn render_stats(frame: &mut Frame, area: Rect, state: &ImportProgressState) {
         Span::styled("✓ ", imported_style),
         Span::styled("Imported ", label_style),
         Span::styled(format!("{:<6}", state.imported), imported_style),
+        Span::raw("   "),
+        Span::styled("⟳ ", updated_style),
+        Span::styled("Updated ", label_style),
+        Span::styled(format!("{:<6}", state.updated), updated_style),
         Span::raw("   "),
         Span::styled("↷ ", skipped_style),
         Span::styled("Duplicates ", label_style),
@@ -251,6 +259,7 @@ fn render_activity_log(frame: &mut Frame, area: Rect, state: &ImportProgressStat
         .map(|entry| {
             let (icon, icon_style) = match &entry.outcome {
                 RowOutcome::Imported => ("✓ ", Style::default().fg(Color::Green)),
+                RowOutcome::Updated => ("⟳ ", Style::default().fg(Color::Cyan)),
                 RowOutcome::Skipped => ("↷ ", Style::default().fg(Color::Yellow)),
                 RowOutcome::Error(_) => ("✗ ", Style::default().fg(Color::Red)),
             };
@@ -264,12 +273,14 @@ fn render_activity_log(frame: &mut Frame, area: Rect, state: &ImportProgressStat
 
             let right_label = match &entry.outcome {
                 RowOutcome::Imported => entry.status.clone(),
+                RowOutcome::Updated => "(tags updated)".to_string(),
                 RowOutcome::Skipped => "(duplicate)".to_string(),
                 RowOutcome::Error(e) => truncate_str(e, 30),
             };
 
             let right_style = match &entry.outcome {
                 RowOutcome::Imported => Style::default().fg(Color::DarkGray),
+                RowOutcome::Updated => Style::default().fg(Color::Cyan),
                 RowOutcome::Skipped => Style::default().fg(Color::Yellow),
                 RowOutcome::Error(_) => Style::default().fg(Color::Red),
             };
@@ -390,6 +401,13 @@ fn print_summary_table(report: &ImportReport, dry_run: bool) {
     // Main stats
     let status_label = if dry_run { "Would import" } else { "Imported" };
     eprintln!("    {:<14} {:>4} books", status_label, report.imported);
+    if report.updated > 0 {
+        let update_label = if dry_run { "Would update" } else { "Updated" };
+        eprintln!(
+            "    {:<14} {:>4} (tags added to existing books)",
+            update_label, report.updated
+        );
+    }
     if report.skipped > 0 {
         eprintln!(
             "    {:<14} {:>4} (already in library)",
@@ -417,6 +435,25 @@ fn print_summary_table(report: &ImportReport, dry_run: bool) {
                 other => other,
             };
             eprintln!("    {:<20} {:>4}", label, count);
+        }
+    }
+
+    // Updated books sample
+    if !report.updated_samples.is_empty() {
+        eprintln!("\n  Tags updated on existing books:");
+        for s in &report.updated_samples {
+            let author = if s.author.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", s.author)
+            };
+            eprintln!("    ⟳ {}{}", truncate_str(&s.title, 50), author);
+        }
+        if report.updated > report.updated_samples.len() {
+            eprintln!(
+                "    ... and {} more",
+                report.updated - report.updated_samples.len()
+            );
         }
     }
 
@@ -462,10 +499,12 @@ fn print_summary_json(report: &ImportReport, dry_run: bool) {
         dry_run: bool,
         total_rows: usize,
         imported: usize,
+        updated: usize,
         skipped: usize,
         errors: usize,
         import_id: Option<String>,
         error_details: Vec<String>,
+        updated_books: Vec<JsonRowSummary>,
         skipped_books: Vec<JsonRowSummary>,
         imported_books: Vec<JsonRowSummary>,
         status_counts: std::collections::HashMap<String, usize>,
@@ -481,10 +520,20 @@ fn print_summary_json(report: &ImportReport, dry_run: bool) {
         dry_run,
         total_rows: report.total_rows,
         imported: report.imported,
+        updated: report.updated,
         skipped: report.skipped,
         errors: report.errors,
         import_id: report.import_id.clone(),
         error_details: report.error_details.clone(),
+        updated_books: report
+            .updated_samples
+            .iter()
+            .map(|s| JsonRowSummary {
+                title: s.title.clone(),
+                author: s.author.clone(),
+                status: s.status.clone(),
+            })
+            .collect(),
         skipped_books: report
             .skipped_samples
             .iter()
@@ -509,11 +558,12 @@ fn print_summary_json(report: &ImportReport, dry_run: bool) {
 }
 
 fn print_summary_csv(report: &ImportReport) {
-    println!("total_rows,imported,skipped,errors,import_id");
+    println!("total_rows,imported,updated,skipped,errors,import_id");
     println!(
-        "{},{},{},{},{}",
+        "{},{},{},{},{},{}",
         report.total_rows,
         report.imported,
+        report.updated,
         report.skipped,
         report.errors,
         report.import_id.as_deref().unwrap_or(""),

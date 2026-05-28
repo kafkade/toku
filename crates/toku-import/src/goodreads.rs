@@ -20,6 +20,7 @@ pub struct GoodreadsImportOptions {
 pub enum RowOutcome {
     Imported,
     Skipped,
+    Updated,
     Error(String),
 }
 
@@ -56,6 +57,7 @@ pub struct ImportReport {
     pub total_rows: usize,
     pub imported: usize,
     pub skipped: usize,
+    pub updated: usize,
     pub errors: usize,
     pub error_details: Vec<String>,
     pub import_id: Option<String>,
@@ -63,6 +65,8 @@ pub struct ImportReport {
     pub imported_samples: Vec<RowSummary>,
     /// Bounded sample of skipped (duplicate) books (capped at 20).
     pub skipped_samples: Vec<RowSummary>,
+    /// Bounded sample of books updated with new tags (capped at 20).
+    pub updated_samples: Vec<RowSummary>,
     /// Counts of imported books by reading status.
     pub status_counts: HashMap<String, usize>,
 }
@@ -72,6 +76,11 @@ impl std::fmt::Display for ImportReport {
         writeln!(f, "Import summary:")?;
         writeln!(f, "  Total rows:  {}", self.total_rows)?;
         writeln!(f, "  Imported:    {}", self.imported)?;
+        writeln!(
+            f,
+            "  Updated:     {} (tags added to existing books)",
+            self.updated
+        )?;
         writeln!(f, "  Skipped:     {} (already in library)", self.skipped)?;
         writeln!(f, "  Errors:      {}", self.errors)?;
         if !self.error_details.is_empty() {
@@ -212,7 +221,7 @@ fn import_rows(
     let col_orig_year = col("Original Publication Year");
     let _col_date_read = col("Date Read");
     let _col_date_added = col("Date Added");
-    let _col_shelves = col("Bookshelves");
+    let col_shelves = col("Bookshelves");
     let col_exclusive = col("Exclusive Shelf");
     let _col_review = col("My Review");
     let _col_read_count = col("Read Count");
@@ -293,31 +302,76 @@ fn import_rows(
 
         let gr_id = get(col_book_id);
         let author_name = get(col_author).unwrap_or_default();
-        let status_str = get(col_exclusive)
-            .map(|s| map_shelf_to_status(&s).as_str().to_string())
+        let exclusive_shelf = get(col_exclusive);
+        let status_str = exclusive_shelf
+            .as_ref()
+            .map(|s| map_shelf_to_status(s).as_str().to_string())
             .unwrap_or_else(|| "want-to-read".to_string());
 
-        // Dedup: skip if goodreads_id already exists
-        if let Some(ref id) = gr_id
-            && existing_gr_ids.contains_key(id)
+        // Collect tags from the Bookshelves column
+        let mut row_tags: Vec<String> = get(col_shelves)
+            .map(|s| parse_shelves_as_tags(&s))
+            .unwrap_or_default();
+
+        // Non-standard exclusive shelves also become tags to avoid data loss
+        if let Some(ref shelf) = exclusive_shelf
+            && !is_standard_exclusive_shelf(shelf)
+            && !shelf.is_empty()
         {
-            report.skipped += 1;
-            if report.skipped_samples.len() < MAX_REPORT_SAMPLES {
-                report.skipped_samples.push(RowSummary {
-                    title: title.clone(),
-                    author: author_name.clone(),
-                    status: status_str.clone(),
-                });
+            let shelf_tag = shelf.trim().to_string();
+            if !row_tags.iter().any(|t| t.eq_ignore_ascii_case(&shelf_tag)) {
+                row_tags.push(shelf_tag);
             }
-            emit_event(
-                observer,
-                report.total_rows,
-                total_rows,
-                &title,
-                &author_name,
-                &status_str,
-                RowOutcome::Skipped,
-            )?;
+        }
+
+        // Dedup: if goodreads_id already exists, apply tags and continue
+        if let Some(ref id) = gr_id
+            && let Some(&existing_book_id) = existing_gr_ids.get(id)
+        {
+            if row_tags.is_empty() {
+                // No tags to apply — pure skip
+                report.skipped += 1;
+                if report.skipped_samples.len() < MAX_REPORT_SAMPLES {
+                    report.skipped_samples.push(RowSummary {
+                        title: title.clone(),
+                        author: author_name.clone(),
+                        status: status_str.clone(),
+                    });
+                }
+                emit_event(
+                    observer,
+                    report.total_rows,
+                    total_rows,
+                    &title,
+                    &author_name,
+                    &status_str,
+                    RowOutcome::Skipped,
+                )?;
+            } else {
+                // Apply tags to existing book
+                if !opts.dry_run {
+                    for tag_name in &row_tags {
+                        repo.add_tag_to_book(&existing_book_id, tag_name)?;
+                    }
+                }
+                report.updated += 1;
+                if report.updated_samples.len() < MAX_REPORT_SAMPLES {
+                    report.updated_samples.push(RowSummary {
+                        title: title.clone(),
+                        author: author_name.clone(),
+                        status: status_str.clone(),
+                    });
+                }
+                emit_event(
+                    observer,
+                    report.total_rows,
+                    total_rows,
+                    &title,
+                    &author_name,
+                    &status_str,
+                    RowOutcome::Updated,
+                )?;
+            }
             continue;
         }
 
@@ -439,6 +493,11 @@ fn import_rows(
             }
         }
 
+        // Tags from Bookshelves column (and non-standard exclusive shelves)
+        for tag_name in &row_tags {
+            repo.add_tag_to_book(&book.id, tag_name)?;
+        }
+
         // Track import → book relationship
         db.conn.execute(
             "INSERT INTO import_books (import_id, book_id) VALUES (?1, ?2)",
@@ -536,6 +595,24 @@ fn map_shelf_to_status(shelf: &str) -> ReadingStatus {
     }
 }
 
+/// Returns true if this exclusive shelf is a standard Goodreads status shelf.
+fn is_standard_exclusive_shelf(shelf: &str) -> bool {
+    matches!(
+        shelf.to_lowercase().as_str(),
+        "read" | "currently-reading" | "to-read"
+    )
+}
+
+/// Parse the comma-separated `Bookshelves` column into trimmed tag names.
+/// Filters out empty entries.
+fn parse_shelves_as_tags(shelves_raw: &str) -> Vec<String> {
+    shelves_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn map_binding_to_format(binding: &str) -> BookFormat {
     match binding.to_lowercase().as_str() {
         "kindle edition" | "ebook" => BookFormat::Ebook,
@@ -621,6 +698,20 @@ mod tests {
             .find(|b| b.title == "Project Hail Mary")
             .unwrap();
         assert_eq!(phm.status, ReadingStatus::Reading);
+
+        // Verify tags from Bookshelves column
+        let dune_tags = repo.get_book_tags(&dune.id).unwrap();
+        let dune_tag_names: Vec<&str> = dune_tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(dune_tag_names.contains(&"sci-fi"));
+        assert!(dune_tag_names.contains(&"classics"));
+
+        let neuro_tags = repo.get_book_tags(&neuro.id).unwrap();
+        let neuro_tag_names: Vec<&str> = neuro_tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(neuro_tag_names.contains(&"cyberpunk"));
+
+        // Project Hail Mary has no shelves → no tags
+        let phm_tags = repo.get_book_tags(&phm.id).unwrap();
+        assert!(phm_tags.is_empty());
     }
 
     #[test]
@@ -646,7 +737,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r2.imported, 0);
-        assert_eq!(r2.skipped, 3);
+        // Dune has shelves "sci-fi, classics", Neuromancer has "cyberpunk" → updated
+        // Project Hail Mary has no shelves → skipped
+        assert_eq!(r2.updated, 2);
+        assert_eq!(r2.skipped, 1);
 
         let repo = BookRepository::new(&db);
         assert_eq!(repo.list_books().unwrap().len(), 3);
@@ -722,5 +816,102 @@ mod tests {
         assert_eq!(clean_isbn(r#"="0441172717""#), "0441172717");
         assert_eq!(clean_isbn(r#"="9780441172719""#), "9780441172719");
         assert_eq!(clean_isbn("  9780441172719  "), "9780441172719");
+    }
+
+    #[test]
+    fn import_goodreads_reimport_updates_tags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let csv_path = write_test_csv(tmp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        // First import
+        import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
+
+        let repo = BookRepository::new(&db);
+        let books = repo.list_books().unwrap();
+        let dune = books.iter().find(|b| b.title == "Dune").unwrap();
+        let tags_before = repo.get_book_tags(&dune.id).unwrap();
+        assert_eq!(tags_before.len(), 2); // sci-fi, classics
+
+        // Re-import — tags should still be there (idempotent)
+        let r2 = import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2.updated, 2); // Dune + Neuromancer have shelves
+        assert_eq!(r2.skipped, 1); // Project Hail Mary has none
+
+        // Tags unchanged (idempotent)
+        let tags_after = repo.get_book_tags(&dune.id).unwrap();
+        assert_eq!(tags_after.len(), 2);
+    }
+
+    #[test]
+    fn import_goodreads_nonstandard_exclusive_shelf_becomes_tag() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let csv_path = tmp.path().join("custom_shelf.csv");
+        let mut f = std::fs::File::create(&csv_path).unwrap();
+        writeln!(f, "Book Id,Title,Author,Author l-f,Additional Authors,ISBN,ISBN13,My Rating,Average Rating,Publisher,Binding,Number of Pages,Year Published,Original Publication Year,Date Read,Date Added,Bookshelves,Bookshelves with positions,Exclusive Shelf,My Review,Spoiler,Private Notes,Read Count,Owned Copies").unwrap();
+        // Custom exclusive shelf "favorites" — not a standard status
+        writeln!(f, r#"42,The Hobbit,J.R.R. Tolkien,"Tolkien, J.R.R.",,="0547928229",="9780547928227",5,4.28,HMH,Paperback,300,2012,1937,,2024/01/01,"fantasy","fantasy (#1)",favorites,,,,1,0"#).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let report = import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.imported, 1);
+
+        let repo = BookRepository::new(&db);
+        let books = repo.list_books().unwrap();
+        let hobbit = books.iter().find(|b| b.title == "The Hobbit").unwrap();
+        // Maps to WantToRead as default for unknown exclusive shelf
+        assert_eq!(hobbit.status, ReadingStatus::WantToRead);
+
+        let tags = repo.get_book_tags(&hobbit.id).unwrap();
+        let tag_names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        // "fantasy" from Bookshelves + "favorites" from non-standard exclusive shelf
+        assert!(tag_names.contains(&"fantasy"));
+        assert!(tag_names.contains(&"favorites"));
+    }
+
+    #[test]
+    fn import_goodreads_dry_run_duplicate_with_shelves() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let csv_path = write_test_csv(tmp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        // First real import
+        import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
+
+        // Dry-run re-import
+        let r2 = import_goodreads(
+            &db,
+            &csv_path,
+            &GoodreadsImportOptions { dry_run: true },
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2.updated, 2); // Would update Dune + Neuromancer
+        assert_eq!(r2.skipped, 1); // PHM has no shelves
+        assert_eq!(r2.imported, 0);
     }
 }

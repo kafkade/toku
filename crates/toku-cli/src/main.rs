@@ -10,6 +10,9 @@ use toku_core::{
 };
 use toku_db::{BookRepository, Database};
 
+mod import_ui;
+mod tui;
+
 /// Toku — a private, offline-first personal book manager.
 #[derive(Parser)]
 #[command(name = "toku", version, about)]
@@ -23,11 +26,14 @@ struct Cli {
     format: OutputFormat,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Interactive library browser (TUI) — default when no subcommand given
+    Browse,
+
     /// Add a book to your library
     Add {
         /// Book title (for manual entry)
@@ -345,8 +351,11 @@ fn main() -> Result<()> {
         None => Database::default_data_dir().context("could not determine data directory")?,
     };
 
+    // Resolve command (default: Browse = TUI)
+    let command = cli.command.unwrap_or(Commands::Browse);
+
     // Commands that don't need the database
-    match &cli.command {
+    match &command {
         Commands::Config { path, edit } => return cmd_config(&data_dir, *path, *edit),
         Commands::Completions { shell } => {
             clap_complete::generate(*shell, &mut Cli::command(), "toku", &mut std::io::stdout());
@@ -360,7 +369,8 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to open database at {}", db_path.display()))?;
     let repo = BookRepository::new(&db);
 
-    match cli.command {
+    match command {
+        Commands::Browse => tui::run(&repo),
         Commands::Add {
             title,
             author,
@@ -668,7 +678,21 @@ fn print_books(books: &[Book], repo: &BookRepository, output_format: &OutputForm
             }
         }
         OutputFormat::Table => {
+            use tabled::settings::Style;
             use tabled::{Table, Tabled};
+
+            // Detect terminal width (fallback: 120 columns)
+            let term_width = crossterm::terminal::size()
+                .map(|(w, _)| w as usize)
+                .unwrap_or(120);
+
+            // Width budget: 7 borders + 12 padding = 19 overhead
+            // Fixed columns: Status(7) + Fmt(5) + ★(3) + Pages(5) = 20
+            // Remaining goes to Title (60%) and Author (40%)
+            let fixed_overhead = 39;
+            let flexible = term_width.saturating_sub(fixed_overhead);
+            let title_max = (flexible * 3 / 5).max(12);
+            let author_max = flexible.saturating_sub(title_max).max(8);
 
             #[derive(Tabled)]
             struct Row {
@@ -678,9 +702,9 @@ fn print_books(books: &[Book], repo: &BookRepository, output_format: &OutputForm
                 author: String,
                 #[tabled(rename = "Status")]
                 status: String,
-                #[tabled(rename = "Format")]
+                #[tabled(rename = "Fmt")]
                 format: String,
-                #[tabled(rename = "Rating")]
+                #[tabled(rename = "★")]
                 rating: String,
                 #[tabled(rename = "Pages")]
                 pages: String,
@@ -696,26 +720,36 @@ fn print_books(books: &[Book], repo: &BookRepository, output_format: &OutputForm
                         .map(|(a, _)| a.name)
                         .collect();
 
-                    let title = if b.title.len() > 40 {
-                        format!("{}…", &b.title[..39])
-                    } else {
-                        b.title.clone()
+                    let status = match b.status {
+                        ReadingStatus::WantToRead => "Want",
+                        ReadingStatus::Reading => "Reading",
+                        ReadingStatus::Read => "Read",
+                        ReadingStatus::Abandoned => "DNF",
+                        ReadingStatus::OnHold => "On Hold",
+                    };
+
+                    let format = match b.format {
+                        BookFormat::Physical => "Print",
+                        BookFormat::Ebook => "Ebook",
+                        BookFormat::Audiobook => "Audio",
                     };
 
                     Row {
-                        title,
-                        author: authors.join(", "),
-                        status: b.status.as_str().to_string(),
-                        format: b.format.as_str().to_string(),
+                        title: import_ui::truncate_str(&b.title, title_max),
+                        author: import_ui::truncate_str(&authors.join(", "), author_max),
+                        status: status.to_string(),
+                        format: format.to_string(),
                         rating: b
                             .rating
-                            .map_or("—".to_string(), |r| format!("{:.1}★", r as f32 / 2.0)),
+                            .map_or("—".to_string(), |r| format!("{:.1}", r as f32 / 2.0)),
                         pages: b.page_count.map_or("—".to_string(), |p| p.to_string()),
                     }
                 })
                 .collect();
 
-            println!("{}", Table::new(rows));
+            let mut table = Table::new(rows);
+            table.with(Style::rounded());
+            println!("{table}");
         }
     }
     Ok(())
@@ -780,10 +814,14 @@ fn print_book_detail(
                 println!("  Cover:   ✓ ({hash})");
             }
             if let Some(desc) = &book.description {
-                let truncated = if desc.len() > 200 {
-                    format!("{}…", &desc[..200])
-                } else {
-                    desc.clone()
+                let truncated = {
+                    let char_count = desc.chars().count();
+                    if char_count > 200 {
+                        let t: String = desc.chars().take(199).collect();
+                        format!("{t}…")
+                    } else {
+                        desc.clone()
+                    }
                 };
                 println!("  Desc:    {truncated}");
             }
@@ -795,42 +833,13 @@ fn print_book_detail(
 
 fn cmd_import(
     db: &Database,
-    repo: &BookRepository,
+    _repo: &BookRepository,
     source: ImportSource,
     output_format: &OutputFormat,
 ) -> Result<()> {
     match source {
         ImportSource::Goodreads { path, dry_run } => {
-            if !path.exists() {
-                anyhow::bail!("file not found: {}", path.display());
-            }
-
-            let opts = toku_import::GoodreadsImportOptions { dry_run };
-
-            if dry_run {
-                eprintln!("Dry run — no changes will be made:\n");
-            } else {
-                eprintln!("Importing from Goodreads CSV: {}\n", path.display());
-            }
-
-            let report = toku_import::import_goodreads(db, &path, &opts)
-                .context("Goodreads import failed")?;
-
-            eprintln!("\n{report}");
-
-            if let Some(ref id) = report.import_id {
-                eprintln!("Import ID: {id}");
-                eprintln!("To undo: toku import undo {id}");
-            }
-
-            if !dry_run && report.imported > 0 {
-                eprintln!();
-                let books = repo.list_books()?;
-                print_books(&books, repo, output_format)?;
-                eprintln!("\n{} book(s) in library", books.len());
-            }
-
-            Ok(())
+            import_ui::run_goodreads_import(db, &path, dry_run, output_format)
         }
         ImportSource::Calibre {
             path,
@@ -860,13 +869,6 @@ fn cmd_import(
             if let Some(ref id) = report.import_id {
                 eprintln!("Import ID: {id}");
                 eprintln!("To undo: toku import undo {id}");
-            }
-
-            if !dry_run && report.imported > 0 {
-                eprintln!();
-                let books = repo.list_books()?;
-                print_books(&books, repo, output_format)?;
-                eprintln!("\n{} book(s) in library", books.len());
             }
 
             Ok(())

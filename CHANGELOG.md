@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Interactive TUI library browser (`toku browse`, or just `toku` with no subcommand) with split-pane layout: scrollable book list on the left, live detail view on the right
+- Filter popup in TUI browser to narrow books by reading status, shelf, or tag
+- Ratatui-based import progress UI with live progress bar, per-row activity log, and colored status indicators
+- Structured import summary with status breakdown, sample lists of imported/skipped books, and undo instructions
+- Width-aware `toku list` table output that adapts columns to terminal width with modern rounded borders
+
+### Changed
+
+- Goodreads importer now uses observer pattern for progress reporting and wraps non-dry-run imports in a transaction for atomicity
+- Import report includes bounded sample lists (up to 20) of imported and skipped books with status counts
+
+### Fixed
+
+- Multibyte string truncation panic when book titles or descriptions contain non-ASCII characters
+- `toku list` no longer dumps the entire library after import — replaced with structured summary
 - Project README with "Why Toku?" naming rationale and CLI usage examples
 - Product roadmap covering 9 phases from MVP to moonshots
 - Architecture Decision Records: core language (ADR-001), database schema (ADR-002), CLI design (ADR-003), metadata sources (ADR-004), import architecture (ADR-005), sync strategy (ADR-006)

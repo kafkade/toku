@@ -243,17 +243,13 @@ impl<'a> App<'a> {
                     .unwrap_or(20);
                 self.move_selection(-page);
             }
-            KeyCode::Home => {
-                if !self.books.is_empty() {
-                    self.list_state.select(Some(0));
-                    self.ensure_detail_loaded();
-                }
+            KeyCode::Home if !self.books.is_empty() => {
+                self.list_state.select(Some(0));
+                self.ensure_detail_loaded();
             }
-            KeyCode::End => {
-                if !self.books.is_empty() {
-                    self.list_state.select(Some(self.books.len() - 1));
-                    self.ensure_detail_loaded();
-                }
+            KeyCode::End if !self.books.is_empty() => {
+                self.list_state.select(Some(self.books.len() - 1));
+                self.ensure_detail_loaded();
             }
             KeyCode::Char('f') => self.open_filter_popup(),
             _ => {}

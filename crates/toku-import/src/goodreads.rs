@@ -792,4 +792,87 @@ mod tests {
         assert_eq!(r2.skipped, 1); // PHM has no shelves
         assert_eq!(r2.imported, 0);
     }
+
+    #[test]
+    fn import_fixture_file_all_edge_cases() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/goodreads/export.csv");
+        assert!(fixture.exists(), "fixture file missing: {fixture:?}");
+
+        let db = Database::open_in_memory().unwrap();
+        let report = import_goodreads(
+            &db,
+            &fixture,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.total_rows, 8);
+        assert_eq!(report.imported, 8);
+        assert_eq!(report.errors, 0);
+
+        let repo = BookRepository::new(&db);
+        let books = repo.list_books().unwrap();
+        assert_eq!(books.len(), 8);
+
+        // Comma in title: Good Omens
+        let good_omens = books
+            .iter()
+            .find(|b| b.title.starts_with("Good Omens"))
+            .unwrap();
+        assert_eq!(good_omens.status, ReadingStatus::Read);
+        assert_eq!(good_omens.rating, Some(10));
+        // Multiple authors
+        let go_authors = repo.get_book_authors(&good_omens.id).unwrap();
+        assert_eq!(go_authors.len(), 2);
+        assert_eq!(go_authors[0].0.name, "Neil Gaiman");
+        assert_eq!(go_authors[1].0.name, "Terry Pratchett");
+
+        // No ISBN: Untitled Manuscript
+        let untitled = books
+            .iter()
+            .find(|b| b.title == "Untitled Manuscript")
+            .unwrap();
+        assert_eq!(untitled.status, ReadingStatus::WantToRead);
+        assert_eq!(untitled.rating, None); // 0 → unrated
+        assert_eq!(untitled.page_count, None);
+        let untitled_isbns = repo.get_book_isbns(&untitled.id).unwrap();
+        assert!(untitled_isbns.is_empty());
+
+        // Negative year (BCE): The Art of War
+        let art_of_war = books.iter().find(|b| b.title == "The Art of War").unwrap();
+        assert_eq!(art_of_war.pub_date.as_deref(), Some("-500"));
+        assert_eq!(art_of_war.format, BookFormat::Audiobook);
+        // 3 authors total (Sun Tzu + 2 additional)
+        let aow_authors = repo.get_book_authors(&art_of_war.id).unwrap();
+        assert_eq!(aow_authors.len(), 3);
+
+        // Non-ASCII: Gödel's Proof
+        let godel = books.iter().find(|b| b.title.contains("del")).unwrap();
+        assert!(godel.title.contains('ö'));
+        assert_eq!(godel.rating, Some(8)); // 4 * 2
+
+        // Non-standard exclusive shelf: favorites → tag
+        let myor = books
+            .iter()
+            .find(|b| b.title.starts_with("My Year"))
+            .unwrap();
+        assert_eq!(myor.status, ReadingStatus::WantToRead);
+        assert_eq!(myor.format, BookFormat::Ebook);
+        let myor_tags = repo.get_book_tags(&myor.id).unwrap();
+        let myor_tag_names: Vec<&str> = myor_tags.iter().map(|t| t.name.as_str()).collect();
+        assert!(myor_tag_names.contains(&"favorites"));
+
+        // Idempotent re-import
+        let r2 = import_goodreads(
+            &db,
+            &fixture,
+            &GoodreadsImportOptions { dry_run: false },
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2.imported, 0);
+        assert_eq!(repo.list_books().unwrap().len(), 8);
+    }
 }

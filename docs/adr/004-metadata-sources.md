@@ -20,8 +20,8 @@ reliable, and compatible with open-source use.
   Google Books. Fill empty fields only — never overwrite existing data.
 - **User edits always win**: Once a user modifies a field, auto-enrichment marks it as
   `user_override` and will not overwrite it.
-- **Caching**: API responses cached locally for 30 days to reduce API calls and enable
-  offline re-enrichment.
+- **Caching**: Open Library API responses cached locally (permitted by OL guidelines).
+  Google Books responses must NOT be cached beyond HTTP cache headers (ToS Section 5e.1).
 
 ## Rationale
 
@@ -46,6 +46,27 @@ Bulk crawling is prohibited. Courtesy attribution is appreciated but not require
 may only be used for transient text metadata enrichment, not cover images. API keys also
 cannot be embedded in open-source projects (Section 4b.1).
 
+## Google Books API — Validated (2026-05-30)
+
+See [docs/validations/google-books-api.md](../validations/google-books-api.md)
+for the full validation report.
+
+**Key findings**:
+
+- **Metadata caching**: Permanent copies of API responses are prohibited by the Google
+  APIs ToS (Section 5e.1). Toku may only use Google Books for transient enrichment —
+  fetch metadata, merge into user's record, discard raw response.
+- **API key**: Cannot be embedded in open-source projects (Section 4b.1). Users must
+  provide their own key via `config.toml`.
+- **Free quota**: 1,000 requests/day per API key. Adequate for personal use but requires
+  each user to create a Google Cloud project and generate a key.
+- **Cover images**: Local caching prohibited. Open Library remains the only cover source.
+- **Attribution**: "Powered by Google" branding required when displaying search results.
+  For individual enriched fields, showing provenance ("via Google Books") is sufficient.
+- **Recommendation**: Defer Google Books integration. Open Library is sufficient as the
+  sole metadata source for the MVP. Google Books adds user friction (API key setup) with
+  significant ToS restrictions for limited coverage gains.
+
 ## Alternatives Considered
 
 | Source | Rejected Because |
@@ -57,10 +78,15 @@ cannot be embedded in open-source projects (Section 4b.1).
 
 ## Open Validations
 
-- [ ] Open Library rate limits (stated 100 req/min — verify in practice)
+- [x] Open Library rate limits — **Validated 2026-05-30**: 100 req/5 min, adequate for
+  personal use. Response times ~2.9s avg for ISBN lookups. Some editions lack author data.
+  See [openlibrary-api.md](../validations/openlibrary-api.md).
 - [x] Google Books ToS for open-source caching — **Validated 2026-05-29**: Significant
   restrictions apply. Permanent caching prohibited. API keys cannot be embedded in
   open-source projects. See [cover-image-licensing.md](../validations/cover-image-licensing.md).
+- [x] Google Books API terms for open-source use — **Validated 2026-05-30**: Transient
+  enrichment only, user-provided API key required, no cover caching. Deferred for MVP.
+  See [google-books-api.md](../validations/google-books-api.md).
 - [x] Cover image licensing for local caching — **Validated 2026-05-29**: Open Library
   on-demand caching permitted. Google Books thumbnail caching prohibited.
   See [cover-image-licensing.md](../validations/cover-image-licensing.md).

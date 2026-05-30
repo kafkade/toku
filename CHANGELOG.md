@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-30
+
 ### Added
 
 - Work grouping: `toku work link|unlink|show|auto` to group multiple editions of the same creative work, with automatic candidate detection by normalized title and primary author

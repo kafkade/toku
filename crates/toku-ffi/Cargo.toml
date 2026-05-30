@@ -1,0 +1,21 @@
+[package]
+name = "toku-ffi"
+description = "C FFI bindings for Toku — enables Swift/iOS and other native frontends"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+toku-core.workspace = true
+toku-db.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+cbindgen = "0.28"

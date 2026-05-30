@@ -15,6 +15,12 @@ pub enum TokuError {
     #[error("invalid duration format: {0}")]
     InvalidDuration(String),
 
+    #[error("invalid tag type: {0}")]
+    InvalidTagType(String),
+
+    #[error("invalid pace rating: {0} (expected fast, medium, or slow)")]
+    InvalidPaceRating(String),
+
     #[error("invalid ISBN: {0}")]
     InvalidIsbn(String),
 

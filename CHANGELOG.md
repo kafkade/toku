@@ -79,6 +79,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reading statistics: `toku stats` with books/pages read, average rating, reading pace, and format breakdown
 - `toku stats --year 2025` for year-filtered analytics
 - Currently reading list with progress percentages in stats output
+- Full statistics engine: rating distribution, reading streaks, monthly books finished, shortest/longest book, average days to finish, reading speed (pages/hour), top authors, and top tags
+- `toku stats --author <name>` to filter all statistics to a single author's books
+- Mood tags, pace ratings, and content warnings as typed tag categories (`toku edit --mood adventurous --pace fast --content-warning violence`)
+- `toku edit` command for updating mood tags, pace, content warnings, and rating on existing books (with `--remove-mood` and `--remove-content-warning` for removal)
+- `toku add --mood`, `--pace`, and `--content-warning` flags for setting typed tags at add time
+- `toku list --mood <tag>` and `--pace <rate>` filters with same-type OR, cross-type AND semantics
+- `toku stats --mood-trends` showing mood tag distribution per month across finished books
+- `toku show` now displays mood tags, pace rating, and content warnings in detail view (all output formats)
+- `toku tag list` now shows tag type column (general, mood, pace, content_warning)
 - Export to CSV: `toku export csv` with flat book table (title, authors, status, rating, shelves, tags)
 - Export to JSON: `toku export json` with full structured library data
 - Export to Markdown: `toku export markdown` with books grouped by reading status and star ratings

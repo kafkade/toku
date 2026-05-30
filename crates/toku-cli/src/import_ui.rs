@@ -15,7 +15,10 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, Padding, Paragraph},
 };
 use toku_db::Database;
-use toku_import::{GoodreadsImportOptions, ImportEvent, ImportObserver, ImportReport, RowOutcome};
+use toku_import::{
+    GoodreadsImportOptions, ImportEvent, ImportObserver, ImportReport, RowOutcome,
+    StorygraphImportOptions,
+};
 
 use crate::OutputFormat;
 
@@ -332,6 +335,39 @@ pub fn run_goodreads_import(
     } else {
         run_without_tui(db, path, &opts, format)
     }
+}
+
+/// Run a StoryGraph import with the same UI as Goodreads import.
+pub fn run_storygraph_import(
+    db: &Database,
+    path: &Path,
+    dry_run: bool,
+    format: &OutputFormat,
+) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("file not found: {}", path.display());
+    }
+
+    let opts = StorygraphImportOptions { dry_run };
+    let use_tui = matches!(format, OutputFormat::Table) && io::stderr().is_terminal();
+
+    if use_tui {
+        let total = count_csv_rows_quick(path)?;
+        let mut observer =
+            RatatuiImportObserver::new(total, dry_run).context("failed to initialize TUI")?;
+
+        let result = toku_import::import_storygraph(db, path, &opts, Some(&mut observer));
+        observer.restore();
+
+        let report = result.context("StoryGraph import failed")?;
+        print_import_summary(&report, format, dry_run);
+    } else {
+        let report = toku_import::import_storygraph(db, path, &opts, None)
+            .context("StoryGraph import failed")?;
+        print_import_summary(&report, format, dry_run);
+    }
+
+    Ok(())
 }
 
 fn run_with_tui(

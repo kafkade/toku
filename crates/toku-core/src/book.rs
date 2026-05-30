@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// A book in the user's library. Each row represents an edition (Book = Edition).
-/// A nullable `work_id` is reserved for Phase 3 work-grouping.
+/// Set `work_id` to link this edition to a `Work` for grouping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Book {
     pub id: Uuid,
@@ -17,7 +17,7 @@ pub struct Book {
     /// Duration in minutes — only meaningful for audiobooks.
     pub duration_minutes: Option<i32>,
     pub cover_hash: Option<String>,
-    /// Reserved for Phase 3 work-grouping. NULL until then.
+    /// Links this edition to a Work (for grouping editions).
     pub work_id: Option<Uuid>,
     pub status: ReadingStatus,
     pub rating: Option<i32>,
@@ -362,10 +362,13 @@ fn guess_sort_name(name: &str) -> String {
 }
 
 /// A user-defined shelf for organizing books (e.g. "Favorites", "To Re-read").
+/// Smart shelves have `is_smart = true` and a `smart_filter` that dynamically matches books.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shelf {
     pub id: Uuid,
     pub name: String,
+    pub is_smart: bool,
+    pub smart_filter: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -374,6 +377,18 @@ impl Shelf {
         Self {
             id: Uuid::now_v7(),
             name: name.into(),
+            is_smart: false,
+            smart_filter: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn new_smart(name: impl Into<String>, filter_json: String) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            name: name.into(),
+            is_smart: true,
+            smart_filter: Some(filter_json),
             created_at: Utc::now(),
         }
     }
@@ -511,6 +526,29 @@ pub struct BookSeries {
     pub position: Option<String>,
 }
 
+/// A Work groups multiple editions (Books) of the same creative work.
+/// E.g. "Dune" hardcover, paperback, and Kindle editions share one Work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Work {
+    pub id: Uuid,
+    pub title: String,
+    pub original_language: Option<String>,
+    pub first_published: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Work {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            title: title.into(),
+            original_language: None,
+            first_published: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +561,14 @@ mod tests {
         assert_eq!(book.format, BookFormat::Physical);
         assert!(book.subtitle.is_none());
         assert!(book.rating.is_none());
+    }
+
+    #[test]
+    fn work_new_has_defaults() {
+        let work = Work::new("Dune");
+        assert_eq!(work.title, "Dune");
+        assert!(work.original_language.is_none());
+        assert!(work.first_published.is_none());
     }
 
     #[test]

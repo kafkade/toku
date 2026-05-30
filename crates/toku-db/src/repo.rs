@@ -1,7 +1,8 @@
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use toku_core::{
-    Author, AuthorCount, Book, BookAuthor, ContributorRole, PaceRating, ReadingProgress,
-    ReadingSession, ReadingStatus, Shelf, Tag, TagCount, TagType,
+    Author, AuthorCount, Book, BookAuthor, ContributorRole, FilterCondition, FilterExpr,
+    FilterField, PaceRating, ReadingProgress, ReadingSession, ReadingStatus, Shelf, SmartFilter,
+    Tag, TagCount, TagType, Work,
 };
 use uuid::Uuid;
 
@@ -452,7 +453,7 @@ impl<'a> BookRepository<'a> {
     pub fn create_shelf(&self, name: &str) -> Result<Shelf, DbError> {
         let shelf = Shelf::new(name);
         self.db.conn.execute(
-            "INSERT INTO shelves (id, name, created_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO shelves (id, name, is_smart, smart_filter, created_at) VALUES (?1, ?2, 0, NULL, ?3)",
             params![
                 shelf.id.to_string(),
                 shelf.name,
@@ -467,20 +468,24 @@ impl<'a> BookRepository<'a> {
         let mut stmt = self
             .db
             .conn
-            .prepare("SELECT id, name, created_at FROM shelves ORDER BY name COLLATE NOCASE")?;
+            .prepare("SELECT id, name, is_smart, smart_filter, created_at FROM shelves ORDER BY name COLLATE NOCASE")?;
 
         let shelves = stmt
             .query_map([], |row| {
                 let id_str: String = row.get(0)?;
                 let name: String = row.get(1)?;
-                let created_str: String = row.get(2)?;
-                Ok((id_str, name, created_str))
+                let is_smart: bool = row.get(2)?;
+                let smart_filter: Option<String> = row.get(3)?;
+                let created_str: String = row.get(4)?;
+                Ok((id_str, name, is_smart, smart_filter, created_str))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(id_str, name, created_str)| {
+            .filter_map(|(id_str, name, is_smart, smart_filter, created_str)| {
                 Some(Shelf {
                     id: Uuid::parse_str(&id_str).ok()?,
                     name,
+                    is_smart,
+                    smart_filter,
                     created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                         .ok()?
                         .with_timezone(&chrono::Utc),
@@ -491,21 +496,32 @@ impl<'a> BookRepository<'a> {
         Ok(shelves)
     }
 
-    /// Add a book to a shelf, creating the shelf if it doesn't exist.
+    /// Add a book to a regular shelf, creating the shelf if it doesn't exist.
+    /// Returns an error if the target shelf is a smart shelf.
     pub fn add_book_to_shelf(&self, book_id: &Uuid, shelf_name: &str) -> Result<(), DbError> {
         self.get_book(book_id)?;
 
-        let shelf_id: String = match self.db.conn.query_row(
-            "SELECT id FROM shelves WHERE name = ?1",
-            params![shelf_name],
-            |row| row.get(0),
-        ) {
-            Ok(id) => id,
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
+        let row: Option<(String, bool)> = self
+            .db
+            .conn
+            .query_row(
+                "SELECT id, is_smart FROM shelves WHERE name = ?1",
+                params![shelf_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let shelf_id = match row {
+            Some((_, true)) => {
+                return Err(DbError::InvalidOperation(format!(
+                    "cannot manually add books to smart shelf '{shelf_name}'"
+                )));
+            }
+            Some((id, false)) => id,
+            None => {
                 let shelf = self.create_shelf(shelf_name)?;
                 shelf.id.to_string()
             }
-            Err(e) => return Err(DbError::Sqlite(e)),
         };
 
         self.db.conn.execute(
@@ -536,7 +552,7 @@ impl<'a> BookRepository<'a> {
     /// Get all shelves a book belongs to.
     pub fn get_book_shelves(&self, book_id: &Uuid) -> Result<Vec<Shelf>, DbError> {
         let mut stmt = self.db.conn.prepare(
-            "SELECT s.id, s.name, s.created_at
+            "SELECT s.id, s.name, s.is_smart, s.smart_filter, s.created_at
              FROM shelves s
              JOIN book_shelves bs ON bs.shelf_id = s.id
              WHERE bs.book_id = ?1
@@ -547,14 +563,18 @@ impl<'a> BookRepository<'a> {
             .query_map(params![book_id.to_string()], |row| {
                 let id_str: String = row.get(0)?;
                 let name: String = row.get(1)?;
-                let created_str: String = row.get(2)?;
-                Ok((id_str, name, created_str))
+                let is_smart: bool = row.get(2)?;
+                let smart_filter: Option<String> = row.get(3)?;
+                let created_str: String = row.get(4)?;
+                Ok((id_str, name, is_smart, smart_filter, created_str))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(id_str, name, created_str)| {
+            .filter_map(|(id_str, name, is_smart, smart_filter, created_str)| {
                 Some(Shelf {
                     id: Uuid::parse_str(&id_str).ok()?,
                     name,
+                    is_smart,
+                    smart_filter,
                     created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                         .ok()?
                         .with_timezone(&chrono::Utc),
@@ -565,21 +585,126 @@ impl<'a> BookRepository<'a> {
         Ok(shelves)
     }
 
-    /// List all books in a shelf.
+    /// List all books in a shelf. For smart shelves, evaluates the filter dynamically.
     pub fn list_books_in_shelf(&self, shelf_name: &str) -> Result<Vec<Book>, DbError> {
-        let mut stmt = self.db.conn.prepare(
+        // Check if this is a smart shelf
+        let row: Option<(bool, Option<String>)> = self
+            .db
+            .conn
+            .query_row(
+                "SELECT is_smart, smart_filter FROM shelves WHERE name = ?1",
+                params![shelf_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        match row {
+            Some((true, Some(filter_json))) => {
+                let filter =
+                    SmartFilter::from_json(&filter_json).map_err(|e| DbError::Io(e.to_string()))?;
+                self.evaluate_smart_filter(&filter)
+            }
+            Some((true, None)) => Ok(Vec::new()),
+            Some((false, _)) | None => {
+                // Regular shelf or not found — use book_shelves join
+                let mut stmt = self.db.conn.prepare(
+                    "SELECT b.id, b.title, b.subtitle, b.description, b.page_count, b.pub_date,
+                     b.language, b.format, b.duration_minutes, b.cover_hash, b.work_id, b.status,
+                     b.rating, b.created_at, b.updated_at
+                     FROM books b
+                     JOIN book_shelves bs ON bs.book_id = b.id
+                     JOIN shelves s ON s.id = bs.shelf_id
+                     WHERE s.name = ?1
+                     ORDER BY b.title COLLATE NOCASE",
+                )?;
+
+                let books = stmt
+                    .query_map(params![shelf_name], |row| Ok(row_to_book(row)))?
+                    .filter_map(|r| r.ok())
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                Ok(books)
+            }
+        }
+    }
+
+    /// Create a smart shelf with a filter expression.
+    pub fn create_smart_shelf(&self, name: &str, filter: &SmartFilter) -> Result<Shelf, DbError> {
+        let filter_json = filter.to_json().map_err(|e| DbError::Io(e.to_string()))?;
+        let shelf = Shelf::new_smart(name, filter_json.clone());
+        self.db.conn.execute(
+            "INSERT INTO shelves (id, name, is_smart, smart_filter, created_at) VALUES (?1, ?2, 1, ?3, ?4)",
+            params![
+                shelf.id.to_string(),
+                shelf.name,
+                filter_json,
+                shelf.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(shelf)
+    }
+
+    /// Get a shelf by name.
+    pub fn get_shelf_by_name(&self, name: &str) -> Result<Option<Shelf>, DbError> {
+        self.db
+            .conn
+            .query_row(
+                "SELECT id, name, is_smart, smart_filter, created_at FROM shelves WHERE name = ?1 COLLATE NOCASE",
+                params![name],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let name: String = row.get(1)?;
+                    let is_smart: bool = row.get(2)?;
+                    let smart_filter: Option<String> = row.get(3)?;
+                    let created_str: String = row.get(4)?;
+                    Ok((id_str, name, is_smart, smart_filter, created_str))
+                },
+            )
+            .optional()?
+            .and_then(|(id_str, name, is_smart, smart_filter, created_str)| {
+                Some(Shelf {
+                    id: Uuid::parse_str(&id_str).ok()?,
+                    name,
+                    is_smart,
+                    smart_filter,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .ok()?
+                        .with_timezone(&chrono::Utc),
+                })
+            })
+            .map_or_else(|| Ok(None), |s| Ok(Some(s)))
+    }
+
+    /// Delete a shelf by name.
+    pub fn delete_shelf(&self, name: &str) -> Result<bool, DbError> {
+        let rows = self
+            .db
+            .conn
+            .execute("DELETE FROM shelves WHERE name = ?1", params![name])?;
+        Ok(rows > 0)
+    }
+
+    /// Evaluate a smart filter and return matching books.
+    pub fn evaluate_smart_filter(&self, filter: &SmartFilter) -> Result<Vec<Book>, DbError> {
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut param_idx = 1u32;
+        let where_clause = build_filter_sql(&filter.expression, &mut params, &mut param_idx);
+
+        let sql = format!(
             "SELECT b.id, b.title, b.subtitle, b.description, b.page_count, b.pub_date,
              b.language, b.format, b.duration_minutes, b.cover_hash, b.work_id, b.status,
              b.rating, b.created_at, b.updated_at
-             FROM books b
-             JOIN book_shelves bs ON bs.book_id = b.id
-             JOIN shelves s ON s.id = bs.shelf_id
-             WHERE s.name = ?1
-             ORDER BY b.title COLLATE NOCASE",
-        )?;
+             FROM books b WHERE {where_clause}
+             ORDER BY b.title COLLATE NOCASE"
+        );
+
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|v| v.as_ref()).collect();
 
         let books = stmt
-            .query_map(params![shelf_name], |row| Ok(row_to_book(row)))?
+            .query_map(params_ref.as_slice(), |row| Ok(row_to_book(row)))?
             .filter_map(|r| r.ok())
             .filter_map(|r| r.ok())
             .collect();
@@ -1353,6 +1478,327 @@ impl<'a> BookRepository<'a> {
 
         Ok(sessions)
     }
+
+    // ── Work methods ──────────────────────────────────────────────────
+
+    /// Create a new work.
+    pub fn create_work(&self, work: &Work) -> Result<(), DbError> {
+        self.db.conn.execute(
+            "INSERT INTO works (id, title, original_language, first_published, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                work.id.to_string(),
+                work.title,
+                work.original_language,
+                work.first_published,
+                work.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get a work by its UUID.
+    pub fn get_work(&self, id: &Uuid) -> Result<Work, DbError> {
+        self.db
+            .conn
+            .query_row(
+                "SELECT id, title, original_language, first_published, created_at
+                 FROM works WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    let id_str: String = row.get(0)?;
+                    let created_str: String = row.get(4)?;
+                    Ok((id_str, row.get(1)?, row.get(2)?, row.get(3)?, created_str))
+                },
+            )
+            .map(
+                |(id_str, title, original_language, first_published, created_str)| Work {
+                    id: Uuid::parse_str(&id_str).expect("valid UUID"),
+                    title,
+                    original_language,
+                    first_published,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .expect("valid datetime")
+                        .with_timezone(&chrono::Utc),
+                },
+            )
+            .map_err(DbError::from)
+    }
+
+    /// Find works whose title matches (case-insensitive LIKE).
+    pub fn find_works_by_title(&self, title: &str) -> Result<Vec<Work>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, title, original_language, first_published, created_at
+             FROM works WHERE title LIKE ?1 COLLATE NOCASE",
+        )?;
+        let works = stmt
+            .query_map(params![format!("%{title}%")], |row| {
+                let id_str: String = row.get(0)?;
+                let created_str: String = row.get(4)?;
+                Ok((id_str, row.get(1)?, row.get(2)?, row.get(3)?, created_str))
+            })?
+            .filter_map(|r| r.ok())
+            .map(
+                |(id_str, title, original_language, first_published, created_str)| Work {
+                    id: Uuid::parse_str(&id_str).expect("valid UUID"),
+                    title,
+                    original_language,
+                    first_published,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .expect("valid datetime")
+                        .with_timezone(&chrono::Utc),
+                },
+            )
+            .collect();
+        Ok(works)
+    }
+
+    /// Link a book to a work by setting books.work_id.
+    pub fn link_book_to_work(&self, book_id: &Uuid, work_id: &Uuid) -> Result<(), DbError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db.conn.execute(
+            "UPDATE books SET work_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![work_id.to_string(), now, book_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Unlink a book from its work (set work_id = NULL).
+    pub fn unlink_book_from_work(&self, book_id: &Uuid) -> Result<(), DbError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db.conn.execute(
+            "UPDATE books SET work_id = NULL, updated_at = ?1 WHERE id = ?2",
+            params![now, book_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// List all books belonging to a work (editions).
+    pub fn get_work_editions(&self, work_id: &Uuid) -> Result<Vec<Book>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, title, subtitle, description, page_count, pub_date,
+                    language, format, duration_minutes, cover_hash, work_id,
+                    status, rating, created_at, updated_at
+             FROM books WHERE work_id = ?1",
+        )?;
+        let books = stmt
+            .query_map(params![work_id.to_string()], |row| {
+                row_to_book(row).map_err(rusqlite::Error::InvalidColumnName)
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(books)
+    }
+
+    /// Find groups of ungrouped books that share the same title and primary
+    /// author (case-insensitive). Returns `(normalized_key, Vec<Book>)` pairs
+    /// where each group has at least 2 members.
+    pub fn auto_group_candidates(&self) -> Result<Vec<(String, Vec<Book>)>, DbError> {
+        // Build a map: normalized(title + primary_author) → Vec<Book>
+        let ungrouped = {
+            let mut stmt = self.db.conn.prepare(
+                "SELECT id, title, subtitle, description, page_count, pub_date,
+                        language, format, duration_minutes, cover_hash, work_id,
+                        status, rating, created_at, updated_at
+                 FROM books WHERE work_id IS NULL",
+            )?;
+            let books: Vec<Book> = stmt
+                .query_map([], |row| {
+                    row_to_book(row).map_err(rusqlite::Error::InvalidColumnName)
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            books
+        };
+
+        let mut groups: std::collections::HashMap<String, Vec<Book>> =
+            std::collections::HashMap::new();
+        for book in ungrouped {
+            let authors = self.get_book_authors(&book.id)?;
+            let primary_author = authors
+                .iter()
+                .find(|(_, ba)| ba.role == ContributorRole::Author)
+                .map(|(a, _)| a.name.clone())
+                .unwrap_or_default();
+            let key = normalize_title_for_grouping(&book.title, &primary_author);
+            groups.entry(key).or_default().push(book);
+        }
+
+        let mut result: Vec<(String, Vec<Book>)> = groups
+            .into_iter()
+            .filter(|(_, books)| books.len() >= 2)
+            .collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(result)
+    }
+
+    /// Merge book `removed_id` into `keep_id`. All dependent data
+    /// (sessions, progress, ISBNs, tags, authors, series, provenance,
+    /// import records, source IDs) is moved or merged, then the removed
+    /// book is deleted.
+    ///
+    /// Fields on the kept book that are NULL are filled from the removed
+    /// book. User-set provenance is never overwritten.
+    pub fn merge_books(&self, keep_id: &Uuid, removed_id: &Uuid) -> Result<(), DbError> {
+        let tx = self.db.conn.unchecked_transaction()?;
+
+        // 1. Reassign reading_sessions
+        tx.execute(
+            "UPDATE reading_sessions SET book_id = ?1 WHERE book_id = ?2",
+            params![keep_id.to_string(), removed_id.to_string()],
+        )?;
+
+        // 2. Reassign reading_progress
+        tx.execute(
+            "UPDATE reading_progress SET book_id = ?1 WHERE book_id = ?2",
+            params![keep_id.to_string(), removed_id.to_string()],
+        )?;
+
+        // 3. Move ISBNs (skip duplicates)
+        tx.execute(
+            "UPDATE OR IGNORE isbns SET book_id = ?1 WHERE book_id = ?2",
+            params![keep_id.to_string(), removed_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM isbns WHERE book_id = ?1",
+            params![removed_id.to_string()],
+        )?;
+
+        // 4. Move tags (skip duplicates via OR IGNORE on composite PK)
+        tx.execute(
+            "INSERT OR IGNORE INTO book_tags (book_id, tag_id)
+             SELECT ?1, tag_id FROM book_tags WHERE book_id = ?2",
+            params![keep_id.to_string(), removed_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM book_tags WHERE book_id = ?1",
+            params![removed_id.to_string()],
+        )?;
+
+        // 5. Move authors (skip duplicates via OR IGNORE)
+        tx.execute(
+            "INSERT OR IGNORE INTO book_authors (book_id, author_id, role)
+             SELECT ?1, author_id, role FROM book_authors WHERE book_id = ?2",
+            params![keep_id.to_string(), removed_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM book_authors WHERE book_id = ?1",
+            params![removed_id.to_string()],
+        )?;
+
+        // 6. Move series memberships (skip duplicates)
+        tx.execute(
+            "INSERT OR IGNORE INTO book_series (book_id, series_id, position)
+             SELECT ?1, series_id, position FROM book_series WHERE book_id = ?2",
+            params![keep_id.to_string(), removed_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM book_series WHERE book_id = ?1",
+            params![removed_id.to_string()],
+        )?;
+
+        // 7. Move provenance (only for fields not already tracked on keep)
+        tx.execute(
+            "INSERT OR IGNORE INTO metadata_provenance (book_id, field_name, source, source_date, is_user_override)
+             SELECT ?1, field_name, source, source_date, is_user_override
+             FROM metadata_provenance WHERE book_id = ?2",
+            params![keep_id.to_string(), removed_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM metadata_provenance WHERE book_id = ?1",
+            params![removed_id.to_string()],
+        )?;
+
+        // 8. Move import records (skip duplicates)
+        tx.execute(
+            "INSERT OR IGNORE INTO import_books (import_id, book_id)
+             SELECT import_id, ?1 FROM import_books WHERE book_id = ?2",
+            params![keep_id.to_string(), removed_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM import_books WHERE book_id = ?1",
+            params![removed_id.to_string()],
+        )?;
+
+        // 9. Fill NULL metadata fields on keep from removed
+        let fill_fields = [
+            "subtitle",
+            "description",
+            "page_count",
+            "pub_date",
+            "language",
+            "duration_minutes",
+            "cover_hash",
+            "rating",
+        ];
+        for field in &fill_fields {
+            let sql = format!(
+                "UPDATE books SET {f} = (SELECT {f} FROM books WHERE id = ?2),
+                 updated_at = ?3
+                 WHERE id = ?1 AND {f} IS NULL
+                 AND (SELECT {f} FROM books WHERE id = ?2) IS NOT NULL",
+                f = field
+            );
+            tx.execute(
+                &sql,
+                params![
+                    keep_id.to_string(),
+                    removed_id.to_string(),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+
+        // 10. Merge source IDs (goodreads_id, calibre_id): copy if keep is NULL
+        tx.execute(
+            "UPDATE books SET goodreads_id = (SELECT goodreads_id FROM books WHERE id = ?2),
+             updated_at = ?3
+             WHERE id = ?1 AND goodreads_id IS NULL
+             AND (SELECT goodreads_id FROM books WHERE id = ?2) IS NOT NULL",
+            params![
+                keep_id.to_string(),
+                removed_id.to_string(),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE books SET calibre_id = (SELECT calibre_id FROM books WHERE id = ?2),
+             updated_at = ?3
+             WHERE id = ?1 AND calibre_id IS NULL
+             AND (SELECT calibre_id FROM books WHERE id = ?2) IS NOT NULL",
+            params![
+                keep_id.to_string(),
+                removed_id.to_string(),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+
+        // 11. If removed book had a work_id and keep doesn't, inherit it
+        tx.execute(
+            "UPDATE books SET work_id = (SELECT work_id FROM books WHERE id = ?2),
+             updated_at = ?3
+             WHERE id = ?1 AND work_id IS NULL
+             AND (SELECT work_id FROM books WHERE id = ?2) IS NOT NULL",
+            params![
+                keep_id.to_string(),
+                removed_id.to_string(),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+
+        // 12. Delete the removed book (ON DELETE CASCADE cleans up remaining refs)
+        tx.execute(
+            "DELETE FROM books WHERE id = ?1",
+            params![removed_id.to_string()],
+        )?;
+
+        tx.commit()?;
+
+        // 13. Recompute search_text outside the transaction
+        self.update_search_text(keep_id)?;
+
+        Ok(())
+    }
 }
 
 /// Build the denormalized search_text from book fields and author names.
@@ -1373,6 +1819,43 @@ fn build_search_text(
         parts.push(name);
     }
     parts.join(" ")
+}
+
+/// Normalize a title + author string for grouping purposes.
+/// Strips parentheticals, edition markers, extra whitespace; lowercases everything.
+fn normalize_title_for_grouping(title: &str, author: &str) -> String {
+    let mut s = title.to_lowercase();
+    // Remove content in parentheses: "(Paperback)", "(2nd Edition)", etc.
+    while let (Some(open), Some(close)) = (s.find('('), s.find(')')) {
+        if open < close {
+            s = format!("{}{}", &s[..open], &s[close + 1..]);
+        } else {
+            break;
+        }
+    }
+    // Remove common edition markers
+    for marker in &[
+        "hardcover",
+        "paperback",
+        "mass market",
+        "trade paperback",
+        "kindle edition",
+        "ebook",
+        "audiobook",
+        "audio cd",
+        "board book",
+        "library binding",
+    ] {
+        s = s.replace(marker, "");
+    }
+    // Collapse whitespace and trim
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let author_norm = author.to_lowercase().trim().to_string();
+    if author_norm.is_empty() {
+        s
+    } else {
+        format!("{s} | {author_norm}")
+    }
 }
 
 fn row_to_book(row: &rusqlite::Row<'_>) -> Result<Book, String> {
@@ -1469,6 +1952,132 @@ fn row_to_reading_session(row: &rusqlite::Row<'_>) -> Result<ReadingSession, Str
             .map_err(|e| e.to_string())?
             .with_timezone(&chrono::Utc),
     })
+}
+
+/// Escape LIKE wildcards in a value for safe parameterized LIKE queries.
+fn escape_like_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Recursively build a SQL WHERE clause from a filter expression tree.
+/// Appends parameterized values to `params` and increments `param_idx`.
+fn build_filter_sql(
+    expr: &FilterExpr,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    param_idx: &mut u32,
+) -> String {
+    match expr {
+        FilterExpr::And(exprs) => {
+            let clauses: Vec<String> = exprs
+                .iter()
+                .map(|e| {
+                    let clause = build_filter_sql(e, params, param_idx);
+                    if matches!(e, FilterExpr::Or(_)) {
+                        format!("({clause})")
+                    } else {
+                        clause
+                    }
+                })
+                .collect();
+            clauses.join(" AND ")
+        }
+        FilterExpr::Or(exprs) => {
+            let clauses: Vec<String> = exprs
+                .iter()
+                .map(|e| build_filter_sql(e, params, param_idx))
+                .collect();
+            clauses.join(" OR ")
+        }
+        FilterExpr::Condition(cond) => build_condition_sql(cond, params, param_idx),
+    }
+}
+
+fn build_condition_sql(
+    cond: &FilterCondition,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    param_idx: &mut u32,
+) -> String {
+    let idx = *param_idx;
+    *param_idx += 1;
+
+    match cond.field {
+        FilterField::Status => {
+            // Normalize underscores to hyphens (DSL accepts both)
+            let normalized = cond.value.replace('_', "-");
+            params.push(Box::new(normalized));
+            format!("b.status = ?{idx}")
+        }
+        FilterField::Rating => {
+            let val: i64 = cond.value.parse().unwrap_or(0);
+            params.push(Box::new(val));
+            format!("b.rating {} ?{idx}", cond.op.as_sql())
+        }
+        FilterField::Pages => {
+            let val: i64 = cond.value.parse().unwrap_or(0);
+            params.push(Box::new(val));
+            format!("b.page_count {} ?{idx}", cond.op.as_sql())
+        }
+        FilterField::Format => {
+            params.push(Box::new(cond.value.clone()));
+            format!("b.format = ?{idx}")
+        }
+        FilterField::PubDate => {
+            params.push(Box::new(cond.value.clone()));
+            if cond.value.len() == 4 {
+                // Year comparison: extract first 4 chars of pub_date
+                format!("SUBSTR(b.pub_date, 1, 4) {} ?{idx}", cond.op.as_sql())
+            } else {
+                format!("b.pub_date {} ?{idx}", cond.op.as_sql())
+            }
+        }
+        FilterField::DateAdded => {
+            params.push(Box::new(cond.value.clone()));
+            if cond.value.len() == 4 {
+                format!("SUBSTR(b.created_at, 1, 4) {} ?{idx}", cond.op.as_sql())
+            } else {
+                format!("SUBSTR(b.created_at, 1, 10) {} ?{idx}", cond.op.as_sql())
+            }
+        }
+        FilterField::Tag => {
+            params.push(Box::new(cond.value.clone()));
+            format!(
+                "EXISTS (SELECT 1 FROM book_tags bt JOIN tags t ON t.id = bt.tag_id \
+                 WHERE bt.book_id = b.id AND t.name = ?{idx} COLLATE NOCASE AND t.tag_type = 'general')"
+            )
+        }
+        FilterField::Mood => {
+            params.push(Box::new(cond.value.clone()));
+            format!(
+                "EXISTS (SELECT 1 FROM book_tags bt JOIN tags t ON t.id = bt.tag_id \
+                 WHERE bt.book_id = b.id AND t.name = ?{idx} COLLATE NOCASE AND t.tag_type = 'mood')"
+            )
+        }
+        FilterField::Pace => {
+            params.push(Box::new(cond.value.clone()));
+            format!(
+                "EXISTS (SELECT 1 FROM book_tags bt JOIN tags t ON t.id = bt.tag_id \
+                 WHERE bt.book_id = b.id AND t.name = ?{idx} COLLATE NOCASE AND t.tag_type = 'pace')"
+            )
+        }
+        FilterField::Author => {
+            let escaped = format!("%{}%", escape_like_value(&cond.value));
+            params.push(Box::new(escaped));
+            format!(
+                "EXISTS (SELECT 1 FROM book_authors ba JOIN authors a ON a.id = ba.author_id \
+                 WHERE ba.book_id = b.id AND a.name LIKE ?{idx} ESCAPE '\\' COLLATE NOCASE)"
+            )
+        }
+        FilterField::Shelf => {
+            params.push(Box::new(cond.value.clone()));
+            format!(
+                "EXISTS (SELECT 1 FROM book_shelves bs JOIN shelves s ON s.id = bs.shelf_id \
+                 WHERE bs.book_id = b.id AND s.name = ?{idx} COLLATE NOCASE AND s.is_smart = 0)"
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1989,5 +2598,586 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].session_id, Some(session.id));
         assert_eq!(log[0].progress_type, ProgressType::Percent);
+    }
+
+    // ── Work & merge tests ────────────────────────────────────────────
+
+    #[test]
+    fn create_and_get_work() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let work = Work::new("Dune");
+        repo.create_work(&work).unwrap();
+
+        let retrieved = repo.get_work(&work.id).unwrap();
+        assert_eq!(retrieved.title, "Dune");
+        assert!(retrieved.original_language.is_none());
+    }
+
+    #[test]
+    fn find_works_by_title_case_insensitive() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let w1 = Work::new("Dune");
+        let w2 = Work::new("The Left Hand of Darkness");
+        repo.create_work(&w1).unwrap();
+        repo.create_work(&w2).unwrap();
+
+        let found = repo.find_works_by_title("dune").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "Dune");
+
+        let found = repo.find_works_by_title("DARKNESS").unwrap();
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn link_and_unlink_book_to_work() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let work = Work::new("Dune");
+        repo.create_work(&work).unwrap();
+
+        let book = Book::new("Dune (Paperback)");
+        repo.create_book(&book).unwrap();
+        assert!(repo.get_book(&book.id).unwrap().work_id.is_none());
+
+        repo.link_book_to_work(&book.id, &work.id).unwrap();
+        assert_eq!(repo.get_book(&book.id).unwrap().work_id, Some(work.id));
+
+        let editions = repo.get_work_editions(&work.id).unwrap();
+        assert_eq!(editions.len(), 1);
+        assert_eq!(editions[0].id, book.id);
+
+        repo.unlink_book_from_work(&book.id).unwrap();
+        assert!(repo.get_book(&book.id).unwrap().work_id.is_none());
+    }
+
+    #[test]
+    fn merge_books_moves_sessions_and_progress() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let keep = Book::new("Dune");
+        let remove = Book::new("Dune (Paperback)");
+        repo.create_book(&keep).unwrap();
+        repo.create_book(&remove).unwrap();
+
+        // Add sessions and progress to the removed book
+        let session = ReadingSession::new(remove.id);
+        repo.create_reading_session(&session).unwrap();
+        let progress = ReadingProgress::new(remove.id, ProgressType::Page, 50);
+        repo.log_progress(&progress).unwrap();
+
+        repo.merge_books(&keep.id, &remove.id).unwrap();
+
+        // Sessions and progress moved to keep
+        let sessions = repo.list_reading_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].book_id, keep.id);
+
+        let log = repo.get_reading_log(&keep.id).unwrap();
+        assert_eq!(log.len(), 1);
+
+        // Removed book is gone
+        assert!(repo.get_book(&remove.id).is_err());
+    }
+
+    #[test]
+    fn merge_books_dedupes_tags_and_authors() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let keep = Book::new("Dune");
+        let remove = Book::new("Dune (Kindle)");
+        repo.create_book(&keep).unwrap();
+        repo.create_book(&remove).unwrap();
+
+        // Both have the same tag "sci-fi" and an exclusive tag each
+        repo.add_tag_to_book(&keep.id, "sci-fi").unwrap();
+        repo.add_tag_to_book(&keep.id, "classic").unwrap();
+        repo.add_tag_to_book(&remove.id, "sci-fi").unwrap();
+        repo.add_tag_to_book(&remove.id, "favorite").unwrap();
+
+        // Both have the same author
+        let frank = Author::new("Frank Herbert");
+        repo.add_book_author(&frank, &keep.id, ContributorRole::Author, 0)
+            .unwrap();
+        repo.add_book_author(&frank, &remove.id, ContributorRole::Author, 0)
+            .unwrap();
+
+        repo.merge_books(&keep.id, &remove.id).unwrap();
+
+        let tags = repo.get_book_tags(&keep.id).unwrap();
+        assert_eq!(tags.len(), 3); // sci-fi, classic, favorite (deduped)
+
+        let authors = repo.get_book_authors(&keep.id).unwrap();
+        assert_eq!(authors.len(), 1); // Frank Herbert (deduped)
+    }
+
+    #[test]
+    fn merge_books_fills_null_metadata() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let keep = Book::new("Dune");
+        repo.create_book(&keep).unwrap();
+
+        let mut remove = Book::new("Dune (Paperback)");
+        remove.page_count = Some(412);
+        remove.language = Some("en".to_string());
+        remove.pub_date = Some("1965".to_string());
+        repo.create_book(&remove).unwrap();
+
+        repo.merge_books(&keep.id, &remove.id).unwrap();
+
+        let merged = repo.get_book(&keep.id).unwrap();
+        assert_eq!(merged.page_count, Some(412));
+        assert_eq!(merged.language.as_deref(), Some("en"));
+        assert_eq!(merged.pub_date.as_deref(), Some("1965"));
+    }
+
+    #[test]
+    fn merge_books_keeps_existing_metadata() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let mut keep = Book::new("Dune");
+        keep.page_count = Some(300);
+        repo.create_book(&keep).unwrap();
+
+        let mut remove = Book::new("Dune (Paperback)");
+        remove.page_count = Some(412);
+        repo.create_book(&remove).unwrap();
+
+        repo.merge_books(&keep.id, &remove.id).unwrap();
+
+        let merged = repo.get_book(&keep.id).unwrap();
+        assert_eq!(merged.page_count, Some(300)); // keep's value preserved
+    }
+
+    #[test]
+    fn merge_books_inherits_work_id() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let work = Work::new("Dune");
+        repo.create_work(&work).unwrap();
+
+        let keep = Book::new("Dune");
+        repo.create_book(&keep).unwrap();
+
+        let mut remove = Book::new("Dune (Paperback)");
+        remove.work_id = Some(work.id);
+        repo.create_book(&remove).unwrap();
+        // Manually set work_id since create_book already wrote it
+        repo.link_book_to_work(&remove.id, &work.id).unwrap();
+
+        repo.merge_books(&keep.id, &remove.id).unwrap();
+
+        let merged = repo.get_book(&keep.id).unwrap();
+        assert_eq!(merged.work_id, Some(work.id));
+    }
+
+    #[test]
+    fn auto_group_candidates_finds_duplicates() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let b1 = Book::new("Dune");
+        let b2 = Book::new("dune");
+        let b3 = Book::new("Neuromancer");
+        repo.create_book(&b1).unwrap();
+        repo.create_book(&b2).unwrap();
+        repo.create_book(&b3).unwrap();
+
+        // b1 and b2 share a primary author
+        let frank = Author::new("Frank Herbert");
+        repo.add_book_author(&frank, &b1.id, ContributorRole::Author, 0)
+            .unwrap();
+        repo.add_book_author(&frank, &b2.id, ContributorRole::Author, 0)
+            .unwrap();
+        let gibson = Author::new("William Gibson");
+        repo.add_book_author(&gibson, &b3.id, ContributorRole::Author, 0)
+            .unwrap();
+
+        let candidates = repo.auto_group_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1.len(), 2);
+    }
+
+    #[test]
+    fn auto_group_excludes_already_grouped() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let work = Work::new("Dune");
+        repo.create_work(&work).unwrap();
+
+        let b1 = Book::new("Dune");
+        let b2 = Book::new("Dune");
+        repo.create_book(&b1).unwrap();
+        repo.create_book(&b2).unwrap();
+
+        let frank = Author::new("Frank Herbert");
+        repo.add_book_author(&frank, &b1.id, ContributorRole::Author, 0)
+            .unwrap();
+        repo.add_book_author(&frank, &b2.id, ContributorRole::Author, 0)
+            .unwrap();
+
+        // Link b1 to work — now it shouldn't be a candidate
+        repo.link_book_to_work(&b1.id, &work.id).unwrap();
+
+        let candidates = repo.auto_group_candidates().unwrap();
+        assert!(candidates.is_empty()); // only 1 ungrouped book, needs >= 2
+    }
+
+    #[test]
+    fn normalize_title_strips_parentheticals() {
+        assert_eq!(
+            normalize_title_for_grouping("Dune (Paperback)", "Frank Herbert"),
+            "dune | frank herbert"
+        );
+        assert_eq!(
+            normalize_title_for_grouping("Dune (2nd Edition)", "Frank Herbert"),
+            "dune | frank herbert"
+        );
+    }
+
+    #[test]
+    fn normalize_title_strips_edition_markers() {
+        assert_eq!(
+            normalize_title_for_grouping("Dune Kindle Edition", ""),
+            "dune"
+        );
+        assert_eq!(
+            normalize_title_for_grouping("Dune Hardcover", "Frank Herbert"),
+            "dune | frank herbert"
+        );
+    }
+
+    // --- Smart shelf tests ---
+
+    #[test]
+    fn create_smart_shelf_and_list() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let filter = SmartFilter::parse("status:read").unwrap();
+        let shelf = repo.create_smart_shelf("Finished Books", &filter).unwrap();
+
+        assert!(shelf.is_smart);
+        assert!(shelf.smart_filter.is_some());
+
+        let shelves = repo.list_shelves().unwrap();
+        let smart = shelves.iter().find(|s| s.name == "Finished Books").unwrap();
+        assert!(smart.is_smart);
+        assert!(smart.smart_filter.is_some());
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_status_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let mut b1 = Book::new("Read Book");
+        b1.status = ReadingStatus::Read;
+        repo.create_book(&b1).unwrap();
+
+        let mut b2 = Book::new("Unread Book");
+        b2.status = ReadingStatus::WantToRead;
+        repo.create_book(&b2).unwrap();
+
+        let filter = SmartFilter::parse("status:read").unwrap();
+        repo.create_smart_shelf("Finished", &filter).unwrap();
+
+        let books = repo.list_books_in_shelf("Finished").unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Read Book");
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_rating_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let mut b1 = Book::new("Great Book");
+        b1.rating = Some(9);
+        repo.create_book(&b1).unwrap();
+
+        let mut b2 = Book::new("OK Book");
+        b2.rating = Some(5);
+        repo.create_book(&b2).unwrap();
+
+        let filter = SmartFilter::parse("rating:>=8").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Great Book");
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_pages_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let mut b1 = Book::new("Long Book");
+        b1.page_count = Some(500);
+        repo.create_book(&b1).unwrap();
+
+        let mut b2 = Book::new("Short Book");
+        b2.page_count = Some(100);
+        repo.create_book(&b2).unwrap();
+
+        let filter = SmartFilter::parse("pages:>300").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Long Book");
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_tag_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let b1 = Book::new("Sci-Fi Book");
+        repo.create_book(&b1).unwrap();
+        repo.add_tag_to_book(&b1.id, "sci-fi").unwrap();
+
+        let b2 = Book::new("Fantasy Book");
+        repo.create_book(&b2).unwrap();
+        repo.add_tag_to_book(&b2.id, "fantasy").unwrap();
+
+        let filter = SmartFilter::parse("tag:sci-fi").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Sci-Fi Book");
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_mood_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let b1 = Book::new("Dark Book");
+        repo.create_book(&b1).unwrap();
+        repo.add_typed_tag_to_book(&b1.id, "dark", TagType::Mood)
+            .unwrap();
+
+        let b2 = Book::new("Light Book");
+        repo.create_book(&b2).unwrap();
+
+        let filter = SmartFilter::parse("mood:dark").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Dark Book");
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_author_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let b1 = Book::new("Dune");
+        repo.create_book(&b1).unwrap();
+        repo.add_book_author(
+            &Author::new("Frank Herbert"),
+            &b1.id,
+            ContributorRole::Author,
+            0,
+        )
+        .unwrap();
+
+        let b2 = Book::new("1984");
+        repo.create_book(&b2).unwrap();
+        repo.add_book_author(
+            &Author::new("George Orwell"),
+            &b2.id,
+            ContributorRole::Author,
+            0,
+        )
+        .unwrap();
+
+        let filter = SmartFilter::parse("author:herbert").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Dune");
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_and_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let mut b1 = Book::new("Read Sci-Fi");
+        b1.status = ReadingStatus::Read;
+        repo.create_book(&b1).unwrap();
+        repo.add_tag_to_book(&b1.id, "sci-fi").unwrap();
+
+        let mut b2 = Book::new("Unread Sci-Fi");
+        b2.status = ReadingStatus::WantToRead;
+        repo.create_book(&b2).unwrap();
+        repo.add_tag_to_book(&b2.id, "sci-fi").unwrap();
+
+        let mut b3 = Book::new("Read Fantasy");
+        b3.status = ReadingStatus::Read;
+        repo.create_book(&b3).unwrap();
+        repo.add_tag_to_book(&b3.id, "fantasy").unwrap();
+
+        let filter = SmartFilter::parse("status:read AND tag:sci-fi").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Read Sci-Fi");
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_or_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let b1 = Book::new("Sci-Fi Book");
+        repo.create_book(&b1).unwrap();
+        repo.add_tag_to_book(&b1.id, "sci-fi").unwrap();
+
+        let b2 = Book::new("Fantasy Book");
+        repo.create_book(&b2).unwrap();
+        repo.add_tag_to_book(&b2.id, "fantasy").unwrap();
+
+        let b3 = Book::new("Romance Book");
+        repo.create_book(&b3).unwrap();
+        repo.add_tag_to_book(&b3.id, "romance").unwrap();
+
+        let filter = SmartFilter::parse("tag:sci-fi OR tag:fantasy").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 2);
+    }
+
+    #[test]
+    fn smart_shelf_evaluates_parenthesized_filter() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let mut b1 = Book::new("Unread Sci-Fi");
+        b1.status = ReadingStatus::WantToRead;
+        repo.create_book(&b1).unwrap();
+        repo.add_tag_to_book(&b1.id, "sci-fi").unwrap();
+
+        let mut b2 = Book::new("Unread Fantasy");
+        b2.status = ReadingStatus::WantToRead;
+        repo.create_book(&b2).unwrap();
+        repo.add_tag_to_book(&b2.id, "fantasy").unwrap();
+
+        let mut b3 = Book::new("Read Sci-Fi");
+        b3.status = ReadingStatus::Read;
+        repo.create_book(&b3).unwrap();
+        repo.add_tag_to_book(&b3.id, "sci-fi").unwrap();
+
+        let filter =
+            SmartFilter::parse("status:want_to_read AND (tag:sci-fi OR tag:fantasy)").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 2);
+    }
+
+    #[test]
+    fn smart_shelf_auto_updates() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let filter = SmartFilter::parse("status:read").unwrap();
+        repo.create_smart_shelf("Finished", &filter).unwrap();
+
+        // Initially empty
+        let books = repo.list_books_in_shelf("Finished").unwrap();
+        assert!(books.is_empty());
+
+        // Add a read book — shelf auto-includes it
+        let mut b1 = Book::new("Newly Finished");
+        b1.status = ReadingStatus::Read;
+        repo.create_book(&b1).unwrap();
+
+        let books = repo.list_books_in_shelf("Finished").unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "Newly Finished");
+    }
+
+    #[test]
+    fn cannot_add_book_to_smart_shelf() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let b1 = Book::new("Test Book");
+        repo.create_book(&b1).unwrap();
+
+        let filter = SmartFilter::parse("status:read").unwrap();
+        repo.create_smart_shelf("Smart", &filter).unwrap();
+
+        let err = repo.add_book_to_shelf(&b1.id, "Smart").unwrap_err();
+        assert!(err.to_string().contains("smart shelf"));
+    }
+
+    #[test]
+    fn get_shelf_by_name_test() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        repo.create_shelf("Regular").unwrap();
+        let filter = SmartFilter::parse("rating:>=8").unwrap();
+        repo.create_smart_shelf("Top Rated", &filter).unwrap();
+
+        let regular = repo.get_shelf_by_name("Regular").unwrap().unwrap();
+        assert!(!regular.is_smart);
+
+        let smart = repo.get_shelf_by_name("Top Rated").unwrap().unwrap();
+        assert!(smart.is_smart);
+        assert!(smart.smart_filter.is_some());
+
+        let missing = repo.get_shelf_by_name("Nonexistent").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn delete_shelf_test() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        repo.create_shelf("ToDelete").unwrap();
+        assert!(repo.delete_shelf("ToDelete").unwrap());
+        assert!(!repo.delete_shelf("ToDelete").unwrap());
+
+        let shelves = repo.list_shelves().unwrap();
+        assert!(shelves.iter().all(|s| s.name != "ToDelete"));
+    }
+
+    #[test]
+    fn smart_shelf_shelf_filter_excludes_smart_shelves() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let b1 = Book::new("On Regular Shelf");
+        repo.create_book(&b1).unwrap();
+        repo.add_book_to_shelf(&b1.id, "Favorites").unwrap();
+
+        let b2 = Book::new("Not On Any Shelf");
+        repo.create_book(&b2).unwrap();
+
+        let filter = SmartFilter::parse("shelf:Favorites").unwrap();
+        let books = repo.evaluate_smart_filter(&filter).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].title, "On Regular Shelf");
+    }
+
+    #[test]
+    fn smart_shelf_json_round_trip_from_db() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let filter = SmartFilter::parse("status:read AND rating:>=8").unwrap();
+        repo.create_smart_shelf("Best Reads", &filter).unwrap();
+
+        let shelf = repo.get_shelf_by_name("Best Reads").unwrap().unwrap();
+        let stored_filter = SmartFilter::from_json(shelf.smart_filter.as_ref().unwrap()).unwrap();
+        assert_eq!(filter, stored_filter);
     }
 }

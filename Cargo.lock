@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "toku-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "toku-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -2264,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "toku-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "directories",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "toku-export"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "csv",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "toku-import"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "csv",
@@ -2311,7 +2311,7 @@ dependencies = [
 
 [[package]]
 name = "toku-meta"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "reqwest",
  "serde",

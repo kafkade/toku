@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Work grouping: `toku work link|unlink|show|auto` to group multiple editions of the same creative work, with automatic candidate detection by normalized title and primary author
+- Duplicate merging: `toku merge <keep> <remove>` moves all reading sessions, progress, tags, authors, ISBNs, and metadata from the removed book to the kept book in a single transaction
+- StoryGraph CSV import: `toku import storygraph <file>` with mood tags, pace ratings, content warnings, quarter-star rating conversion, multi-session date parsing, contributor roles (narrator/translator), and DNF/paused status mapping
+- Smart shelves: `toku shelf create "Unread Sci-Fi" --smart --filter "status:want_to_read AND tag:sci-fi"` creates saved filter rules that auto-populate with matching books
+- Filter DSL for smart shelves supporting 11 fields (status, tag, mood, pace, rating, pages, author, format, shelf, pub_date, date_added) with comparison operators and AND/OR/parentheses
+- `toku shelf list|show|delete|add|remove` for managing both regular and smart shelves with `--format table|json|csv` output
 - Interactive TUI library browser (`toku browse`, or just `toku` with no subcommand) with split-pane layout: scrollable book list on the left, live detail view on the right
 - Tag display in TUI book detail pane with styled cyan labels
 - Filter popup in TUI browser to narrow books by reading status or tag
@@ -25,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Shared import types (ImportReport, ImportEvent, ImportObserver) extracted to common module for reuse across all importers
 - Goodreads importer now uses observer pattern for progress reporting and wraps non-dry-run imports in a transaction for atomicity
 - Import report includes bounded sample lists (up to 20) of imported, updated, and skipped books with status counts
 - Shelves merged into tags — all user-created groupings are now tags; `ReadingStatus` remains as the separate state machine for tracking reading progress

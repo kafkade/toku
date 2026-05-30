@@ -8,7 +8,7 @@ use toku_db::{BookRepository, Database};
 use uuid::Uuid;
 
 use crate::ImportError;
-use crate::goodreads::ImportReport;
+use crate::common::ImportReport;
 
 /// Options for a Calibre import.
 pub struct CalibreImportOptions {

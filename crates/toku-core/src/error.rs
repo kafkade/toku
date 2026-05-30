@@ -32,4 +32,13 @@ pub enum TokuError {
         from: &'static str,
         to: &'static str,
     },
+
+    #[error("work not found: {0}")]
+    WorkNotFound(String),
+
+    #[error("merge conflict: {0}")]
+    MergeConflict(String),
+
+    #[error("invalid filter: {0}")]
+    InvalidFilter(String),
 }

@@ -11,4 +11,7 @@ pub enum DbError {
 
     #[error("not found: {0}")]
     NotFound(String),
+
+    #[error("invalid operation: {0}")]
+    InvalidOperation(String),
 }

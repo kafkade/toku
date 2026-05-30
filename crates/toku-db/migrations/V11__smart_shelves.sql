@@ -1,0 +1,2 @@
+ALTER TABLE shelves ADD COLUMN is_smart INTEGER NOT NULL DEFAULT 0 CHECK (is_smart IN (0, 1));
+ALTER TABLE shelves ADD COLUMN smart_filter TEXT;

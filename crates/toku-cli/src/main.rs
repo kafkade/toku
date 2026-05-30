@@ -7,8 +7,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use toku_core::{
     Author, Book, BookFormat, ContributorRole, CurrentlyReadingInput, Isbn, PaceRating,
-    ProgressType, ReadingProgress, ReadingSession, ReadingStatus, StatsInput, TagType, TokuConfig,
-    compute_stats, parse_duration_to_minutes,
+    ProgressType, ReadingProgress, ReadingSession, ReadingStatus, SmartFilter, StatsInput, TagType,
+    TokuConfig, compute_stats, parse_duration_to_minutes,
 };
 use toku_db::{BookRepository, Database};
 
@@ -215,6 +215,27 @@ enum Commands {
         #[arg(long)]
         mood_trends: bool,
     },
+
+    /// Manage work grouping (link editions of the same creative work)
+    Work {
+        #[command(subcommand)]
+        action: WorkAction,
+    },
+
+    /// Merge duplicate books (keep one, move all data from the other)
+    Merge {
+        /// Book to keep (title or ID)
+        keep: String,
+
+        /// Book to remove (title or ID) — its data is moved to the kept book
+        remove: String,
+    },
+
+    /// Manage shelves (regular and smart)
+    Shelf {
+        #[command(subcommand)]
+        action: ShelfAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,6 +262,16 @@ enum ImportSource {
         /// Skip importing cover images
         #[arg(long)]
         no_covers: bool,
+    },
+
+    /// Import from a StoryGraph CSV export
+    Storygraph {
+        /// Path to the StoryGraph CSV file
+        path: PathBuf,
+
+        /// Preview what would be imported without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Undo a previous import by its ID
@@ -399,6 +430,84 @@ enum BulkAction {
 }
 
 #[derive(Subcommand)]
+enum WorkAction {
+    /// Link a book to a work (creates the work if needed)
+    Link {
+        /// Book title or ID
+        book: String,
+
+        /// Work title (creates or finds an existing work)
+        #[arg(long)]
+        work: String,
+    },
+
+    /// Unlink a book from its work
+    Unlink {
+        /// Book title or ID
+        book: String,
+    },
+
+    /// Show all editions of a work
+    Show {
+        /// Work title to display
+        work: String,
+    },
+
+    /// Auto-detect potential work groups from ungrouped books
+    Auto,
+}
+
+#[derive(Subcommand)]
+enum ShelfAction {
+    /// Create a shelf (use --smart --filter for smart shelves)
+    Create {
+        /// Shelf name
+        name: String,
+
+        /// Create a smart shelf with a filter rule
+        #[arg(long)]
+        smart: bool,
+
+        /// Filter expression (required with --smart)
+        #[arg(long, requires = "smart")]
+        filter: Option<String>,
+    },
+
+    /// List all shelves
+    List,
+
+    /// Show books in a shelf (smart shelves are evaluated dynamically)
+    Show {
+        /// Shelf name
+        name: String,
+    },
+
+    /// Delete a shelf
+    Delete {
+        /// Shelf name
+        name: String,
+    },
+
+    /// Add a book to a regular shelf
+    Add {
+        /// Shelf name
+        shelf: String,
+
+        /// Book title or ID
+        book: String,
+    },
+
+    /// Remove a book from a regular shelf
+    Remove {
+        /// Shelf name
+        shelf: String,
+
+        /// Book title or ID
+        book: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ExportTarget {
     /// Export as CSV
     Csv {
@@ -539,6 +648,9 @@ fn main() -> Result<()> {
             author,
             mood_trends,
         } => cmd_stats(&repo, year, author.as_deref(), mood_trends, &cli.format),
+        Commands::Work { action } => cmd_work(&repo, action, &cli.format),
+        Commands::Merge { keep, remove } => cmd_merge(&repo, &keep, &remove, &cli.format),
+        Commands::Shelf { action } => cmd_shelf(&repo, action, &cli.format),
         // Already handled above
         Commands::Config { .. } | Commands::Completions { .. } => unreachable!(),
     }
@@ -1236,6 +1348,7 @@ fn print_book_detail(
                 "format": book.format.as_str(),
                 "rating": book.rating,
                 "pages": book.page_count,
+                "work_id": book.work_id.map(|w| w.to_string()),
                 "tags": general_tags.iter().map(|t| &t.name).collect::<Vec<_>>(),
                 "moods": mood_tags.iter().map(|t| &t.name).collect::<Vec<_>>(),
                 "pace": pace_tags.first().map(|t| &t.name),
@@ -1316,6 +1429,13 @@ fn print_book_detail(
                 println!("  Desc:    {truncated}");
             }
             println!("  ID:      {}", book.id);
+            if let Some(work_id) = &book.work_id {
+                if let Ok(work) = repo.get_work(work_id) {
+                    println!("  Work:    {} ({})", work.title, work_id);
+                } else {
+                    println!("  Work:    {work_id}");
+                }
+            }
         }
     }
     Ok(())
@@ -1362,6 +1482,9 @@ fn cmd_import(
             }
 
             Ok(())
+        }
+        ImportSource::Storygraph { path, dry_run } => {
+            import_ui::run_storygraph_import(db, &path, dry_run, output_format)
         }
         ImportSource::Undo { import_id } => {
             let count =
@@ -1957,6 +2080,194 @@ fn cmd_bulk(repo: &BookRepository, action: BulkAction) -> Result<()> {
     }
 }
 
+fn cmd_work(repo: &BookRepository, action: WorkAction, output_format: &OutputFormat) -> Result<()> {
+    match action {
+        WorkAction::Link { book, work } => {
+            let b = resolve_book(repo, &book)?;
+            // Find or create the work
+            let works = repo.find_works_by_title(&work)?;
+            let w = if let Some(existing) = works
+                .into_iter()
+                .find(|w| w.title.eq_ignore_ascii_case(&work))
+            {
+                existing
+            } else {
+                let new_work = toku_core::Work::new(&work);
+                repo.create_work(&new_work)?;
+                eprintln!("Created work \"{}\"", work);
+                new_work
+            };
+
+            // Check if the book already has a different work
+            if let Some(existing_work_id) = b.work_id {
+                if existing_work_id == w.id {
+                    eprintln!("\"{}\" is already linked to work \"{}\"", b.title, w.title);
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "\"{}\" is already linked to a different work ({}). Unlink it first with `toku work unlink`.",
+                    b.title,
+                    existing_work_id
+                );
+            }
+
+            repo.link_book_to_work(&b.id, &w.id)?;
+            eprintln!("Linked \"{}\" → work \"{}\"", b.title, w.title);
+            Ok(())
+        }
+        WorkAction::Unlink { book } => {
+            let b = resolve_book(repo, &book)?;
+            if b.work_id.is_none() {
+                eprintln!("\"{}\" is not linked to any work", b.title);
+                return Ok(());
+            }
+            repo.unlink_book_from_work(&b.id)?;
+            eprintln!("Unlinked \"{}\" from its work", b.title);
+            Ok(())
+        }
+        WorkAction::Show { work } => {
+            let works = repo.find_works_by_title(&work)?;
+            if works.is_empty() {
+                eprintln!("No work found matching \"{work}\"");
+                return Ok(());
+            }
+            for w in &works {
+                let editions = repo.get_work_editions(&w.id)?;
+                match output_format {
+                    OutputFormat::Json => {
+                        let json = serde_json::json!({
+                            "work_id": w.id.to_string(),
+                            "title": w.title,
+                            "original_language": w.original_language,
+                            "first_published": w.first_published,
+                            "editions": editions.iter().map(|b| serde_json::json!({
+                                "id": b.id.to_string(),
+                                "title": b.title,
+                                "format": b.format.as_str(),
+                                "status": b.status.as_str(),
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&json)?);
+                    }
+                    OutputFormat::Csv => {
+                        println!("work_id,work_title,book_id,book_title,format,status");
+                        for b in &editions {
+                            println!(
+                                "{},{},{},{},{},{}",
+                                w.id, w.title, b.id, b.title, b.format, b.status
+                            );
+                        }
+                    }
+                    OutputFormat::Table => {
+                        println!("Work: {}", w.title);
+                        println!("  ID: {}", w.id);
+                        if let Some(lang) = &w.original_language {
+                            println!("  Language: {lang}");
+                        }
+                        if let Some(pub_date) = &w.first_published {
+                            println!("  First published: {pub_date}");
+                        }
+                        println!("  Editions ({}):", editions.len());
+                        for b in &editions {
+                            println!("    • {} [{}] — {}", b.title, b.format, b.status);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        WorkAction::Auto => {
+            let candidates = repo.auto_group_candidates()?;
+            if candidates.is_empty() {
+                eprintln!("No potential work groups found among ungrouped books.");
+                return Ok(());
+            }
+            match output_format {
+                OutputFormat::Json => {
+                    let json: Vec<_> = candidates
+                        .iter()
+                        .map(|(key, books)| {
+                            serde_json::json!({
+                                "group_key": key,
+                                "books": books.iter().map(|b| serde_json::json!({
+                                    "id": b.id.to_string(),
+                                    "title": b.title,
+                                    "format": b.format.as_str(),
+                                })).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+                OutputFormat::Csv => {
+                    println!("group_key,book_id,title,format");
+                    for (key, books) in &candidates {
+                        for b in books {
+                            println!("{},{},{},{}", key, b.id, b.title, b.format);
+                        }
+                    }
+                }
+                OutputFormat::Table => {
+                    eprintln!(
+                        "Found {} potential work group(s). Use `toku work link` to group them.\n",
+                        candidates.len()
+                    );
+                    for (key, books) in &candidates {
+                        println!("Group: {key}");
+                        for b in books {
+                            println!("  • {} [{}] ({})", b.title, b.format, b.id);
+                        }
+                        println!();
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_merge(
+    repo: &BookRepository,
+    keep_query: &str,
+    remove_query: &str,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    let keep = resolve_book(repo, keep_query)?;
+    let remove = resolve_book(repo, remove_query)?;
+
+    if keep.id == remove.id {
+        anyhow::bail!("Cannot merge a book with itself");
+    }
+
+    // Show comparison before merge
+    match output_format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "action": "merge",
+                "keep": { "id": keep.id.to_string(), "title": keep.title },
+                "remove": { "id": remove.id.to_string(), "title": remove.title },
+            });
+            repo.merge_books(&keep.id, &remove.id)?;
+            let result = serde_json::json!({
+                "merged": json,
+                "status": "ok",
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        _ => {
+            eprintln!("Merging:");
+            eprintln!("  Keep:   \"{}\" ({})", keep.title, keep.id);
+            eprintln!("  Remove: \"{}\" ({})", remove.title, remove.id);
+            repo.merge_books(&keep.id, &remove.id)?;
+            eprintln!(
+                "✓ Merged successfully. All data moved to \"{}\".",
+                keep.title
+            );
+        }
+    }
+    Ok(())
+}
+
 fn cmd_stats(
     repo: &BookRepository,
     year: Option<i32>,
@@ -2351,4 +2662,176 @@ fn format_number(n: i64) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+fn cmd_shelf(
+    repo: &BookRepository,
+    action: ShelfAction,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    match action {
+        ShelfAction::Create {
+            name,
+            smart,
+            filter,
+        } => {
+            if smart {
+                let filter_str = filter.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--filter is required when creating a smart shelf")
+                })?;
+                let parsed = SmartFilter::parse(filter_str).map_err(|e| anyhow::anyhow!("{e}"))?;
+                repo.create_smart_shelf(&name, &parsed)
+                    .with_context(|| format!("failed to create smart shelf '{name}'"))?;
+                eprintln!("✓ Created smart shelf \"{name}\"");
+                eprintln!("  Filter: {parsed}");
+            } else {
+                if filter.is_some() {
+                    anyhow::bail!("--filter requires --smart");
+                }
+                repo.create_shelf(&name)
+                    .with_context(|| format!("failed to create shelf '{name}'"))?;
+                eprintln!("✓ Created shelf \"{name}\"");
+            }
+            Ok(())
+        }
+        ShelfAction::List => {
+            let shelves = repo.list_shelves()?;
+
+            if shelves.is_empty() {
+                eprintln!("No shelves yet. Create one with: toku shelf create <name>");
+                return Ok(());
+            }
+
+            match output_format {
+                OutputFormat::Json => {
+                    #[derive(serde::Serialize)]
+                    struct ShelfOut {
+                        name: String,
+                        is_smart: bool,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        filter: Option<String>,
+                        book_count: usize,
+                    }
+                    let out: Vec<ShelfOut> = shelves
+                        .iter()
+                        .map(|s| {
+                            let count = repo
+                                .list_books_in_shelf(&s.name)
+                                .map(|b| b.len())
+                                .unwrap_or(0);
+                            let filter_display = s.smart_filter.as_ref().and_then(|json| {
+                                SmartFilter::from_json(json).ok().map(|f| f.to_string())
+                            });
+                            ShelfOut {
+                                name: s.name.clone(),
+                                is_smart: s.is_smart,
+                                filter: filter_display,
+                                book_count: count,
+                            }
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+                OutputFormat::Csv => {
+                    println!("name,type,filter,books");
+                    for s in &shelves {
+                        let count = repo
+                            .list_books_in_shelf(&s.name)
+                            .map(|b| b.len())
+                            .unwrap_or(0);
+                        let kind = if s.is_smart { "smart" } else { "regular" };
+                        let filter_display = s
+                            .smart_filter
+                            .as_ref()
+                            .and_then(|json| {
+                                SmartFilter::from_json(json).ok().map(|f| f.to_string())
+                            })
+                            .unwrap_or_default();
+                        println!("{},{kind},\"{filter_display}\",{count}", s.name);
+                    }
+                }
+                OutputFormat::Table => {
+                    for s in &shelves {
+                        let count = repo
+                            .list_books_in_shelf(&s.name)
+                            .map(|b| b.len())
+                            .unwrap_or(0);
+                        if s.is_smart {
+                            let filter_display = s
+                                .smart_filter
+                                .as_ref()
+                                .and_then(|json| {
+                                    SmartFilter::from_json(json).ok().map(|f| f.to_string())
+                                })
+                                .unwrap_or_else(|| "?".to_string());
+                            println!(
+                                "  📋 {} [smart: {}] ({} book{})",
+                                s.name,
+                                filter_display,
+                                count,
+                                if count == 1 { "" } else { "s" }
+                            );
+                        } else {
+                            println!(
+                                "  📚 {} ({} book{})",
+                                s.name,
+                                count,
+                                if count == 1 { "" } else { "s" }
+                            );
+                        }
+                    }
+                }
+            }
+            eprintln!("\n{} shelf/shelves", shelves.len());
+            Ok(())
+        }
+        ShelfAction::Show { name } => {
+            let shelf = repo
+                .get_shelf_by_name(&name)?
+                .ok_or_else(|| anyhow::anyhow!("shelf '{name}' not found"))?;
+
+            let books = repo.list_books_in_shelf(&name)?;
+
+            if shelf.is_smart {
+                let filter_display = shelf
+                    .smart_filter
+                    .as_ref()
+                    .and_then(|json| SmartFilter::from_json(json).ok().map(|f| f.to_string()))
+                    .unwrap_or_else(|| "?".to_string());
+                eprintln!("📋 Smart shelf: {name}");
+                eprintln!("   Filter: {filter_display}");
+            } else {
+                eprintln!("📚 Shelf: {name}");
+            }
+
+            if books.is_empty() {
+                eprintln!("   (empty)");
+            } else {
+                print_books(&books, repo, output_format)?;
+                eprintln!("\n{} book(s)", books.len());
+            }
+            Ok(())
+        }
+        ShelfAction::Delete { name } => {
+            if repo.delete_shelf(&name)? {
+                eprintln!("✓ Deleted shelf \"{name}\"");
+            } else {
+                anyhow::bail!("shelf '{name}' not found");
+            }
+            Ok(())
+        }
+        ShelfAction::Add { shelf, book } => {
+            let found = resolve_book(repo, &book)?;
+            repo.add_book_to_shelf(&found.id, &shelf)
+                .with_context(|| format!("failed to add '{}' to shelf '{shelf}'", found.title))?;
+            eprintln!("✓ Added \"{}\" to shelf \"{shelf}\"", found.title);
+            Ok(())
+        }
+        ShelfAction::Remove { shelf, book } => {
+            let found = resolve_book(repo, &book)?;
+            repo.remove_book_from_shelf(&found.id, &shelf)?;
+            eprintln!("✓ Removed \"{}\" from shelf \"{shelf}\"", found.title);
+            Ok(())
+        }
+    }
 }

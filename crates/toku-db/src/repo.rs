@@ -1,7 +1,7 @@
 use rusqlite::params;
 use toku_core::{
-    Author, Book, BookAuthor, ContributorRole, ReadingProgress, ReadingSession, ReadingStatus,
-    Shelf, Tag,
+    Author, AuthorCount, Book, BookAuthor, ContributorRole, PaceRating, ReadingProgress,
+    ReadingSession, ReadingStatus, Shelf, Tag, TagCount, TagType,
 };
 use uuid::Uuid;
 
@@ -591,20 +591,27 @@ impl<'a> BookRepository<'a> {
 
     /// Create a tag (UPSERT — returns existing tag if name matches case-insensitively).
     pub fn create_tag(&self, name: &str) -> Result<Tag, DbError> {
+        self.create_typed_tag(name, TagType::General)
+    }
+
+    /// Create or get a tag with a specific type. Tags are unique by (name, tag_type).
+    pub fn create_typed_tag(&self, name: &str, tag_type: TagType) -> Result<Tag, DbError> {
         match self.db.conn.query_row(
-            "SELECT id, name, created_at FROM tags WHERE name = ?1",
-            params![name],
+            "SELECT id, name, tag_type, created_at FROM tags WHERE name = ?1 AND tag_type = ?2",
+            params![name, tag_type.as_str()],
             |row| {
                 let id_str: String = row.get(0)?;
                 let tag_name: String = row.get(1)?;
-                let created_str: String = row.get(2)?;
-                Ok((id_str, tag_name, created_str))
+                let type_str: String = row.get(2)?;
+                let created_str: String = row.get(3)?;
+                Ok((id_str, tag_name, type_str, created_str))
             },
         ) {
-            Ok((id_str, tag_name, created_str)) => {
+            Ok((id_str, tag_name, type_str, created_str)) => {
                 let tag = Tag {
                     id: Uuid::parse_str(&id_str).map_err(|e| DbError::Io(e.to_string()))?,
                     name: tag_name,
+                    tag_type: type_str.parse().unwrap_or(TagType::General),
                     created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                         .map_err(|e| DbError::Io(e.to_string()))?
                         .with_timezone(&chrono::Utc),
@@ -612,10 +619,15 @@ impl<'a> BookRepository<'a> {
                 Ok(tag)
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                let tag = Tag::new(name);
+                let tag = Tag::with_type(name, tag_type);
                 self.db.conn.execute(
-                    "INSERT INTO tags (id, name, created_at) VALUES (?1, ?2, ?3)",
-                    params![tag.id.to_string(), tag.name, tag.created_at.to_rfc3339(),],
+                    "INSERT INTO tags (id, name, tag_type, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        tag.id.to_string(),
+                        tag.name,
+                        tag.tag_type.as_str(),
+                        tag.created_at.to_rfc3339(),
+                    ],
                 )?;
                 Ok(tag)
             }
@@ -623,10 +635,20 @@ impl<'a> BookRepository<'a> {
         }
     }
 
-    /// Add a tag to a book, creating the tag if it doesn't exist.
+    /// Add a general tag to a book, creating the tag if it doesn't exist.
     pub fn add_tag_to_book(&self, book_id: &Uuid, tag_name: &str) -> Result<(), DbError> {
+        self.add_typed_tag_to_book(book_id, tag_name, TagType::General)
+    }
+
+    /// Add a typed tag to a book, creating the tag if it doesn't exist.
+    pub fn add_typed_tag_to_book(
+        &self,
+        book_id: &Uuid,
+        tag_name: &str,
+        tag_type: TagType,
+    ) -> Result<(), DbError> {
         self.get_book(book_id)?;
-        let tag = self.create_tag(tag_name)?;
+        let tag = self.create_typed_tag(tag_name, tag_type)?;
 
         self.db.conn.execute(
             "INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?1, ?2)",
@@ -636,17 +658,42 @@ impl<'a> BookRepository<'a> {
         Ok(())
     }
 
-    /// Remove a tag from a book.
+    /// Set the pace rating for a book. Removes any existing pace tag first.
+    pub fn set_book_pace(&self, book_id: &Uuid, pace: PaceRating) -> Result<(), DbError> {
+        self.get_book(book_id)?;
+
+        // Remove existing pace tags
+        self.db.conn.execute(
+            "DELETE FROM book_tags WHERE book_id = ?1
+             AND tag_id IN (SELECT id FROM tags WHERE tag_type = 'pace')",
+            params![book_id.to_string()],
+        )?;
+
+        // Add new pace tag
+        self.add_typed_tag_to_book(book_id, pace.as_str(), TagType::Pace)
+    }
+
+    /// Remove a general tag from a book.
     pub fn remove_tag_from_book(&self, book_id: &Uuid, tag_name: &str) -> Result<(), DbError> {
+        self.remove_typed_tag_from_book(book_id, tag_name, TagType::General)
+    }
+
+    /// Remove a typed tag from a book.
+    pub fn remove_typed_tag_from_book(
+        &self,
+        book_id: &Uuid,
+        tag_name: &str,
+        tag_type: TagType,
+    ) -> Result<(), DbError> {
         let rows = self.db.conn.execute(
             "DELETE FROM book_tags WHERE book_id = ?1
-             AND tag_id IN (SELECT id FROM tags WHERE name = ?2)",
-            params![book_id.to_string(), tag_name],
+             AND tag_id IN (SELECT id FROM tags WHERE name = ?2 AND tag_type = ?3)",
+            params![book_id.to_string(), tag_name, tag_type.as_str()],
         )?;
 
         if rows == 0 {
             return Err(DbError::NotFound(format!(
-                "tag '{tag_name}' not on this book"
+                "tag '{tag_name}' ({tag_type}) not on this book"
             )));
         }
 
@@ -656,25 +703,27 @@ impl<'a> BookRepository<'a> {
     /// Get all tags for a book.
     pub fn get_book_tags(&self, book_id: &Uuid) -> Result<Vec<Tag>, DbError> {
         let mut stmt = self.db.conn.prepare(
-            "SELECT t.id, t.name, t.created_at
+            "SELECT t.id, t.name, t.tag_type, t.created_at
              FROM tags t
              JOIN book_tags bt ON bt.tag_id = t.id
              WHERE bt.book_id = ?1
-             ORDER BY t.name COLLATE NOCASE",
+             ORDER BY t.tag_type, t.name COLLATE NOCASE",
         )?;
 
         let tags = stmt
             .query_map(params![book_id.to_string()], |row| {
                 let id_str: String = row.get(0)?;
                 let name: String = row.get(1)?;
-                let created_str: String = row.get(2)?;
-                Ok((id_str, name, created_str))
+                let type_str: String = row.get(2)?;
+                let created_str: String = row.get(3)?;
+                Ok((id_str, name, type_str, created_str))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(id_str, name, created_str)| {
+            .filter_map(|(id_str, name, type_str, created_str)| {
                 Some(Tag {
                     id: Uuid::parse_str(&id_str).ok()?,
                     name,
+                    tag_type: type_str.parse().unwrap_or(TagType::General),
                     created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                         .ok()?
                         .with_timezone(&chrono::Utc),
@@ -685,8 +734,55 @@ impl<'a> BookRepository<'a> {
         Ok(tags)
     }
 
-    /// List all books with a given tag.
+    /// Get tags of a specific type for a book.
+    pub fn get_book_tags_by_type(
+        &self,
+        book_id: &Uuid,
+        tag_type: TagType,
+    ) -> Result<Vec<Tag>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT t.id, t.name, t.tag_type, t.created_at
+             FROM tags t
+             JOIN book_tags bt ON bt.tag_id = t.id
+             WHERE bt.book_id = ?1 AND t.tag_type = ?2
+             ORDER BY t.name COLLATE NOCASE",
+        )?;
+
+        let tags = stmt
+            .query_map(params![book_id.to_string(), tag_type.as_str()], |row| {
+                let id_str: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let type_str: String = row.get(2)?;
+                let created_str: String = row.get(3)?;
+                Ok((id_str, name, type_str, created_str))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(id_str, name, type_str, created_str)| {
+                Some(Tag {
+                    id: Uuid::parse_str(&id_str).ok()?,
+                    name,
+                    tag_type: type_str.parse().unwrap_or(TagType::General),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                        .ok()?
+                        .with_timezone(&chrono::Utc),
+                })
+            })
+            .collect();
+
+        Ok(tags)
+    }
+
+    /// List all books with a given general tag.
     pub fn list_books_by_tag(&self, tag_name: &str) -> Result<Vec<Book>, DbError> {
+        self.list_books_by_typed_tag(tag_name, TagType::General)
+    }
+
+    /// List all books with a given typed tag.
+    pub fn list_books_by_typed_tag(
+        &self,
+        tag_name: &str,
+        tag_type: TagType,
+    ) -> Result<Vec<Book>, DbError> {
         let mut stmt = self.db.conn.prepare(
             "SELECT b.id, b.title, b.subtitle, b.description, b.page_count, b.pub_date,
              b.language, b.format, b.duration_minutes, b.cover_hash, b.work_id, b.status,
@@ -694,12 +790,14 @@ impl<'a> BookRepository<'a> {
              FROM books b
              JOIN book_tags bt ON bt.book_id = b.id
              JOIN tags t ON t.id = bt.tag_id
-             WHERE t.name = ?1
+             WHERE t.name = ?1 AND t.tag_type = ?2
              ORDER BY b.title COLLATE NOCASE",
         )?;
 
         let books = stmt
-            .query_map(params![tag_name], |row| Ok(row_to_book(row)))?
+            .query_map(params![tag_name, tag_type.as_str()], |row| {
+                Ok(row_to_book(row))
+            })?
             .filter_map(|r| r.ok())
             .filter_map(|r| r.ok())
             .collect();
@@ -710,27 +808,71 @@ impl<'a> BookRepository<'a> {
     /// List all tags with book counts.
     pub fn list_tags_with_counts(&self) -> Result<Vec<(Tag, i64)>, DbError> {
         let mut stmt = self.db.conn.prepare(
-            "SELECT t.id, t.name, t.created_at, COUNT(bt.book_id) as book_count
+            "SELECT t.id, t.name, t.tag_type, t.created_at, COUNT(bt.book_id) as book_count
              FROM tags t
              LEFT JOIN book_tags bt ON bt.tag_id = t.id
              GROUP BY t.id
-             ORDER BY t.name COLLATE NOCASE",
+             ORDER BY t.tag_type, t.name COLLATE NOCASE",
         )?;
 
         let tags = stmt
             .query_map([], |row| {
                 let id_str: String = row.get(0)?;
                 let name: String = row.get(1)?;
-                let created_str: String = row.get(2)?;
-                let count: i64 = row.get(3)?;
-                Ok((id_str, name, created_str, count))
+                let type_str: String = row.get(2)?;
+                let created_str: String = row.get(3)?;
+                let count: i64 = row.get(4)?;
+                Ok((id_str, name, type_str, created_str, count))
             })?
             .filter_map(|r| r.ok())
-            .filter_map(|(id_str, name, created_str, count)| {
+            .filter_map(|(id_str, name, type_str, created_str, count)| {
                 Some((
                     Tag {
                         id: Uuid::parse_str(&id_str).ok()?,
                         name,
+                        tag_type: type_str.parse().unwrap_or(TagType::General),
+                        created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
+                            .ok()?
+                            .with_timezone(&chrono::Utc),
+                    },
+                    count,
+                ))
+            })
+            .collect();
+
+        Ok(tags)
+    }
+
+    /// List tags of a specific type with book counts.
+    pub fn list_tags_with_counts_by_type(
+        &self,
+        tag_type: TagType,
+    ) -> Result<Vec<(Tag, i64)>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT t.id, t.name, t.tag_type, t.created_at, COUNT(bt.book_id) as book_count
+             FROM tags t
+             LEFT JOIN book_tags bt ON bt.tag_id = t.id
+             WHERE t.tag_type = ?1
+             GROUP BY t.id
+             ORDER BY t.name COLLATE NOCASE",
+        )?;
+
+        let tags = stmt
+            .query_map(params![tag_type.as_str()], |row| {
+                let id_str: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let type_str: String = row.get(2)?;
+                let created_str: String = row.get(3)?;
+                let count: i64 = row.get(4)?;
+                Ok((id_str, name, type_str, created_str, count))
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|(id_str, name, type_str, created_str, count)| {
+                Some((
+                    Tag {
+                        id: Uuid::parse_str(&id_str).ok()?,
+                        name,
+                        tag_type: type_str.parse().unwrap_or(TagType::General),
                         created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                             .ok()?
                             .with_timezone(&chrono::Utc),
@@ -837,6 +979,379 @@ impl<'a> BookRepository<'a> {
         }
 
         Ok(results)
+    }
+
+    /// Get mood tag names for each book in a list of IDs.
+    /// Returns a map of book_id string → list of mood tag names.
+    pub fn get_mood_tags_for_books(
+        &self,
+        book_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, DbError> {
+        if book_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let placeholders: String = book_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT bt.book_id, t.name
+             FROM book_tags bt
+             JOIN tags t ON t.id = bt.tag_id
+             WHERE t.tag_type = 'mood' AND bt.book_id IN ({placeholders})
+             ORDER BY bt.book_id, t.name"
+        );
+
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = book_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let mut result: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let book_id: String = row.get(0)?;
+            let mood: String = row.get(1)?;
+            Ok((book_id, mood))
+        })?;
+
+        for row in rows.flatten() {
+            result.entry(row.0).or_default().push(row.1);
+        }
+
+        Ok(result)
+    }
+
+    /// Tag names with book counts, sorted by count descending.
+    pub fn list_tag_counts(&self) -> Result<Vec<TagCount>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT t.name, COUNT(bt.book_id) as cnt
+             FROM tags t
+             JOIN book_tags bt ON bt.tag_id = t.id
+             GROUP BY t.name
+             ORDER BY cnt DESC, t.name COLLATE NOCASE",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok(TagCount {
+                    name,
+                    count: count as usize,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Tag counts scoped to a specific set of book IDs.
+    pub fn list_tag_counts_for_books(&self, book_ids: &[String]) -> Result<Vec<TagCount>, DbError> {
+        if book_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: String = book_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT t.name, COUNT(bt.book_id) as cnt
+             FROM tags t
+             JOIN book_tags bt ON bt.tag_id = t.id
+             WHERE bt.book_id IN ({placeholders})
+             GROUP BY t.name
+             ORDER BY cnt DESC, t.name COLLATE NOCASE"
+        );
+
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = book_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                let name: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok(TagCount {
+                    name,
+                    count: count as usize,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Author names with book counts (role = author), sorted by count descending.
+    pub fn list_author_book_counts(&self) -> Result<Vec<AuthorCount>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT a.name, COUNT(DISTINCT ba.book_id) as cnt
+             FROM authors a
+             JOIN book_authors ba ON ba.author_id = a.id
+             WHERE ba.role = 'author'
+             GROUP BY a.name
+             ORDER BY cnt DESC, a.name COLLATE NOCASE",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok(AuthorCount {
+                    name,
+                    count: count as usize,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Author book counts scoped to specific book IDs.
+    pub fn list_author_book_counts_for_books(
+        &self,
+        book_ids: &[String],
+    ) -> Result<Vec<AuthorCount>, DbError> {
+        if book_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: String = book_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT a.name, COUNT(DISTINCT ba.book_id) as cnt
+             FROM authors a
+             JOIN book_authors ba ON ba.author_id = a.id
+             WHERE ba.role = 'author' AND ba.book_id IN ({placeholders})
+             GROUP BY a.name
+             ORDER BY cnt DESC, a.name COLLATE NOCASE"
+        );
+
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = book_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                let name: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok(AuthorCount {
+                    name,
+                    count: count as usize,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Unique dates of reading activity (progress logs + session start/finish dates).
+    pub fn list_activity_dates(&self) -> Result<Vec<chrono::NaiveDate>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT DISTINCT d FROM (
+                 SELECT DATE(logged_at) AS d FROM reading_progress
+                 UNION
+                 SELECT DATE(started_at) AS d FROM reading_sessions
+                 UNION
+                 SELECT DATE(finished_at) AS d FROM reading_sessions
+                     WHERE finished_at IS NOT NULL
+             )
+             ORDER BY d",
+        )?;
+
+        let dates = stmt
+            .query_map([], |row| {
+                let date_str: String = row.get(0)?;
+                Ok(date_str)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+            .collect();
+
+        Ok(dates)
+    }
+
+    /// Activity dates scoped to a specific year.
+    pub fn list_activity_dates_in_year(
+        &self,
+        year: i32,
+    ) -> Result<Vec<chrono::NaiveDate>, DbError> {
+        let start = format!("{year}-01-01");
+        let end = format!("{}-01-01", year + 1);
+
+        let mut stmt = self.db.conn.prepare(
+            "SELECT DISTINCT d FROM (
+                 SELECT DATE(logged_at) AS d FROM reading_progress
+                     WHERE DATE(logged_at) >= ?1 AND DATE(logged_at) < ?2
+                 UNION
+                 SELECT DATE(started_at) AS d FROM reading_sessions
+                     WHERE DATE(started_at) >= ?1 AND DATE(started_at) < ?2
+                 UNION
+                 SELECT DATE(finished_at) AS d FROM reading_sessions
+                     WHERE finished_at IS NOT NULL
+                       AND DATE(finished_at) >= ?1 AND DATE(finished_at) < ?2
+             )
+             ORDER BY d",
+        )?;
+
+        let dates = stmt
+            .query_map(params![start, end], |row| {
+                let date_str: String = row.get(0)?;
+                Ok(date_str)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+            .collect();
+
+        Ok(dates)
+    }
+
+    /// Activity dates scoped to specific book IDs.
+    pub fn list_activity_dates_for_books(
+        &self,
+        book_ids: &[String],
+    ) -> Result<Vec<chrono::NaiveDate>, DbError> {
+        if book_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: String = book_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT DISTINCT d FROM (
+                 SELECT DATE(logged_at) AS d FROM reading_progress
+                     WHERE book_id IN ({placeholders})
+                 UNION
+                 SELECT DATE(started_at) AS d FROM reading_sessions
+                     WHERE book_id IN ({placeholders})
+                 UNION
+                 SELECT DATE(finished_at) AS d FROM reading_sessions
+                     WHERE finished_at IS NOT NULL AND book_id IN ({placeholders})
+             )
+             ORDER BY d"
+        );
+
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        // Each subquery uses the same placeholders, so triple the params
+        let mut all_params: Vec<&dyn rusqlite::types::ToSql> = Vec::new();
+        for _ in 0..3 {
+            for id in book_ids {
+                all_params.push(id as &dyn rusqlite::types::ToSql);
+            }
+        }
+
+        let dates = stmt
+            .query_map(all_params.as_slice(), |row| {
+                let date_str: String = row.get(0)?;
+                Ok(date_str)
+            })?
+            .filter_map(|r| r.ok())
+            .filter_map(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+            .collect();
+
+        Ok(dates)
+    }
+
+    /// List books by a specific author name (case-insensitive match).
+    pub fn list_books_by_author_name(&self, name: &str) -> Result<Vec<Book>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT DISTINCT b.id, b.title, b.subtitle, b.description, b.page_count,
+                    b.pub_date, b.language, b.format, b.duration_minutes, b.cover_hash,
+                    b.work_id, b.status, b.rating, b.created_at, b.updated_at
+             FROM books b
+             JOIN book_authors ba ON ba.book_id = b.id
+             JOIN authors a ON a.id = ba.author_id
+             WHERE LOWER(a.name) = LOWER(?1)
+             ORDER BY b.title COLLATE NOCASE",
+        )?;
+
+        let books = stmt
+            .query_map(params![name], |row| Ok(row_to_book(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(books)
+    }
+
+    /// List reading sessions for specific book IDs.
+    pub fn list_sessions_for_books(
+        &self,
+        book_ids: &[String],
+    ) -> Result<Vec<ReadingSession>, DbError> {
+        if book_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders: String = book_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, book_id, started_at, finished_at, start_page, end_page,
+                    rating, notes, created_at
+             FROM reading_sessions
+             WHERE book_id IN ({placeholders})
+             ORDER BY started_at DESC"
+        );
+
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = book_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let sessions = stmt
+            .query_map(params.as_slice(), |row| Ok(row_to_reading_session(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(sessions)
+    }
+
+    /// List reading sessions for specific book IDs, filtered to a year.
+    pub fn list_sessions_for_books_in_year(
+        &self,
+        book_ids: &[String],
+        year: i32,
+    ) -> Result<Vec<ReadingSession>, DbError> {
+        if book_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let start = format!("{year}-01-01T00:00:00+00:00");
+        let end = format!("{}-01-01T00:00:00+00:00", year + 1);
+        let placeholders: String = book_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, book_id, started_at, finished_at, start_page, end_page,
+                    rating, notes, created_at
+             FROM reading_sessions
+             WHERE book_id IN ({placeholders})
+               AND finished_at IS NOT NULL
+               AND finished_at >= ?{p1}
+               AND finished_at < ?{p2}
+             ORDER BY finished_at DESC",
+            p1 = book_ids.len() + 1,
+            p2 = book_ids.len() + 2,
+        );
+
+        let mut stmt = self.db.conn.prepare(&sql)?;
+        let mut all_params: Vec<&dyn rusqlite::types::ToSql> = book_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        all_params.push(&start as &dyn rusqlite::types::ToSql);
+        all_params.push(&end as &dyn rusqlite::types::ToSql);
+
+        let sessions = stmt
+            .query_map(all_params.as_slice(), |row| Ok(row_to_reading_session(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(sessions)
     }
 }
 

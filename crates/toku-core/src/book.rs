@@ -379,12 +379,90 @@ impl Shelf {
     }
 }
 
+/// Type of tag: general, mood, pace, or content warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TagType {
+    General,
+    Mood,
+    Pace,
+    ContentWarning,
+}
+
+impl TagType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Mood => "mood",
+            Self::Pace => "pace",
+            Self::ContentWarning => "content_warning",
+        }
+    }
+}
+
+impl std::fmt::Display for TagType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TagType {
+    type Err = crate::TokuError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "general" => Ok(Self::General),
+            "mood" => Ok(Self::Mood),
+            "pace" => Ok(Self::Pace),
+            "content_warning" | "content-warning" | "cw" => Ok(Self::ContentWarning),
+            _ => Err(crate::TokuError::InvalidTagType(s.to_string())),
+        }
+    }
+}
+
+/// Pace rating for a book: fast, medium, or slow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaceRating {
+    Fast,
+    Medium,
+    Slow,
+}
+
+impl PaceRating {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Medium => "medium",
+            Self::Slow => "slow",
+        }
+    }
+}
+
+impl std::fmt::Display for PaceRating {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for PaceRating {
+    type Err = crate::TokuError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fast" => Ok(Self::Fast),
+            "medium" | "med" => Ok(Self::Medium),
+            "slow" => Ok(Self::Slow),
+            _ => Err(crate::TokuError::InvalidPaceRating(s.to_string())),
+        }
+    }
+}
+
 /// A user-defined tag for categorizing books (e.g. "sci-fi", "Hugo winner").
-/// Tag names are case-insensitive.
+/// Tag names are case-insensitive. Tags are unique by `(name, tag_type)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
     pub id: Uuid,
     pub name: String,
+    pub tag_type: TagType,
     pub created_at: DateTime<Utc>,
 }
 
@@ -393,6 +471,16 @@ impl Tag {
         Self {
             id: Uuid::now_v7(),
             name: name.into(),
+            tag_type: TagType::General,
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn with_type(name: impl Into<String>, tag_type: TagType) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            name: name.into(),
+            tag_type,
             created_at: Utc::now(),
         }
     }
@@ -612,5 +700,63 @@ mod tests {
     fn parse_duration_invalid() {
         assert!(parse_duration_to_minutes("abc").is_err());
         assert!(parse_duration_to_minutes("").is_err());
+    }
+
+    #[test]
+    fn tag_type_roundtrip() {
+        for tt in [
+            TagType::General,
+            TagType::Mood,
+            TagType::Pace,
+            TagType::ContentWarning,
+        ] {
+            let parsed: TagType = tt.as_str().parse().unwrap();
+            assert_eq!(parsed, tt);
+        }
+    }
+
+    #[test]
+    fn tag_type_aliases() {
+        assert_eq!(
+            "content-warning".parse::<TagType>().unwrap(),
+            TagType::ContentWarning
+        );
+        assert_eq!("cw".parse::<TagType>().unwrap(), TagType::ContentWarning);
+    }
+
+    #[test]
+    fn tag_type_invalid() {
+        assert!("unknown".parse::<TagType>().is_err());
+    }
+
+    #[test]
+    fn pace_rating_roundtrip() {
+        for pr in [PaceRating::Fast, PaceRating::Medium, PaceRating::Slow] {
+            let parsed: PaceRating = pr.as_str().parse().unwrap();
+            assert_eq!(parsed, pr);
+        }
+    }
+
+    #[test]
+    fn pace_rating_alias_med() {
+        assert_eq!("med".parse::<PaceRating>().unwrap(), PaceRating::Medium);
+    }
+
+    #[test]
+    fn pace_rating_invalid() {
+        assert!("very-fast".parse::<PaceRating>().is_err());
+    }
+
+    #[test]
+    fn tag_with_type() {
+        let tag = Tag::with_type("adventurous", TagType::Mood);
+        assert_eq!(tag.name, "adventurous");
+        assert_eq!(tag.tag_type, TagType::Mood);
+    }
+
+    #[test]
+    fn tag_new_defaults_to_general() {
+        let tag = Tag::new("sci-fi");
+        assert_eq!(tag.tag_type, TagType::General);
     }
 }

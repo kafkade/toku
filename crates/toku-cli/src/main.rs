@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -5,9 +6,9 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use toku_core::{
-    Author, Book, BookFormat, ContributorRole, CurrentlyReadingInput, Isbn, ProgressType,
-    ReadingProgress, ReadingSession, ReadingStatus, TokuConfig, compute_stats,
-    parse_duration_to_minutes,
+    Author, Book, BookFormat, ContributorRole, CurrentlyReadingInput, Isbn, PaceRating,
+    ProgressType, ReadingProgress, ReadingSession, ReadingStatus, StatsInput, TagType, TokuConfig,
+    compute_stats, parse_duration_to_minutes,
 };
 use toku_db::{BookRepository, Database};
 
@@ -57,6 +58,18 @@ enum Commands {
         #[arg(long, short = 'T')]
         tag: Vec<String>,
 
+        /// Mood tag(s) to apply (repeatable)
+        #[arg(long)]
+        mood: Vec<String>,
+
+        /// Pace rating (fast, medium, slow)
+        #[arg(long)]
+        pace: Option<String>,
+
+        /// Content warning(s) to apply (repeatable)
+        #[arg(long, alias = "cw")]
+        content_warning: Vec<String>,
+
         /// Initial reading status (want-to-read, reading, read, abandoned, on-hold)
         #[arg(long)]
         status: Option<String>,
@@ -68,6 +81,36 @@ enum Commands {
         query: String,
     },
 
+    /// Edit book metadata (mood tags, pace, content warnings, rating)
+    Edit {
+        /// Book title or ID
+        query: String,
+
+        /// Mood tag(s) to add (repeatable)
+        #[arg(long)]
+        mood: Vec<String>,
+
+        /// Pace rating (fast, medium, slow)
+        #[arg(long)]
+        pace: Option<String>,
+
+        /// Content warning(s) to add (repeatable)
+        #[arg(long, alias = "cw")]
+        content_warning: Vec<String>,
+
+        /// Mood tag(s) to remove (repeatable)
+        #[arg(long)]
+        remove_mood: Vec<String>,
+
+        /// Content warning(s) to remove (repeatable)
+        #[arg(long, alias = "remove-cw")]
+        remove_content_warning: Vec<String>,
+
+        /// Set rating (0–10, displayed as 5★ with half-star increments)
+        #[arg(long, short)]
+        rating: Option<i32>,
+    },
+
     /// List books in your library
     List {
         /// Filter by reading status
@@ -77,6 +120,14 @@ enum Commands {
         /// Filter by tag name
         #[arg(long)]
         tag: Option<String>,
+
+        /// Filter by mood tag(s) (same-type OR, cross-type AND)
+        #[arg(long)]
+        mood: Vec<String>,
+
+        /// Filter by pace (fast, medium, slow)
+        #[arg(long)]
+        pace: Option<String>,
     },
 
     /// Search your library
@@ -155,6 +206,14 @@ enum Commands {
         /// Show stats for a specific year only
         #[arg(long)]
         year: Option<i32>,
+
+        /// Filter stats to a specific author (case-insensitive)
+        #[arg(long)]
+        author: Option<String>,
+
+        /// Show mood tag distribution over time
+        #[arg(long)]
+        mood_trends: bool,
     },
 }
 
@@ -411,6 +470,9 @@ fn main() -> Result<()> {
             isbn,
             book_format,
             tag,
+            mood,
+            pace,
+            content_warning,
             status,
         } => cmd_add(
             &repo,
@@ -420,13 +482,45 @@ fn main() -> Result<()> {
             isbn,
             &book_format,
             &tag,
+            &mood,
+            pace.as_deref(),
+            &content_warning,
             status.as_deref(),
             &cli.format,
         ),
         Commands::Show { query } => cmd_show(&repo, &query, &cli.format),
-        Commands::List { status, tag } => {
-            cmd_list(&repo, status.as_deref(), tag.as_deref(), &cli.format)
-        }
+        Commands::Edit {
+            query,
+            mood,
+            pace,
+            content_warning,
+            remove_mood,
+            remove_content_warning,
+            rating,
+        } => cmd_edit(
+            &repo,
+            &query,
+            &mood,
+            pace.as_deref(),
+            &content_warning,
+            &remove_mood,
+            &remove_content_warning,
+            rating,
+            &cli.format,
+        ),
+        Commands::List {
+            status,
+            tag,
+            mood,
+            pace,
+        } => cmd_list(
+            &repo,
+            status.as_deref(),
+            tag.as_deref(),
+            &mood,
+            pace.as_deref(),
+            &cli.format,
+        ),
         Commands::Search { query, status, tag } => cmd_search(
             &repo,
             &query,
@@ -440,7 +534,11 @@ fn main() -> Result<()> {
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
         Commands::Bulk { action } => cmd_bulk(&repo, action),
-        Commands::Stats { year } => cmd_stats(&repo, year, &cli.format),
+        Commands::Stats {
+            year,
+            author,
+            mood_trends,
+        } => cmd_stats(&repo, year, author.as_deref(), mood_trends, &cli.format),
         // Already handled above
         Commands::Config { .. } | Commands::Completions { .. } => unreachable!(),
     }
@@ -496,6 +594,9 @@ fn cmd_add(
     isbn: Option<String>,
     book_format: &str,
     tags: &[String],
+    moods: &[String],
+    pace: Option<&str>,
+    content_warnings: &[String],
     initial_status: Option<&str>,
     output_format: &OutputFormat,
 ) -> Result<()> {
@@ -515,7 +616,15 @@ fn cmd_add(
         // Check for existing book with this ISBN
         if let Some(existing) = repo.find_by_isbn(&isbn13)? {
             // Apply tags/status to existing book instead of silently ignoring
-            apply_post_add(repo, &existing, tags, target_status)?;
+            apply_post_add(
+                repo,
+                &existing,
+                tags,
+                moods,
+                pace,
+                content_warnings,
+                target_status,
+            )?;
             print_books(&[existing], repo, output_format)?;
             eprintln!("Book already exists — applied tags/status updates");
             return Ok(());
@@ -558,7 +667,15 @@ fn cmd_add(
                     repo.add_book_author(&a, &book.id, ContributorRole::Author, i as i32)?;
                 }
 
-                apply_post_add(repo, &book, tags, target_status)?;
+                apply_post_add(
+                    repo,
+                    &book,
+                    tags,
+                    moods,
+                    pace,
+                    content_warnings,
+                    target_status,
+                )?;
                 print_books(&[book], repo, output_format)?;
                 eprintln!("✓ Added from Open Library");
             }
@@ -569,7 +686,15 @@ fn cmd_add(
                 book.format = format;
                 repo.create_book(&book)?;
                 repo.add_isbn(&isbn13, &book.id)?;
-                apply_post_add(repo, &book, tags, target_status)?;
+                apply_post_add(
+                    repo,
+                    &book,
+                    tags,
+                    moods,
+                    pace,
+                    content_warnings,
+                    target_status,
+                )?;
                 print_books(&[book], repo, output_format)?;
             }
         }
@@ -583,7 +708,15 @@ fn cmd_add(
             repo.add_book_author(&a, &book.id, ContributorRole::Author, 0)?;
         }
 
-        apply_post_add(repo, &book, tags, target_status)?;
+        apply_post_add(
+            repo,
+            &book,
+            tags,
+            moods,
+            pace,
+            content_warnings,
+            target_status,
+        )?;
         print_books(&[book], repo, output_format)?;
         eprintln!("✓ Added manually");
     } else {
@@ -593,11 +726,15 @@ fn cmd_add(
     Ok(())
 }
 
-/// Apply tags and optional status change after creating/finding a book.
+/// Apply tags, mood tags, pace, content warnings, and optional status change after creating/finding a book.
+#[allow(clippy::too_many_arguments)]
 fn apply_post_add(
     repo: &BookRepository,
     book: &Book,
     tags: &[String],
+    moods: &[String],
+    pace: Option<&str>,
+    content_warnings: &[String],
     status: Option<ReadingStatus>,
 ) -> Result<()> {
     for tag_name in tags {
@@ -606,9 +743,26 @@ fn apply_post_add(
             repo.add_tag_to_book(&book.id, trimmed)?;
         }
     }
+    for mood in moods {
+        let trimmed = mood.trim();
+        if !trimmed.is_empty() {
+            repo.add_typed_tag_to_book(&book.id, trimmed, TagType::Mood)?;
+        }
+    }
+    if let Some(pace_str) = pace {
+        let pace_rating: PaceRating = pace_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid pace: {pace_str} (use fast, medium, or slow)"))?;
+        repo.set_book_pace(&book.id, pace_rating)?;
+    }
+    for cw in content_warnings {
+        let trimmed = cw.trim();
+        if !trimmed.is_empty() {
+            repo.add_typed_tag_to_book(&book.id, trimmed, TagType::ContentWarning)?;
+        }
+    }
     if let Some(target) = status {
         repo.update_book_status(&book.id, target)?;
-        // If marking as "reading", also create a reading session
         if target == ReadingStatus::Reading {
             let session = ReadingSession::new(book.id);
             repo.create_reading_session(&session)?;
@@ -634,6 +788,93 @@ fn cmd_show(repo: &BookRepository, query: &str, output_format: &OutputFormat) ->
     } else {
         print_book_detail(&books[0], repo, output_format)?;
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_edit(
+    repo: &BookRepository,
+    query: &str,
+    moods: &[String],
+    pace: Option<&str>,
+    content_warnings: &[String],
+    remove_moods: &[String],
+    remove_content_warnings: &[String],
+    rating: Option<i32>,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    let book = resolve_book(repo, query)?;
+    let mut changes = Vec::new();
+
+    // Add mood tags
+    for mood in moods {
+        let trimmed = mood.trim();
+        if !trimmed.is_empty() {
+            repo.add_typed_tag_to_book(&book.id, trimmed, TagType::Mood)?;
+            changes.push(format!("added mood \"{trimmed}\""));
+        }
+    }
+
+    // Remove mood tags
+    for mood in remove_moods {
+        let trimmed = mood.trim();
+        if !trimmed.is_empty() {
+            repo.remove_typed_tag_from_book(&book.id, trimmed, TagType::Mood)?;
+            changes.push(format!("removed mood \"{trimmed}\""));
+        }
+    }
+
+    // Set pace
+    if let Some(pace_str) = pace {
+        let pace_rating: PaceRating = pace_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid pace: {pace_str} (use fast, medium, or slow)"))?;
+        repo.set_book_pace(&book.id, pace_rating)?;
+        changes.push(format!("set pace to {pace_str}"));
+    }
+
+    // Add content warnings
+    for cw in content_warnings {
+        let trimmed = cw.trim();
+        if !trimmed.is_empty() {
+            repo.add_typed_tag_to_book(&book.id, trimmed, TagType::ContentWarning)?;
+            changes.push(format!("added content warning \"{trimmed}\""));
+        }
+    }
+
+    // Remove content warnings
+    for cw in remove_content_warnings {
+        let trimmed = cw.trim();
+        if !trimmed.is_empty() {
+            repo.remove_typed_tag_from_book(&book.id, trimmed, TagType::ContentWarning)?;
+            changes.push(format!("removed content warning \"{trimmed}\""));
+        }
+    }
+
+    // Set rating
+    if let Some(r) = rating {
+        if !(0..=10).contains(&r) {
+            anyhow::bail!("rating must be between 0 and 10, got {r}");
+        }
+        repo.update_book_rating(&book.id, r)?;
+        changes.push(format!("set rating to {:.1}★", r as f32 / 2.0));
+    }
+
+    if changes.is_empty() {
+        eprintln!("No changes specified for \"{}\"", book.title);
+        eprintln!(
+            "Use --mood, --pace, --content-warning, --remove-mood, --remove-content-warning, or --rating"
+        );
+    } else {
+        // Re-fetch to show updated rating, then display
+        let updated = repo.get_book(&book.id).unwrap_or(book.clone());
+        print_book_detail(&updated, repo, output_format)?;
+        for change in &changes {
+            eprintln!("  ✓ {change}");
+        }
+        eprintln!("✓ Updated \"{}\" ({} change(s))", book.title, changes.len());
+    }
+
     Ok(())
 }
 
@@ -751,6 +992,8 @@ fn cmd_list(
     repo: &BookRepository,
     status: Option<&str>,
     tag: Option<&str>,
+    moods: &[String],
+    pace: Option<&str>,
     output_format: &OutputFormat,
 ) -> Result<()> {
     let books = if let Some(tag_name) = tag {
@@ -764,6 +1007,36 @@ fn cmd_list(
         books.into_iter().filter(|b| b.status == target).collect()
     } else {
         books
+    };
+
+    // Apply mood filter (same-type OR): keep books that have ANY of the specified moods
+    let filtered = if moods.is_empty() {
+        filtered
+    } else {
+        let mut mood_matched: Vec<Book> = Vec::new();
+        for book in filtered {
+            let book_moods = repo.get_book_tags_by_type(&book.id, TagType::Mood)?;
+            let mood_names: Vec<String> = book_moods.iter().map(|t| t.name.clone()).collect();
+            if moods.iter().any(|m| mood_names.contains(m)) {
+                mood_matched.push(book);
+            }
+        }
+        mood_matched
+    };
+
+    // Apply pace filter (AND with mood)
+    let filtered = if let Some(pace_str) = pace {
+        let mut pace_matched: Vec<Book> = Vec::new();
+        for book in filtered {
+            let book_pace = repo.get_book_tags_by_type(&book.id, TagType::Pace)?;
+            let pace_names: Vec<String> = book_pace.iter().map(|t| t.name.clone()).collect();
+            if pace_names.contains(&pace_str.to_string()) {
+                pace_matched.push(book);
+            }
+        }
+        pace_matched
+    } else {
+        filtered
     };
 
     if filtered.is_empty() {
@@ -933,9 +1206,42 @@ fn print_book_detail(
     repo: &BookRepository,
     output_format: &OutputFormat,
 ) -> Result<()> {
+    // Gather typed tags for all output formats
+    let mood_tags = repo
+        .get_book_tags_by_type(&book.id, TagType::Mood)
+        .unwrap_or_default();
+    let pace_tags = repo
+        .get_book_tags_by_type(&book.id, TagType::Pace)
+        .unwrap_or_default();
+    let cw_tags = repo
+        .get_book_tags_by_type(&book.id, TagType::ContentWarning)
+        .unwrap_or_default();
+
     match output_format {
         OutputFormat::Json => {
-            print_books(std::slice::from_ref(book), repo, output_format)?;
+            let authors: Vec<String> = repo
+                .get_book_authors(&book.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(a, _)| a.name)
+                .collect();
+            let general_tags = repo
+                .get_book_tags_by_type(&book.id, TagType::General)
+                .unwrap_or_default();
+            let json = serde_json::json!({
+                "id": book.id.to_string(),
+                "title": book.title,
+                "authors": authors,
+                "status": book.status.as_str(),
+                "format": book.format.as_str(),
+                "rating": book.rating,
+                "pages": book.page_count,
+                "tags": general_tags.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                "moods": mood_tags.iter().map(|t| &t.name).collect::<Vec<_>>(),
+                "pace": pace_tags.first().map(|t| &t.name),
+                "content_warnings": cw_tags.iter().map(|t| &t.name).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json)?);
         }
         OutputFormat::Csv => {
             print_books(std::slice::from_ref(book), repo, output_format)?;
@@ -976,6 +1282,17 @@ fn print_book_detail(
             }
             if let Some(rating) = book.rating {
                 println!("  Rating:  {:.1}★", rating as f32 / 2.0);
+            }
+            if !mood_tags.is_empty() {
+                let names: Vec<&str> = mood_tags.iter().map(|t| t.name.as_str()).collect();
+                println!("  Moods:   {}", names.join(", "));
+            }
+            if let Some(pace) = pace_tags.first() {
+                println!("  Pace:    {}", pace.name);
+            }
+            if !cw_tags.is_empty() {
+                let names: Vec<&str> = cw_tags.iter().map(|t| t.name.as_str()).collect();
+                println!("  ⚠ CW:    {}", names.join(", "));
             }
             if let Some(date) = &book.pub_date {
                 println!("  Pub:     {date}");
@@ -1430,21 +1747,28 @@ fn cmd_tag(repo: &BookRepository, action: TagAction, output_format: &OutputForma
                     #[derive(serde::Serialize)]
                     struct TagOut {
                         name: String,
+                        tag_type: String,
                         books: i64,
                     }
                     let out: Vec<TagOut> = tags
                         .iter()
                         .map(|(t, count)| TagOut {
                             name: t.name.clone(),
+                            tag_type: t.tag_type.to_string(),
                             books: *count,
                         })
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&out)?);
                 }
                 OutputFormat::Csv => {
-                    println!("tag,books");
+                    println!("tag,type,books");
                     for (t, count) in &tags {
-                        println!("\"{}\",{}", t.name.replace('"', "\"\""), count);
+                        println!(
+                            "\"{}\",{},{}",
+                            t.name.replace('"', "\"\""),
+                            t.tag_type,
+                            count
+                        );
                     }
                 }
                 OutputFormat::Table => {
@@ -1454,6 +1778,8 @@ fn cmd_tag(repo: &BookRepository, action: TagAction, output_format: &OutputForma
                     struct Row {
                         #[tabled(rename = "Tag")]
                         name: String,
+                        #[tabled(rename = "Type")]
+                        tag_type: String,
                         #[tabled(rename = "Books")]
                         books: i64,
                     }
@@ -1462,6 +1788,7 @@ fn cmd_tag(repo: &BookRepository, action: TagAction, output_format: &OutputForma
                         .iter()
                         .map(|(t, count)| Row {
                             name: t.name.clone(),
+                            tag_type: t.tag_type.to_string(),
                             books: *count,
                         })
                         .collect();
@@ -1630,34 +1957,102 @@ fn cmd_bulk(repo: &BookRepository, action: BulkAction) -> Result<()> {
     }
 }
 
-fn cmd_stats(repo: &BookRepository, year: Option<i32>, output_format: &OutputFormat) -> Result<()> {
-    let books = repo.list_books()?;
-
-    let sessions = match year {
-        Some(y) => repo.list_reading_sessions_in_year(y)?,
-        None => repo.list_reading_sessions()?,
+fn cmd_stats(
+    repo: &BookRepository,
+    year: Option<i32>,
+    author: Option<&str>,
+    show_mood_trends: bool,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    // Gather books — optionally filtered by author
+    let books = match author {
+        Some(name) => repo.list_books_by_author_name(name)?,
+        None => repo.list_books()?,
     };
 
+    let book_ids: Vec<String> = books.iter().map(|b| b.id.to_string()).collect();
+
+    // Gather sessions — scoped by author's books if filtered, then by year
+    let sessions = if author.is_some() {
+        match year {
+            Some(y) => repo.list_sessions_for_books_in_year(&book_ids, y)?,
+            None => repo.list_sessions_for_books(&book_ids)?,
+        }
+    } else {
+        match year {
+            Some(y) => repo.list_reading_sessions_in_year(y)?,
+            None => repo.list_reading_sessions()?,
+        }
+    };
+
+    // Currently reading details (only relevant when not author-filtered)
     let currently_reading_details = repo.get_currently_reading_details()?;
     let currently_reading_input: Vec<CurrentlyReadingInput> = currently_reading_details
         .into_iter()
+        .filter(|(book, _, _)| {
+            // When author-filtered, only include that author's books
+            author.is_none() || book_ids.contains(&book.id.to_string())
+        })
         .map(|(book, progress, authors)| {
-            let author = authors
+            let author_name = authors
                 .into_iter()
                 .map(|(a, _)| a.name)
                 .collect::<Vec<_>>()
                 .join(", ");
             CurrentlyReadingInput {
                 title: book.title,
-                author,
+                author: author_name,
                 page_count: book.page_count,
                 latest_progress: progress,
             }
         })
         .collect();
 
+    // Tag counts — scoped by author's books if filtered
+    let tag_counts = if author.is_some() {
+        repo.list_tag_counts_for_books(&book_ids)?
+    } else {
+        repo.list_tag_counts()?
+    };
+
+    // Author counts — scoped by author's books if filtered
+    let author_counts = if author.is_some() {
+        repo.list_author_book_counts_for_books(&book_ids)?
+    } else {
+        repo.list_author_book_counts()?
+    };
+
+    // Activity dates — scoped by year and/or author
+    let activity_dates = if author.is_some() {
+        repo.list_activity_dates_for_books(&book_ids)?
+    } else {
+        match year {
+            Some(y) => repo.list_activity_dates_in_year(y)?,
+            None => repo.list_activity_dates()?,
+        }
+    };
+
     let now = chrono::Utc::now();
-    let stats = compute_stats(&books, &sessions, &currently_reading_input, now);
+    let today = chrono::Local::now().date_naive();
+
+    // Mood tag data — only gathered when --mood-trends is requested
+    let mood_tag_data = if show_mood_trends {
+        repo.get_mood_tags_for_books(&book_ids)?
+    } else {
+        HashMap::new()
+    };
+
+    let stats = compute_stats(StatsInput {
+        books: &books,
+        sessions: &sessions,
+        currently_reading: &currently_reading_input,
+        tag_counts: &tag_counts,
+        author_counts: &author_counts,
+        activity_dates: &activity_dates,
+        now,
+        today,
+        mood_tag_data: &mood_tag_data,
+    });
 
     match output_format {
         OutputFormat::Json => {
@@ -1688,20 +2083,62 @@ fn cmd_stats(repo: &BookRepository, year: Option<i32>, output_format: &OutputFor
             println!("format_physical,{}", stats.format_breakdown.physical);
             println!("format_ebook,{}", stats.format_breakdown.ebook);
             println!("format_audiobook,{}", stats.format_breakdown.audiobook);
+            println!(
+                "rating_total_rated,{}",
+                stats.rating_distribution.total_rated
+            );
+            for (i, &count) in stats.rating_distribution.counts.iter().enumerate() {
+                println!("rating_{i},{count}");
+            }
+            println!("unique_authors,{}", stats.author_stats.unique_count);
+            println!(
+                "current_streak_days,{}",
+                stats.reading_streaks.current_streak_days
+            );
+            println!(
+                "longest_streak_days,{}",
+                stats.reading_streaks.longest_streak_days
+            );
+            println!(
+                "total_active_days,{}",
+                stats.reading_streaks.total_active_days
+            );
+            println!(
+                "avg_days_to_finish,{}",
+                stats
+                    .avg_days_to_finish
+                    .map_or("-".to_string(), |d| format!("{d:.1}"))
+            );
+            println!(
+                "reading_speed_pages_per_hour,{}",
+                stats
+                    .reading_speed_pages_per_hour
+                    .map_or("-".to_string(), |s| format!("{s:.1}"))
+            );
+            if let Some(ref b) = stats.shortest_book {
+                println!("shortest_book_pages,{}", b.page_count);
+            }
+            if let Some(ref b) = stats.longest_book {
+                println!("longest_book_pages,{}", b.page_count);
+            }
         }
         OutputFormat::Table => {
-            let header = match year {
-                Some(y) => format!("📊 Reading Statistics ({y})"),
-                None => "📊 Reading Statistics (All Time)".to_string(),
+            let header = match (year, author) {
+                (Some(y), Some(a)) => format!("📊 Reading Statistics ({y}) — {a}"),
+                (Some(y), None) => format!("📊 Reading Statistics ({y})"),
+                (None, Some(a)) => format!("📊 Reading Statistics (All Time) — {a}"),
+                (None, None) => "📊 Reading Statistics (All Time)".to_string(),
             };
             println!("\n{header}\n");
 
+            // --- Library overview ---
             println!("  Books read:        {:>5}", stats.books_read);
             println!("  Currently reading: {:>5}", stats.books_reading);
             println!("  Want to read:      {:>5}", stats.books_want_to_read);
             println!("  Abandoned:         {:>5}", stats.books_abandoned);
             println!();
 
+            // --- Reading metrics ---
             println!(
                 "  Pages read:        {:>5}",
                 format_number(stats.total_pages_read)
@@ -1721,6 +2158,28 @@ fn cmd_stats(repo: &BookRepository, year: Option<i32>, output_format: &OutputFor
                 format!("{:.1}", stats.pages_per_day)
             );
 
+            // --- Reading speed ---
+            if let Some(speed) = stats.reading_speed_pages_per_hour {
+                println!(
+                    "  Reading speed:     {:>5} pages/hour",
+                    format!("{speed:.1}")
+                );
+            }
+
+            // --- Time to finish ---
+            if let Some(avg) = stats.avg_days_to_finish {
+                println!("  Avg. time to finish: {avg:.1} days");
+            }
+
+            // --- Shortest / longest ---
+            if let Some(ref b) = stats.shortest_book {
+                println!("  Shortest book:     {} ({} pages)", b.title, b.page_count);
+            }
+            if let Some(ref b) = stats.longest_book {
+                println!("  Longest book:      {} ({} pages)", b.title, b.page_count);
+            }
+
+            // --- Format breakdown ---
             let total_formats = stats.format_breakdown.physical
                 + stats.format_breakdown.ebook
                 + stats.format_breakdown.audiobook;
@@ -1752,6 +2211,77 @@ fn cmd_stats(repo: &BookRepository, year: Option<i32>, output_format: &OutputFor
                 );
             }
 
+            // --- Rating distribution ---
+            if stats.rating_distribution.total_rated > 0 {
+                println!();
+                println!("  Rating distribution:");
+                for i in (0..=10).rev() {
+                    let count = stats.rating_distribution.counts[i];
+                    if count > 0 {
+                        let stars = i as f64 / 2.0;
+                        let bar = "█".repeat(count.min(40));
+                        println!("    {stars:>4.1}★ {bar} {count}");
+                    }
+                }
+            }
+
+            // --- Tag distribution ---
+            if !stats.tag_distribution.is_empty() {
+                println!();
+                println!("  Top tags:");
+                for tc in stats.tag_distribution.iter().take(10) {
+                    println!("    {:<20} {:>3}", tc.name, tc.count);
+                }
+            }
+
+            // --- Author stats ---
+            if stats.author_stats.unique_count > 0 {
+                println!();
+                println!("  Authors: {} unique", stats.author_stats.unique_count);
+                if !stats.author_stats.top_authors.is_empty() {
+                    println!("  Top authors:");
+                    for ac in &stats.author_stats.top_authors {
+                        println!("    {:<20} {:>3} books", ac.name, ac.count);
+                    }
+                }
+            }
+
+            // --- Reading streaks ---
+            let streaks = &stats.reading_streaks;
+            if streaks.total_active_days > 0 {
+                println!();
+                println!("  Reading streaks:");
+                println!("    Current:  {:>3} days", streaks.current_streak_days);
+                println!("    Longest:  {:>3} days", streaks.longest_streak_days);
+                println!("    Active days: {}", streaks.total_active_days);
+            }
+
+            // --- Monthly breakdown ---
+            if !stats.monthly_finished.is_empty() {
+                println!();
+                println!("  Books finished per month:");
+                for mf in &stats.monthly_finished {
+                    let month_name = match mf.month {
+                        1 => "Jan",
+                        2 => "Feb",
+                        3 => "Mar",
+                        4 => "Apr",
+                        5 => "May",
+                        6 => "Jun",
+                        7 => "Jul",
+                        8 => "Aug",
+                        9 => "Sep",
+                        10 => "Oct",
+                        11 => "Nov",
+                        12 => "Dec",
+                        _ => "???",
+                    };
+                    let bar = "█".repeat(mf.count.min(40));
+                    println!("    {} {:>4} {bar} {}", month_name, mf.year, mf.count);
+                }
+            }
+
+            // --- Currently reading ---
             if !stats.currently_reading.is_empty() {
                 println!();
                 println!("  Currently reading:");
@@ -1763,12 +2293,41 @@ fn cmd_stats(repo: &BookRepository, year: Option<i32>, output_format: &OutputFor
                         (Some(page), None, _) => format!(" (page {page})"),
                         _ => String::new(),
                     };
-                    let author = if cr.author.is_empty() {
+                    let author_str = if cr.author.is_empty() {
                         String::new()
                     } else {
                         format!(" — {}", cr.author)
                     };
-                    println!("    {}{author}{progress}", cr.title);
+                    println!("    {}{author_str}{progress}", cr.title);
+                }
+            }
+
+            // --- Mood trends ---
+            if !stats.mood_trends.is_empty() {
+                println!();
+                println!("  Mood trends:");
+                for trend in &stats.mood_trends {
+                    let month_name = match trend.month {
+                        1 => "Jan",
+                        2 => "Feb",
+                        3 => "Mar",
+                        4 => "Apr",
+                        5 => "May",
+                        6 => "Jun",
+                        7 => "Jul",
+                        8 => "Aug",
+                        9 => "Sep",
+                        10 => "Oct",
+                        11 => "Nov",
+                        12 => "Dec",
+                        _ => "???",
+                    };
+                    let moods: Vec<String> = trend
+                        .moods
+                        .iter()
+                        .map(|m| format!("{} ({})", m.name, m.count))
+                        .collect();
+                    println!("    {} {:>4}: {}", month_name, trend.year, moods.join(", "));
                 }
             }
 

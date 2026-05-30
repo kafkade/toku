@@ -132,6 +132,14 @@ pub async fn fetch_by_isbn(isbn: &str) -> Result<OpenLibraryBook, MetaError> {
 
 /// Download a cover image and save it content-addressed by SHA-256.
 /// Returns the hash filename (e.g., "a1b2c3d4e5f6.jpg").
+///
+/// This function is intended for user-initiated single-book enrichment only
+/// (e.g., `toku add --isbn`). Callers must NOT use this for bulk pre-fetching
+/// or crawling — Open Library's Covers API prohibits that usage and rate-limits
+/// to 100 requests per 5 minutes for ISBN-based lookups.
+///
+/// Cover images from Open Library: on-demand local caching is permitted per OL's
+/// API guidelines. See `docs/validations/cover-image-licensing.md`.
 pub async fn fetch_cover(isbn: &str, covers_dir: &Path) -> Result<Option<String>, MetaError> {
     let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
 

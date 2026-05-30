@@ -80,6 +80,11 @@ their ever-growing libraries.
 
 [MIT](LICENSE)
 
+## Acknowledgments
+
+- Book metadata and cover images from [Open Library](https://openlibrary.org) by the
+  [Internet Archive](https://archive.org).
+
 ---
 
 _Built by [kafkade](https://github.com/kafkade)._

@@ -402,7 +402,7 @@ Each op:
 |--------|--------|----------|-----------|-------|------------|
 | **Goodreads** | CSV export | Title, author, ISBN, rating (1–5), date read, shelves, review, page count, Goodreads ID | 🟢 | **MVP** | `[Validation Required]` — verify current CSV column names |
 | **Calibre** | SQLite `metadata.db` + OPF | Full metadata, tags, custom columns, series, publisher, covers, file paths | 🟡 | Phase 2 | `[Validated]` — well-documented, stable schema |
-| **StoryGraph** | CSV export | Title, author, rating, moods, pace, dates, content warnings | 🟡 | Phase 3 | `[Validation Required]` — verify export availability and format |
+| **StoryGraph** | CSV export | Title, author, rating, moods, pace, dates, content warnings | 🟡 | Phase 3 | `[Validated]` — 23-column CSV, see `docs/validations/storygraph-export.md` |
 | **Manual entry** | CLI flags | User-supplied fields | 🟢 | **MVP** | N/A |
 | **ISBN list** | Plain text | ISBNs only → metadata fetch | 🟢 | **MVP** | N/A |
 | **Generic CSV** | User-mapped CSV | Flexible column mapping | 🟡 | Phase 2 | N/A |
@@ -485,12 +485,12 @@ Rejected alternatives:
 - Cover API: `https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg`
 - Rate limits: generous (100 req/min stated, practically higher) `[Validation Required]`
 
-**Fallback: Google Books API** `[Validation Required]`
+**Fallback: Google Books API** `[Validated — significant restrictions]`
 
 - 1,000 requests/day free tier (no key), higher with API key.
 - Broader coverage than Open Library, especially for recent releases.
-- Terms of service: allows caching for offline use `[Validation Required]`
-- Better cover image quality in many cases.
+- Terms of service: **thumbnails cannot be cached locally** (ToS Section 5e.1 prohibits permanent copies). Metadata caching is restricted to HTTP cache header TTL. API keys cannot be embedded in open-source projects (Section 4b.1). See `docs/validations/cover-image-licensing.md`.
+- Google Books is viable only for transient text metadata enrichment (title, author, pages), not cover images.
 
 **Merge strategy**: Query Open Library first. If no result or missing fields, query Google Books. User edits always take precedence. Empty fields filled from the highest-quality available source.
 
@@ -502,11 +502,12 @@ Rejected alternatives:
 
 ### 3.4 — Cover Image Strategy
 
-- **Sources**: Open Library Covers API (primary), Google Books thumbnail (fallback), user upload via `toku cover set <book> <path>`.
+- **Sources**: Open Library Covers API (primary), user upload via `toku cover set <book> <path>`. Google Books thumbnails **cannot** be cached locally per Google's ToS — see `docs/validations/cover-image-licensing.md`.
 - **Storage**: Filesystem, content-addressed. `covers/{sha256_first_16_chars}.jpg`. Thumbnails generated on first display (200px width) and cached as `covers/thumb/{hash}.jpg`.
-- **Offline**: Covers fetched once, stored locally forever. App works without covers (text-only display in CLI).
+- **Offline**: Covers fetched once from Open Library, stored locally. App works without covers (text-only display in CLI).
 - **No cover placeholder**: Color-coded rectangle derived from genre/title hash. Visually distinct per book.
 - **Resolution**: Store original as fetched (typically 300–600px). Generate thumbnails on demand.
+- **Licensing**: Open Library on-demand caching is permitted per their API guidelines. Bulk crawling is prohibited. Courtesy attribution appreciated.
 
 ### 3.5 — Non-Goals & Red Lines
 
@@ -1333,7 +1334,7 @@ Before committing to the architecture, validate:
 2. **Mood tags, pace ratings, content warnings**
 3. **Work grouping** (link editions of the same book) + merge duplicates
 4. **Smart shelves** (saved filter rules that auto-populate)
-5. **StoryGraph import** `[Validation Required]`
+5. **StoryGraph import** `[Validated]` — see `docs/validations/storygraph-export.md`
 
 **Acceptance criteria**:
 
@@ -1430,11 +1431,11 @@ Before committing to the architecture, validate:
 |------|----------|--------|
 | Download real Goodreads CSV export, document all columns | P0 | `[Validation Required]` |
 | Test Open Library API: rate limits, non-English books, old editions | P0 | `[Validation Required]` |
-| Google Books API: ToS for open-source, quota limits | P1 | `[Validation Required]` |
-| StoryGraph: verify export availability and format | P1 | `[Validation Required]` |
+| Google Books API: ToS for open-source, quota limits | P1 | `[Validated]` — significant ToS restrictions. See `docs/validations/cover-image-licensing.md` |
+| StoryGraph: verify export availability and format | P1 | `[Validated]` — 23-column CSV export available. See `docs/validations/storygraph-export.md` |
 | Calibre `metadata.db` schema: document all useful tables | P1 | `[Validated]` — schema is stable |
 | ISBN-10 ↔ ISBN-13 conversion: verify algorithm, edge cases | P0 | `[Validated]` — well-documented standard |
-| Cover image licensing: caching Open Library covers locally | P1 | `[Validation Required]` |
+| Cover image licensing: caching Open Library covers locally | P1 | `[Validated]` — on-demand caching permitted. See `docs/validations/cover-image-licensing.md` |
 | `crates.io` name availability: "toku" | P0 | `[Validation Required]` |
 
 ### 14.4 — Architecture Decision Records

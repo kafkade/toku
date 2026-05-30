@@ -12,11 +12,11 @@ name = "toku"
 path = "src/main.rs"
 
 [dependencies]
-toku-core = { path = "../toku-core", version = "0.1.0" }
-toku-db = { path = "../toku-db", version = "0.1.0" }
-toku-meta = { path = "../toku-meta", version = "0.1.0" }
-toku-import = { path = "../toku-import", version = "0.1.0" }
-toku-export = { path = "../toku-export", version = "0.1.0" }
+toku-core.workspace = true
+toku-db.workspace = true
+toku-meta.workspace = true
+toku-import.workspace = true
+toku-export.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 anyhow = "1"

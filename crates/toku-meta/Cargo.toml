@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-toku-core = { path = "../toku-core", version = "0.1.0" }
+toku-core.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

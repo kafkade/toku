@@ -10,18 +10,18 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["kafkade"]
 license = "MIT"
 repository = "https://github.com/kafkade/toku"
 
 [workspace.dependencies]
-toku-core = { path = "crates/toku-core", version = "0.2.0" }
-toku-db = { path = "crates/toku-db", version = "0.2.0" }
-toku-meta = { path = "crates/toku-meta", version = "0.2.0" }
-toku-import = { path = "crates/toku-import", version = "0.2.0" }
-toku-export = { path = "crates/toku-export", version = "0.2.0" }
+toku-core = { path = "crates/toku-core", version = "0.2.1" }
+toku-db = { path = "crates/toku-db", version = "0.2.1" }
+toku-meta = { path = "crates/toku-meta", version = "0.2.1" }
+toku-import = { path = "crates/toku-import", version = "0.2.1" }
+toku-export = { path = "crates/toku-export", version = "0.2.1" }
 thiserror = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }

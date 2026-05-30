@@ -138,7 +138,7 @@ fn generate_title(i: usize) -> String {
     let w1 = TITLE_WORDS[i % TITLE_WORDS.len()];
     let w2 = TITLE_WORDS[(i * 7 + 13) % TITLE_WORDS.len()];
     let w3 = TITLE_WORDS[(i * 3 + 29) % TITLE_WORDS.len()];
-    if i % 3 == 0 {
+    if i.is_multiple_of(3) {
         format!("{w1} {w2}")
     } else if i % 3 == 1 {
         format!("The {w1} of {w2}")

@@ -1,0 +1,24 @@
+{
+  "productName": "Toku",
+  "version": "0.2.1",
+  "identifier": "com.kafkade.toku",
+  "build": {},
+  "app": {
+    "security": {
+      "csp": null
+    },
+    "windows": []
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi"],
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    }
+  },
+  "plugins": {}
+}

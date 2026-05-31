@@ -1,0 +1,25 @@
+[package]
+name = "toku-desktop"
+description = "Desktop application for Toku personal book manager (Windows)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "toku-desktop"
+path = "src/main.rs"
+
+# All desktop dependencies are Windows-only. On other platforms the crate
+# compiles as a stub binary that prints an unsupported-platform message.
+
+[target.'cfg(windows)'.dependencies]
+toku-web.workspace = true
+toku-db.workspace = true
+tauri = { version = "2", features = ["tray-icon"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-build = "2"

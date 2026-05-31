@@ -9,6 +9,7 @@ members = [
     "crates/toku-cli",
     "crates/toku-ffi",
     "crates/toku-web",
+    "crates/toku-desktop",
 ]
 
 [workspace.package]

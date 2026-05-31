@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pagination for large libraries (60 books per page)
 - Filter bar with status, tag, sort controls, and grid/list view toggle
 - ADR-007: Web framework decision documenting the choice of Axum + maud over HTMX and Leptos
+- Windows desktop application (`toku-desktop`) wrapping the web UI in a native Tauri v2 window with system tray and minimize-to-tray support
 
 ## [0.2.1] - 2026-05-30
 

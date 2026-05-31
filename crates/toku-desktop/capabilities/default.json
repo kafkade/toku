@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Default capability for the Toku desktop app",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -6,7 +6,7 @@
 **Repository**: `kafkade/toku`
 **Core Language**: Rust
 **Primary Interface**: CLI
-**Date**: July 2025
+**Date**: May 2026
 **Author**: kafkade
 
 ---
@@ -158,7 +158,7 @@
 
 **Recommendation**: Monorepo with Cargo workspace from day one.
 
-The crate count is small enough (4–6 crates) that the overhead is minimal, and the boundaries enforce the layered architecture. A monolith-first approach risks coupling the CLI to the core in ways that are painful to untangle when the web UI arrives.
+The crate count is small enough (9 crates) that the overhead is minimal, and the boundaries enforce the layered architecture. A monolith-first approach risks coupling the CLI to the core in ways that are painful to untangle when the web UI arrives.
 
 ```sh
 kafkade/toku/
@@ -169,7 +169,12 @@ kafkade/toku/
 │   ├── toku-import/        # Goodreads CSV, Calibre, StoryGraph parsers
 │   ├── toku-meta/          # Open Library, Google Books API clients
 │   ├── toku-cli/           # CLI binary (clap-based)
-│   └── toku-export/        # CSV, JSON, Markdown, BibTeX exporters
+│   ├── toku-export/        # CSV, JSON, Markdown, BibTeX exporters
+│   ├── toku-ffi/           # C FFI bindings for Swift/Kotlin (cbindgen)
+│   ├── toku-web/           # Axum + maud web server (library crate)
+│   └── toku-desktop/       # Tauri v2 Windows desktop app
+├── toku-apple/             # macOS + iOS SwiftUI apps (Xcode project)
+│   └── TokuKit/            # Swift FFI wrapper + shared UI components
 ├── docs/                   # User and developer documentation
 ├── tests/                  # Integration tests, test fixtures
 │   └── fixtures/           # Sample Goodreads CSVs, Calibre DBs
@@ -784,9 +789,10 @@ File management lives in a new `toku-files` crate that depends on `toku-core` an
 
 ### 7.5 — Self-Hosted Sync Server 🔴
 
-- Deferred to Phase 7. cr-sqlite is the preferred approach (see Section 2.5).
-- Alternative: lightweight Axum server with REST API + Docker deployment.
-- All data encrypted at rest on server.
+- Deferred to Phase 7. Changeset-based REST sync is the chosen approach (see ADR-006).
+- Axum server with REST API + Docker deployment.
+- All data optionally encrypted at rest on server (client-side encryption).
+- cr-sqlite kept as a research alternative if it matures for iOS/WASM.
 
 ---
 
@@ -1092,13 +1098,17 @@ fallback_source = "google_books"
 default_status = "want_to_read"
 ```
 
-### 9.3 — Web UI Design (Phase 4)
+### 9.3 — Web UI Design (Phase 4) ✅
 
-- **Technology**: Axum backend serving HTMX + minimal JS, or Leptos for full Rust stack.
-- **Key screens**: Library grid/list, book detail, progress dashboard, statistics, import wizard, search.
-- **Dark mode**: System-preference detection + toggle.
-- **PWA**: Service worker for offline browsing of cached library data.
-- **Responsive**: Mobile-friendly layouts.
+- **Technology**: Axum backend with maud for server-side HTML rendering (see ADR-007).
+  Inline SVG charts, CSS custom properties with `prefers-color-scheme` dark mode.
+  Minimal inline JavaScript (~15 lines for SSE import progress only).
+- **Key screens**: Library grid/list with cover images, book detail with reading timeline,
+  statistics dashboard with rating histogram / monthly pace / format breakdown / top authors,
+  import wizard with dry-run preview and live SSE progress, FTS5-powered search.
+- **Dark mode**: Automatic via `prefers-color-scheme` CSS media query.
+- **Fully offline**: No CDN, no npm, no external assets. Works on `localhost` with no internet.
+- **Responsive**: Pagination (60 books/page), grid/list toggle, sort controls.
 
 ### 9.4 — Key Screens Per Platform
 
@@ -1220,7 +1230,7 @@ Rejected alternatives:
 | **Documentation** | **mdBook** (user docs) + **rustdoc** (API docs) | mdBook for the user guide. Rustdoc for crate documentation. |
 | **Distribution** | **cargo install** + **GitHub Releases** (pre-built binaries) | `cargo-dist` automates cross-compilation and release. Homebrew tap in Phase 2. |
 
-**Web stack (Phase 4)**: **Axum** (backend) + **HTMX** (frontend) or **Leptos** (full Rust). Decision deferred — both are viable. HTMX is simpler; Leptos keeps the entire stack in Rust.
+**Web stack (Phase 4)**: **Axum** (backend) + **maud** (server-side rendering). See ADR-007 for the decision against HTMX and Leptos. Inline SVG charts, no external JavaScript dependencies.
 
 **iOS/macOS (Phase 5)**: **SwiftUI** consuming Rust core via C FFI (`toku-ffi` crate using `cbindgen`). Rejected React Native / Tauri for iOS due to UX quality concerns.
 
@@ -1243,7 +1253,7 @@ Before committing to the architecture, validate:
 
 ## Section 13: Phased Roadmap with Milestones
 
-### Phase 0: First Book 🟢
+### Phase 0: First Book ✅
 
 **Theme**: "One book, stored and retrieved."
 **Goal**: Add one book from the CLI, store it in SQLite, retrieve it. Validate the entire stack.
@@ -1267,7 +1277,7 @@ Before committing to the architecture, validate:
 
 ---
 
-### Phase 1: Minimum Usable Library (MVP) 🟡
+### Phase 1: Minimum Usable Library (MVP) ✅
 
 **Theme**: "My Goodreads library is here. I use this daily."
 **Goal**: Import a full Goodreads library, track reading status, search and organize.
@@ -1297,7 +1307,7 @@ Before committing to the architecture, validate:
 
 ---
 
-### Phase 2: Reading Tracker 🟡
+### Phase 2: Reading Tracker ✅
 
 **Theme**: "I track my reading progress and can see my history."
 **Goal**: Page-by-page progress tracking, reading sessions (including re-reads), basic statistics, Calibre import, export.
@@ -1323,7 +1333,7 @@ Before committing to the architecture, validate:
 
 ---
 
-### Phase 3: Analytics & Polish (1.0 Release) 🟡
+### Phase 3: Analytics & Polish (1.0 Release) ✅
 
 **Theme**: "This is genuinely better than Goodreads for personal use."
 **Goal**: Full statistics, mood/pace tags, goals, work grouping, smart shelves, StoryGraph import.
@@ -1346,7 +1356,7 @@ Before committing to the architecture, validate:
 
 ---
 
-### Phase 4: Web Interface 🟡
+### Phase 4: Web Interface ✅
 
 **Theme**: "Non-CLI users can use Toku."
 **Goal**: Web UI for library browsing, book management, statistics, and import.
@@ -1362,7 +1372,7 @@ Before committing to the architecture, validate:
 
 ---
 
-### Phase 5: Native Apps 🔴
+### Phase 5: Native Apps ✅
 
 **Theme**: "Toku on every device."
 
@@ -1383,10 +1393,40 @@ Before committing to the architecture, validate:
 
 ---
 
-### Phase 7: Sync & Multi-Device 🔴
+### Phase 7: Sync & Multi-Device 🟡
 
 **Theme**: "My library everywhere."
-**Deliverables**: cr-sqlite integration, multi-device sync, conflict resolution UI.
+**Goal**: Opt-in multi-device sync via a lightweight changeset-based REST API. Users can sync between CLI, iOS, macOS, web, and Windows — without sacrificing the local-first guarantee. Sync is additive: a user who never enables sync loses nothing.
+
+**Architecture**: See Section 2.5 (Sync Strategy) and ADR-006 for the full design. Summary: append-only op-log synced over REST with optional client-side symmetric encryption (Argon2id + AES-256-GCM).
+
+**Deliverables** (5):
+
+1. **Sync data model + op-log**: Local `sync_ops` table with Hybrid Logical Clock (HLC) timestamps, op IDs (UUID v7), entity type/ID, and encrypted-or-plaintext payload. Every mutation writes to both the domain table and the op-log in a single transaction.
+2. **Sync server (`toku-sync` crate)**: Axum REST API for push/pull/snapshot/device management. Thin relay — stores ops and cursors, does not interpret content. Deployable as a Docker image (`kafkade/toku-sync`).
+3. **Push/pull protocol with entity-specific merge rules**: Push sends new ops since last cursor. Pull receives ops and applies entity-specific merge: LWW per field for books, append-only for reading sessions, monotonic for progress, LWW with conflict detection for notes/reviews. Soft deletes with 30-day tombstone retention.
+4. **Optional client-side encryption**: Passphrase → Argon2id → AES-256-GCM. Key stored in OS keychain. Server stores opaque blobs. Passphrase change triggers re-keying (pull, re-encrypt, push snapshot, purge old ops).
+5. **CLI sync commands + device management**: `toku sync init`, `toku sync push`, `toku sync pull`, `toku sync status`, `toku sync devices`. Device registration with UUID + human-readable name.
+
+**Acceptance criteria**:
+
+- Two devices (e.g., CLI on laptop + iOS app) can sync a library through the server with no data loss
+- Offline edits on both devices merge correctly when both push/pull
+- A deleted book on device A does not reappear on device B after sync
+- A new device can bootstrap from a server snapshot + subsequent ops
+- With encryption enabled, the server cannot decrypt any book content (verified by inspecting server storage)
+- Sync resumes correctly after network failure (idempotent push/pull)
+- `toku sync status` shows last sync time, pending ops count, and device list
+
+**Dependencies**: Phase 3 (stable data model). Phase 4/5 (clients exist to sync between).
+
+**Risks**:
+
+- Schema migration during sync — ops from different app versions must coexist. **Mitigation**: version field in op envelope, backward-compatible op format.
+- Conflict resolution UX — what happens when two devices edit the same book's title? **Mitigation**: LWW per field is invisible to the user in most cases; only note/review conflicts surface for manual resolution.
+- Encryption complexity — nonce management, key storage, rotation. **Mitigation**: dedicated security review before merge; use well-audited crates (ring, aes-gcm).
+
+**Cut line**: Managed hosted instance (`sync.toku.dev`) — self-hosted first. Browser-local SQLite for web app (web remains a connected companion). File sync for ebooks (Phase 6 files are not synced in Phase 7).
 
 ---
 
@@ -1486,7 +1526,7 @@ Phase 3: Analytics & Polish (1.0)
         │       └─── Phase 6: File Management (independent of web)
         │
         └─── Phase 7: Sync (depends on stable schema)
-                │
+                │     Changeset REST API, see ADR-006
                 └─── Phase 8: Moonshots
 ```
 
@@ -1650,7 +1690,7 @@ The name must satisfy:
 | 7 | Rating scale | 5-star / 10-point / 5-star with halves | **0–10 integer (displayed as 5★ with halves)** — Goodreads-compatible | Decided |
 | 8 | Sync strategy | File copy / REST server / CRDTs / SQLite replication | **Changeset-based REST sync with optional symmetric encryption** — lighter than Pildora's ZK, privacy-respecting | Deferred (Phase 7) |
 | 9 | License | MIT / Apache 2.0 / GPL / Dual | **MIT** — maximum contributor friendliness | Decided |
-| 10 | Web framework | Axum+HTMX / Leptos / SvelteKit / Next.js | **Axum + HTMX or Leptos** — full Rust stack | Deferred (Phase 4) |
+| 10 | Web framework | Axum+HTMX / Leptos / SvelteKit / Next.js | **Axum + maud** — server-rendered HTML, inline SVG charts, no client-side framework (see ADR-007) | Decided |
 | 11 | Cover storage | Filesystem / Database blobs / Content-addressed | **Filesystem, content-addressed (SHA-256)** — keeps DB small | Decided |
 | 12 | Project name | 15 candidates evaluated | **Toku** — short, non-English, evokes reading, terminal-friendly | Decided `[Validation Required]` crates.io |
 | 13 | File management | MVP / Post-1.0 / Never | **Deferred to Phase 6 (post-1.0)** — MVP is a tracker, not file manager | Decided |

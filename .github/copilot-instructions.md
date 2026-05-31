@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Toku (読く — Japanese for "to read") is a private, offline-first personal book manager. It combines the metadata depth of Calibre, the reading tracking of Goodreads, and the analytics of StoryGraph — without any social features. The project is in early development (Phase 0).
+Toku (読く — Japanese for "to read") is a private, offline-first personal book manager. It combines the metadata depth of Calibre, the reading tracking of Goodreads, and the analytics of StoryGraph — without any social features. Phases 0–5 are complete (CLI, imports, analytics, web dashboard, native apps). Phase 6 (file management) and Phase 7 (sync) are next.
 
 ## Non-Negotiable Constraints
 
@@ -16,7 +16,7 @@ Every code contribution, architecture decision, and feature design must uphold t
 
 ## Architecture
 
-Cargo workspace with 6 crates:
+Cargo workspace with 9 crates:
 
 - `toku-core/` — Domain models, traits, state machine, statistics engine. Pure Rust, no I/O. Compiles to native, WASM, FFI.
 - `toku-db/` — SQLite persistence, schema migrations (refinery), FTS5 full-text search.
@@ -24,6 +24,9 @@ Cargo workspace with 6 crates:
 - `toku-meta/` — Metadata fetching: Open Library API (primary), Google Books (fallback). Cover image downloading.
 - `toku-cli/` — CLI binary (clap v4). The main entry point.
 - `toku-export/` — Export implementations: CSV, JSON, Markdown, BibTeX, canonical backup.
+- `toku-ffi/` — C FFI bindings for Swift/Kotlin via `cbindgen`. Used by macOS and iOS apps.
+- `toku-web/` — Axum + maud web server. Library views, statistics dashboard, import wizard. Started via `toku serve`.
+- `toku-desktop/` — Tauri v2 Windows desktop app wrapping the web UI.
 
 ### Data Boundary Rule
 

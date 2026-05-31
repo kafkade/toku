@@ -80,10 +80,12 @@ pub fn build_router(db_path: PathBuf, temp_dir: PathBuf) -> Router {
         .with_state(state)
 }
 
-/// Start the web dashboard server.
+/// Start serving using a pre-bound listener.
 ///
-/// Runs migrations once, then serves the dashboard on `{host}:{port}`.
-pub async fn serve(db_path: PathBuf, host: &str, port: u16) -> Result<(), WebError> {
+/// Runs migrations once at startup, then serves the dashboard on the
+/// listener's local address. Use this when you need to control the
+/// listener (e.g. binding to a random port for the desktop app).
+pub async fn serve_on(db_path: PathBuf, listener: tokio::net::TcpListener) -> Result<(), WebError> {
     // Run migrations once at startup
     toku_db::Database::open(&db_path)
         .map_err(|e| WebError::Internal(format!("failed to open database: {e}")))?;
@@ -95,16 +97,23 @@ pub async fn serve(db_path: PathBuf, host: &str, port: u16) -> Result<(), WebErr
 
     let app = build_router(db_path, temp_dir);
 
-    let addr = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|e| WebError::Internal(format!("failed to bind {addr}: {e}")))?;
-
-    eprintln!("Toku dashboard → http://{addr}/stats");
-
     axum::serve(listener, app)
         .await
         .map_err(|e| WebError::Internal(format!("server error: {e}")))?;
 
     Ok(())
+}
+
+/// Start the web dashboard server.
+///
+/// Runs migrations once, then serves the dashboard on `{host}:{port}`.
+pub async fn serve(db_path: PathBuf, host: &str, port: u16) -> Result<(), WebError> {
+    let addr = format!("{host}:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| WebError::Internal(format!("failed to bind {addr}: {e}")))?;
+
+    eprintln!("Toku dashboard → http://{addr}/library");
+
+    serve_on(db_path, listener).await
 }

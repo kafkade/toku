@@ -38,6 +38,7 @@ SwiftUI Views → Swift ViewModels → TokuFFI wrapper → toku-ffi (C ABI) → 
 - iOS 17.0 or later
 - Xcode 15.4 or later
 - Rust toolchain with iOS targets:
+
   ```bash
   rustup target add aarch64-apple-ios         # Device
   rustup target add aarch64-apple-ios-sim     # Apple Silicon simulator

@@ -15,6 +15,8 @@ mod error;
 mod handlers;
 pub mod import_handlers;
 mod import_views;
+pub mod library_handlers;
+mod library_views;
 mod views;
 
 pub use error::WebError;
@@ -25,19 +27,32 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub import_sessions: import_handlers::ImportSessions,
     pub temp_dir: PathBuf,
+    pub covers_dir: PathBuf,
 }
 
 /// Build the Axum router for the web dashboard.
 pub fn build_router(db_path: PathBuf, temp_dir: PathBuf) -> Router {
+    let covers_dir = db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("covers");
+
     let state = AppState {
         db_path,
         import_sessions: Arc::new(Mutex::new(HashMap::new())),
         temp_dir,
+        covers_dir,
     };
 
     Router::new()
-        // Stats
+        // Root
         .route("/", get(handlers::root))
+        // Library
+        .route("/library", get(library_handlers::library_page))
+        .route("/books/{id}", get(library_handlers::book_detail))
+        .route("/search", get(library_handlers::search_page))
+        .route("/covers/{hash}", get(library_handlers::serve_cover))
+        // Stats
         .route("/stats", get(handlers::stats_dashboard))
         .route("/stats/wrap/{year}", get(handlers::yearly_wrap))
         .route("/api/stats", get(handlers::stats_json))

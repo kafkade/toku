@@ -4,9 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_crates:
+        description: "Publish to crates.io"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
@@ -121,6 +131,10 @@ jobs:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+      || (github.event_name == 'workflow_dispatch' && inputs.publish_crates)
+    environment: crates-io
     steps:
       - uses: actions/checkout@v6
 
@@ -128,19 +142,45 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Verify version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "✅ Tag $TAG_VERSION matches Cargo.toml"
+
       # Publish crates in dependency order:
       # toku-core (no deps) → toku-db → toku-import, toku-meta, toku-export → toku-cli
-      # Each `cargo publish` needs a brief pause for crates.io index to update.
+      # Polls crates.io index between publishes to avoid timing issues.
       - name: Publish workspace crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          EXPECTED_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+          wait_for_index() {
+            local crate=$1
+            echo "⏳ Waiting for crates.io to index $crate $EXPECTED_VERSION..."
+            for i in $(seq 1 30); do
+              if cargo search "$crate" 2>/dev/null | grep -q "\"$EXPECTED_VERSION\""; then
+                echo "✅ $crate $EXPECTED_VERSION is indexed."
+                return 0
+              fi
+              echo "  Attempt $i/30 — not yet indexed, waiting 10s..."
+              sleep 10
+            done
+            echo "⚠️  Timed out waiting for $crate to be indexed. Proceeding anyway."
+          }
+
           publish_crate() {
             local crate=$1
             echo "📦 Publishing $crate..."
             cargo publish -p "$crate" --no-verify
-            echo "⏳ Waiting for crates.io index to update..."
-            sleep 30
+            wait_for_index "$crate"
           }
 
           publish_crate toku-core

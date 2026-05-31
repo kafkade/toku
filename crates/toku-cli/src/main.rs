@@ -216,6 +216,17 @@ enum Commands {
         mood_trends: bool,
     },
 
+    /// Start the web dashboard server
+    Serve {
+        /// Port to listen on
+        #[arg(long, short, default_value = "3000")]
+        port: u16,
+
+        /// Host to bind (use 127.0.0.1 for local-only access)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+
     /// Manage work grouping (link editions of the same creative work)
     Work {
         #[command(subcommand)]
@@ -563,6 +574,18 @@ fn main() -> Result<()> {
             clap_complete::generate(*shell, &mut Cli::command(), "toku", &mut std::io::stdout());
             return Ok(());
         }
+        Commands::Serve { port, host } => {
+            let db_path = data_dir.join("toku.db");
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            return rt.block_on(async {
+                toku_web::serve(db_path, host, *port)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            });
+        }
         _ => {}
     }
 
@@ -652,7 +675,9 @@ fn main() -> Result<()> {
         Commands::Merge { keep, remove } => cmd_merge(&repo, &keep, &remove, &cli.format),
         Commands::Shelf { action } => cmd_shelf(&repo, action, &cli.format),
         // Already handled above
-        Commands::Config { .. } | Commands::Completions { .. } => unreachable!(),
+        Commands::Config { .. } | Commands::Completions { .. } | Commands::Serve { .. } => {
+            unreachable!()
+        }
     }
 }
 

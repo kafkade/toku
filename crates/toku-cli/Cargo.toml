@@ -17,6 +17,7 @@ toku-db.workspace = true
 toku-meta.workspace = true
 toku-import.workspace = true
 toku-export.workspace = true
+toku-web.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 anyhow = "1"

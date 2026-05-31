@@ -28,6 +28,17 @@ impl Database {
         Ok(Self { conn })
     }
 
+    /// Open the database without running migrations.
+    ///
+    /// Use this for request-time reads after migrations have already run
+    /// at startup via [`Database::open`].
+    pub fn open_no_migrate(path: &Path) -> Result<Self, DbError> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self { conn })
+    }
+
     /// Open an in-memory database (for testing).
     pub fn open_in_memory() -> Result<Self, DbError> {
         let mut conn = Connection::open_in_memory()?;

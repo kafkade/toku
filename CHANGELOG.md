@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Web statistics dashboard (`toku serve`): reading stats, rating histogram, monthly pace chart, format breakdown donut, top authors and tags — all rendered as server-side SVG with dark mode support
+- Yearly wrap-up pages at `/stats/wrap/{year}` summarizing a single year's reading
+- JSON statistics API at `/api/stats` for programmatic access
+- Web import wizard with step-by-step flow: upload CSV or enter Calibre path → dry-run preview → live progress via SSE → results summary
+- Real-time import progress streaming with Server-Sent Events and automatic reconnect replay
+- Support for Goodreads, StoryGraph, and Calibre imports through the web interface
+
 ## [0.2.1] - 2026-05-30
 
 ### Changed

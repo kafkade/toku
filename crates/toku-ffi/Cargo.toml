@@ -13,9 +13,11 @@ crate-type = ["cdylib", "staticlib"]
 [dependencies]
 toku-core.workspace = true
 toku-db.workspace = true
+toku-import.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 
 [build-dependencies]
 cbindgen = "0.28"

@@ -1,0 +1,5 @@
+module CTokuFFI {
+    header "toku.h"
+    link "toku_ffi"
+    export *
+}

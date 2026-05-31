@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Filter bar with status, tag, sort controls, and grid/list view toggle
 - ADR-007: Web framework decision documenting the choice of Axum + maud over HTMX and Leptos
 - Windows desktop application (`toku-desktop`) wrapping the web UI in a native Tauri v2 window with system tray and minimize-to-tray support
+- Extended FFI API with 9 new functions: delete, update status/rating, search, stats, tags, shelves, and Goodreads import
+- macOS app (`toku-apple`) with SwiftUI: sidebar navigation, sortable table and grid views, book detail inspector, Swift Charts statistics dashboard, and drag-and-drop Goodreads CSV import
 
 ## [0.2.1] - 2026-05-30
 

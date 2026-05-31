@@ -29,9 +29,12 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
+use std::str::FromStr;
 
 use serde::Serialize;
-use toku_core::{Author, Book, ContributorRole};
+use toku_core::{
+    Author, Book, ContributorRole, CurrentlyReadingInput, ReadingStatus, StatsInput, compute_stats,
+};
 use toku_db::{BookRepository, Database};
 
 // ── Status codes ────────────────────────────────────────────────────────
@@ -408,6 +411,602 @@ pub unsafe extern "C" fn toku_get_book(
     }))
 }
 
+// ── FFI-specific DTOs (tags, shelves, import) ───────────────────────────
+
+#[derive(Serialize)]
+struct FfiTag {
+    name: String,
+    tag_type: String,
+    count: i64,
+}
+
+#[derive(Serialize)]
+struct FfiShelf {
+    name: String,
+    is_smart: bool,
+    book_count: usize,
+}
+
+#[derive(Serialize)]
+struct FfiImportReport {
+    total_rows: usize,
+    imported: usize,
+    skipped: usize,
+    updated: usize,
+    errors: usize,
+}
+
+// ── Additional public FFI functions ─────────────────────────────────────
+
+/// Delete a book by UUID. Returns `ErrorNotFound` if no book matches.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `id` must be a valid NUL-terminated UUID string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_delete_book(db: *mut TokuDb, id: *const c_char) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() {
+            set_last_error("null db pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let id_str = match unsafe { cstr_to_str(id) } {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
+
+        let uuid = match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => u,
+            Err(_) => {
+                set_last_error("invalid UUID format");
+                return TokuStatus::ErrorInvalidUtf8;
+            }
+        };
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+
+        match repo.delete_book(&uuid) {
+            Ok(true) => TokuStatus::Ok,
+            Ok(false) => {
+                set_last_error("book not found");
+                TokuStatus::ErrorNotFound
+            }
+            Err(e) => {
+                set_last_error(&format!("failed to delete book: {e}"));
+                TokuStatus::ErrorDb
+            }
+        }
+    }))
+}
+
+/// Update a book's reading status. `status` must be one of:
+/// `want-to-read`, `reading`, `read`, `on-hold`, `did-not-finish`.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `id` must be a valid NUL-terminated UUID string.
+/// - `status` must be a valid NUL-terminated status string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_update_book_status(
+    db: *mut TokuDb,
+    id: *const c_char,
+    status: *const c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() {
+            set_last_error("null db pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let id_str = match unsafe { cstr_to_str(id) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let status_str = match unsafe { cstr_to_str(status) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        let uuid = match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => u,
+            Err(_) => {
+                set_last_error("invalid UUID format");
+                return TokuStatus::ErrorInvalidUtf8;
+            }
+        };
+
+        let reading_status = match ReadingStatus::from_str(status_str) {
+            Ok(s) => s,
+            Err(_) => {
+                set_last_error(&format!("invalid status: {status_str}"));
+                return TokuStatus::ErrorInvalidUtf8;
+            }
+        };
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+
+        match repo.update_book_status(&uuid, reading_status) {
+            Ok(true) => TokuStatus::Ok,
+            Ok(false) => {
+                set_last_error("book not found");
+                TokuStatus::ErrorNotFound
+            }
+            Err(e) => {
+                set_last_error(&format!("failed to update status: {e}"));
+                TokuStatus::ErrorDb
+            }
+        }
+    }))
+}
+
+/// Update a book's rating (0–10 scale). Pass -1 to clear the rating.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `id` must be a valid NUL-terminated UUID string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_update_book_rating(
+    db: *mut TokuDb,
+    id: *const c_char,
+    rating: i32,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() {
+            set_last_error("null db pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let id_str = match unsafe { cstr_to_str(id) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        let uuid = match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => u,
+            Err(_) => {
+                set_last_error("invalid UUID format");
+                return TokuStatus::ErrorInvalidUtf8;
+            }
+        };
+
+        if !(-1..=10).contains(&rating) {
+            set_last_error("rating must be -1 (clear) or 0–10");
+            return TokuStatus::ErrorInvalidUtf8;
+        }
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+
+        // -1 means clear — update to 0 and let the app interpret
+        let actual_rating = if rating == -1 { 0 } else { rating };
+
+        match repo.update_book_rating(&uuid, actual_rating) {
+            Ok(true) => TokuStatus::Ok,
+            Ok(false) => {
+                set_last_error("book not found");
+                TokuStatus::ErrorNotFound
+            }
+            Err(e) => {
+                set_last_error(&format!("failed to update rating: {e}"));
+                TokuStatus::ErrorDb
+            }
+        }
+    }))
+}
+
+/// Search books using full-text search. Results are returned as a JSON array.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `query` must be a valid NUL-terminated UTF-8 string.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_search_books(
+    db: *mut TokuDb,
+    query: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() || out_json.is_null() {
+            set_last_error("null db or out_json pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let query_str = match unsafe { cstr_to_str(query) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+
+        let books = match repo.search_books(query_str) {
+            Ok(b) => b,
+            Err(e) => {
+                set_last_error(&format!("search failed: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        let ffi_books: Vec<FfiBook> = books
+            .iter()
+            .map(|b| {
+                let authors = repo
+                    .get_book_authors(&b.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(a, _)| a.name)
+                    .collect();
+                FfiBook::from_book(b, authors)
+            })
+            .collect();
+
+        let json = match serde_json::to_string(&ffi_books) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(&format!("failed to serialize results: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        unsafe { *out_json = rust_string_to_c(&json) };
+        TokuStatus::Ok
+    }))
+}
+
+/// Get reading statistics as a JSON object. Pass `year = 0` for all-time stats,
+/// or a specific year (e.g. 2025) for year-scoped stats.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_get_stats(
+    db: *mut TokuDb,
+    year: i32,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() || out_json.is_null() {
+            set_last_error("null db or out_json pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+        let year_opt = if year == 0 { None } else { Some(year) };
+
+        let stats = match gather_stats_for_ffi(&repo, year_opt) {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(&format!("failed to compute stats: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        let json = match serde_json::to_string(&stats) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(&format!("failed to serialize stats: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        unsafe { *out_json = rust_string_to_c(&json) };
+        TokuStatus::Ok
+    }))
+}
+
+/// List all tags with their counts as a JSON array.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_list_tags(db: *mut TokuDb, out_json: *mut *mut c_char) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() || out_json.is_null() {
+            set_last_error("null db or out_json pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+
+        let tags = match repo.list_tags_with_counts() {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(&format!("failed to list tags: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        let ffi_tags: Vec<FfiTag> = tags
+            .into_iter()
+            .map(|(tag, count)| FfiTag {
+                name: tag.name,
+                tag_type: tag.tag_type.as_str().to_string(),
+                count,
+            })
+            .collect();
+
+        let json = match serde_json::to_string(&ffi_tags) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(&format!("failed to serialize tags: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        unsafe { *out_json = rust_string_to_c(&json) };
+        TokuStatus::Ok
+    }))
+}
+
+/// Get tags for a specific book as a JSON array.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `id` must be a valid NUL-terminated UUID string.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_get_book_tags(
+    db: *mut TokuDb,
+    id: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() || out_json.is_null() {
+            set_last_error("null db or out_json pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let id_str = match unsafe { cstr_to_str(id) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        let uuid = match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => u,
+            Err(_) => {
+                set_last_error("invalid UUID format");
+                return TokuStatus::ErrorInvalidUtf8;
+            }
+        };
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+
+        let tags = match repo.get_book_tags(&uuid) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(&format!("failed to get book tags: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        let ffi_tags: Vec<FfiTag> = tags
+            .into_iter()
+            .map(|tag| FfiTag {
+                name: tag.name,
+                tag_type: tag.tag_type.as_str().to_string(),
+                count: 0,
+            })
+            .collect();
+
+        let json = match serde_json::to_string(&ffi_tags) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(&format!("failed to serialize tags: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        unsafe { *out_json = rust_string_to_c(&json) };
+        TokuStatus::Ok
+    }))
+}
+
+/// List all shelves as a JSON array.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_list_shelves(
+    db: *mut TokuDb,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() || out_json.is_null() {
+            set_last_error("null db or out_json pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+
+        let shelves = match repo.list_shelves() {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(&format!("failed to list shelves: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        let ffi_shelves: Vec<FfiShelf> = shelves
+            .into_iter()
+            .map(|s| {
+                let count = repo
+                    .list_books_in_shelf(&s.name)
+                    .map(|b| b.len())
+                    .unwrap_or(0);
+                FfiShelf {
+                    name: s.name,
+                    is_smart: s.is_smart,
+                    book_count: count,
+                }
+            })
+            .collect();
+
+        let json = match serde_json::to_string(&ffi_shelves) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(&format!("failed to serialize shelves: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        unsafe { *out_json = rust_string_to_c(&json) };
+        TokuStatus::Ok
+    }))
+}
+
+/// Import books from a Goodreads CSV export. Returns an import report as JSON.
+/// Set `dry_run` to true to preview without modifying the database.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `csv_path` must be a valid NUL-terminated file path.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_import_goodreads(
+    db: *mut TokuDb,
+    csv_path: *const c_char,
+    dry_run: bool,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() || out_json.is_null() {
+            set_last_error("null db or out_json pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let path_str = match unsafe { cstr_to_str(csv_path) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        let handle = unsafe { &*db };
+        let opts = toku_import::GoodreadsImportOptions { dry_run };
+
+        let report =
+            match toku_import::import_goodreads(&handle.db, Path::new(path_str), &opts, None) {
+                Ok(r) => r,
+                Err(e) => {
+                    set_last_error(&format!("import failed: {e}"));
+                    return TokuStatus::ErrorDb;
+                }
+            };
+
+        let ffi_report = FfiImportReport {
+            total_rows: report.total_rows,
+            imported: report.imported,
+            skipped: report.skipped,
+            updated: report.updated,
+            errors: report.errors,
+        };
+
+        let json = match serde_json::to_string(&ffi_report) {
+            Ok(j) => j,
+            Err(e) => {
+                set_last_error(&format!("failed to serialize report: {e}"));
+                return TokuStatus::ErrorDb;
+            }
+        };
+
+        unsafe { *out_json = rust_string_to_c(&json) };
+        TokuStatus::Ok
+    }))
+}
+
+// ── Stats helper ────────────────────────────────────────────────────────
+
+/// Gather data and compute reading statistics — mirrors the web dashboard's logic.
+fn gather_stats_for_ffi(
+    repo: &BookRepository<'_>,
+    year: Option<i32>,
+) -> Result<toku_core::ReadingStats, String> {
+    let books = repo.list_books().map_err(|e| e.to_string())?;
+    let book_ids: Vec<String> = books.iter().map(|b| b.id.to_string()).collect();
+
+    let sessions = match year {
+        Some(y) => repo.list_reading_sessions_in_year(y),
+        None => repo.list_reading_sessions(),
+    }
+    .map_err(|e| e.to_string())?;
+
+    let currently_reading_details = repo
+        .get_currently_reading_details()
+        .map_err(|e| e.to_string())?;
+    let currently_reading_input: Vec<CurrentlyReadingInput> = currently_reading_details
+        .into_iter()
+        .map(|(book, progress, authors)| {
+            let author_name = authors
+                .into_iter()
+                .map(|(a, _)| a.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            CurrentlyReadingInput {
+                title: book.title,
+                author: author_name,
+                page_count: book.page_count,
+                latest_progress: progress,
+            }
+        })
+        .collect();
+
+    let tag_counts = repo.list_tag_counts().map_err(|e| e.to_string())?;
+    let author_counts = repo.list_author_book_counts().map_err(|e| e.to_string())?;
+
+    let activity_dates = match year {
+        Some(y) => repo.list_activity_dates_in_year(y),
+        None => repo.list_activity_dates(),
+    }
+    .map_err(|e| e.to_string())?;
+
+    let now = chrono::Utc::now();
+    let today = chrono::Local::now().date_naive();
+    let mood_tag_data = repo
+        .get_mood_tags_for_books(&book_ids)
+        .map_err(|e| e.to_string())?;
+
+    let stats = compute_stats(StatsInput {
+        books: &books,
+        sessions: &sessions,
+        currently_reading: &currently_reading_input,
+        tag_counts: &tag_counts,
+        author_counts: &author_counts,
+        activity_dates: &activity_dates,
+        now,
+        today,
+        mood_tag_data: &mood_tag_data,
+    });
+
+    Ok(stats)
+}
+
 /// Free a string that was allocated by a `toku_*` function. Passing null is a safe no-op.
 ///
 /// # Safety
@@ -616,5 +1215,257 @@ mod tests {
 
         unsafe { toku_free_string(out) };
         unsafe { toku_close(db) };
+    }
+
+    // Helper: add a book and return its UUID string
+    fn add_test_book(db: *mut TokuDb, title: &str, author: Option<&str>) -> String {
+        let title_c = CString::new(title).unwrap();
+        let author_c = author.map(|a| CString::new(a).unwrap());
+        let mut out_id: *mut c_char = std::ptr::null_mut();
+
+        let status = unsafe {
+            toku_add_book(
+                db,
+                title_c.as_ptr(),
+                author_c.as_ref().map_or(std::ptr::null(), |a| a.as_ptr()),
+                &mut out_id,
+            )
+        };
+        assert!(matches!(status, TokuStatus::Ok));
+
+        let id = unsafe { CStr::from_ptr(out_id) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe { toku_free_string(out_id) };
+        id
+    }
+
+    #[test]
+    fn delete_book_success() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "To Delete", Some("Author"));
+        let id_c = CString::new(id).unwrap();
+
+        let status = unsafe { toku_delete_book(db, id_c.as_ptr()) };
+        assert!(matches!(status, TokuStatus::Ok));
+
+        // Verify it's gone
+        let mut out: *mut c_char = std::ptr::null_mut();
+        unsafe { toku_list_books(db, &mut out) };
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        let books: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(books.is_empty());
+
+        unsafe { toku_free_string(out) };
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn delete_book_not_found() {
+        let db = open_memory_db();
+        let id = CString::new("01961234-5678-7000-8000-000000000000").unwrap();
+
+        let status = unsafe { toku_delete_book(db, id.as_ptr()) };
+        assert!(matches!(status, TokuStatus::ErrorNotFound));
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn update_status_success() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Status Test", None);
+        let id_c = CString::new(id.clone()).unwrap();
+        let status_c = CString::new("reading").unwrap();
+
+        let result = unsafe { toku_update_book_status(db, id_c.as_ptr(), status_c.as_ptr()) };
+        assert!(matches!(result, TokuStatus::Ok));
+
+        // Verify the status changed
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let id_c2 = CString::new(id).unwrap();
+        unsafe { toku_get_book(db, id_c2.as_ptr(), &mut out) };
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        let book: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(book["status"], "reading");
+
+        unsafe { toku_free_string(out) };
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn update_status_invalid() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Bad Status", None);
+        let id_c = CString::new(id).unwrap();
+        let status_c = CString::new("invalid-status").unwrap();
+
+        let result = unsafe { toku_update_book_status(db, id_c.as_ptr(), status_c.as_ptr()) };
+        assert!(matches!(result, TokuStatus::ErrorInvalidUtf8));
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn update_rating_success() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Rating Test", None);
+        let id_c = CString::new(id.clone()).unwrap();
+
+        let result = unsafe { toku_update_book_rating(db, id_c.as_ptr(), 8) };
+        assert!(matches!(result, TokuStatus::Ok));
+
+        // Verify the rating changed
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let id_c2 = CString::new(id).unwrap();
+        unsafe { toku_get_book(db, id_c2.as_ptr(), &mut out) };
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        let book: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(book["rating"], 8);
+
+        unsafe { toku_free_string(out) };
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn update_rating_out_of_range() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Bad Rating", None);
+        let id_c = CString::new(id).unwrap();
+
+        let result = unsafe { toku_update_book_rating(db, id_c.as_ptr(), 11) };
+        assert!(matches!(result, TokuStatus::ErrorInvalidUtf8));
+
+        let result = unsafe { toku_update_book_rating(db, id_c.as_ptr(), -2) };
+        assert!(matches!(result, TokuStatus::ErrorInvalidUtf8));
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn search_books_returns_results() {
+        let db = open_memory_db();
+        add_test_book(db, "Dune Messiah", Some("Frank Herbert"));
+        add_test_book(db, "Foundation", Some("Isaac Asimov"));
+
+        let query = CString::new("Dune").unwrap();
+        let mut out: *mut c_char = std::ptr::null_mut();
+
+        let status = unsafe { toku_search_books(db, query.as_ptr(), &mut out) };
+        assert!(matches!(status, TokuStatus::Ok));
+
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        let books: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0]["title"], "Dune Messiah");
+
+        unsafe { toku_free_string(out) };
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn get_stats_returns_json() {
+        let db = open_memory_db();
+        add_test_book(db, "Stats Book", None);
+
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let status = unsafe { toku_get_stats(db, 0, &mut out) };
+        assert!(matches!(status, TokuStatus::Ok));
+
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        let stats: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert!(stats.get("total_books").is_some());
+
+        unsafe { toku_free_string(out) };
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn list_tags_empty() {
+        let db = open_memory_db();
+        let mut out: *mut c_char = std::ptr::null_mut();
+
+        let status = unsafe { toku_list_tags(db, &mut out) };
+        assert!(matches!(status, TokuStatus::Ok));
+
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        let tags: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(tags.is_empty());
+
+        unsafe { toku_free_string(out) };
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn list_shelves_empty() {
+        let db = open_memory_db();
+        let mut out: *mut c_char = std::ptr::null_mut();
+
+        let status = unsafe { toku_list_shelves(db, &mut out) };
+        assert!(matches!(status, TokuStatus::Ok));
+
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        let shelves: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(shelves.is_empty());
+
+        unsafe { toku_free_string(out) };
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn get_book_tags_not_found() {
+        let db = open_memory_db();
+        let id = CString::new("01961234-5678-7000-8000-000000000000").unwrap();
+        let mut out: *mut c_char = std::ptr::null_mut();
+
+        // Tags for non-existent book returns empty array (not error)
+        let status = unsafe { toku_get_book_tags(db, id.as_ptr(), &mut out) };
+        assert!(matches!(status, TokuStatus::Ok));
+
+        let json = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        let tags: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        assert!(tags.is_empty());
+
+        unsafe { toku_free_string(out) };
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn null_pointer_new_functions() {
+        let mut out: *mut c_char = std::ptr::null_mut();
+
+        // delete_book with null db
+        let id = CString::new("01961234-5678-7000-8000-000000000000").unwrap();
+        let status = unsafe { toku_delete_book(std::ptr::null_mut(), id.as_ptr()) };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+
+        // update_status with null db
+        let status_c = CString::new("reading").unwrap();
+        let status = unsafe {
+            toku_update_book_status(std::ptr::null_mut(), id.as_ptr(), status_c.as_ptr())
+        };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+
+        // update_rating with null db
+        let status = unsafe { toku_update_book_rating(std::ptr::null_mut(), id.as_ptr(), 5) };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+
+        // search_books with null db
+        let query = CString::new("test").unwrap();
+        let status = unsafe { toku_search_books(std::ptr::null_mut(), query.as_ptr(), &mut out) };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+
+        // get_stats with null db
+        let status = unsafe { toku_get_stats(std::ptr::null_mut(), 0, &mut out) };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+
+        // list_tags with null db
+        let status = unsafe { toku_list_tags(std::ptr::null_mut(), &mut out) };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+
+        // list_shelves with null db
+        let status = unsafe { toku_list_shelves(std::ptr::null_mut(), &mut out) };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
     }
 }

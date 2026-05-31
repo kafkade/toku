@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows desktop application (`toku-desktop`) wrapping the web UI in a native Tauri v2 window with system tray and minimize-to-tray support
 - Extended FFI API with 9 new functions: delete, update status/rating, search, stats, tags, shelves, and Goodreads import
 - macOS app (`toku-apple`) with SwiftUI: sidebar navigation, sortable table and grid views, book detail inspector, Swift Charts statistics dashboard, and drag-and-drop Goodreads CSV import
+- iOS app (iPhone + iPad) with SwiftUI: library cover grid, book detail, barcode scanner (ISBN-13 via camera), quick progress update sheet, statistics glance with Swift Charts, full-text search, Goodreads CSV import, adaptive navigation (TabView on iPhone, NavigationSplitView on iPad), status filter chips, and pull-to-refresh
+- TokuKitUI shared SwiftUI component library (StarRatingView, FlowLayout, MetadataRow, StatCard) for reuse across macOS and iOS apps
 
 ## [0.2.1] - 2026-05-30
 

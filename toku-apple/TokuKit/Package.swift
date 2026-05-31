@@ -3,9 +3,10 @@ import PackageDescription
 
 let package = Package(
     name: "TokuKit",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v14), .iOS(.v17)],
     products: [
         .library(name: "TokuKit", targets: ["TokuKit"]),
+        .library(name: "TokuKitUI", targets: ["TokuKitUI"]),
     ],
     targets: [
         .systemLibrary(
@@ -18,6 +19,11 @@ let package = Package(
             name: "TokuKit",
             dependencies: ["CTokuFFI"],
             path: "Sources/TokuKit"
+        ),
+        .target(
+            name: "TokuKitUI",
+            dependencies: ["TokuKit"],
+            path: "Sources/TokuKitUI"
         ),
     ]
 )

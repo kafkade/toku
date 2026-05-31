@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::ImportError;
 
 /// The outcome of processing a single row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum RowOutcome {
     Imported,
     Skipped,
@@ -16,7 +16,7 @@ pub enum RowOutcome {
 }
 
 /// Progress event emitted for each row during import.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ImportEvent {
     pub row: usize,
     pub total: usize,
@@ -33,7 +33,7 @@ pub trait ImportObserver {
 }
 
 /// A short summary of a skipped or imported row, kept for the final report.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RowSummary {
     pub title: String,
     pub author: String,
@@ -43,7 +43,7 @@ pub struct RowSummary {
 pub const MAX_REPORT_SAMPLES: usize = 20;
 
 /// Summary report of an import operation.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ImportReport {
     pub total_rows: usize,
     pub imported: usize,

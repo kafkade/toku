@@ -1,0 +1,22 @@
+[package]
+name = "toku-web"
+description = "Web dashboard for Toku personal book manager"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+toku-core.workspace = true
+toku-db.workspace = true
+toku-import.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+axum = { version = "0.8", features = ["multipart"] }
+maud = "0.26"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }

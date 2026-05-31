@@ -13,6 +13,15 @@ native frontends (Swift/iOS, C#/Windows, Kotlin/JNI).
 | `toku_add_book` | Add a book with title and optional author |
 | `toku_list_books` | List all books as a JSON array |
 | `toku_get_book` | Get a single book by UUID as JSON |
+| `toku_delete_book` | Delete a book by UUID |
+| `toku_update_book_status` | Update reading status (`want-to-read`, `reading`, etc.) |
+| `toku_update_book_rating` | Update rating (0–10) or clear with -1 |
+| `toku_search_books` | Full-text search, returns JSON array |
+| `toku_get_stats` | Reading statistics as JSON (year=0 for all-time) |
+| `toku_list_tags` | All tags with counts as JSON array |
+| `toku_get_book_tags` | Tags for a specific book as JSON array |
+| `toku_list_shelves` | All shelves with book counts as JSON array |
+| `toku_import_goodreads` | Import Goodreads CSV, returns report JSON |
 | `toku_free_string` | Free a string allocated by any `toku_*` function |
 | `toku_last_error` | Retrieve the last error message (thread-local) |
 

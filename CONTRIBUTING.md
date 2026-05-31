@@ -54,11 +54,32 @@ cargo test --workspace
 
 # Run the CLI
 cargo run -p toku-cli -- --help
+
+# Run the web dashboard locally
+cargo run -p toku-cli -- serve
 ```
+
+### Web UI Development
+
+The web interface lives in `crates/toku-web/` and uses Axum + maud for server-side
+rendering. Start the dev server with `cargo run -p toku-cli -- serve` and visit
+`http://localhost:3000`. All HTML is generated server-side — no JavaScript build step.
+
+### FFI Development (macOS/iOS)
+
+The `toku-ffi` crate (`crates/toku-ffi/`) provides C FFI bindings for the Swift layer.
+After changing FFI functions, regenerate the C header with `cbindgen`. The Swift wrapper
+lives in `toku-apple/TokuKit/`. FFI methods must run on the same thread that opened the
+database handle.
+
+### Windows Desktop (Tauri)
+
+The Tauri v2 desktop app (`crates/toku-desktop/`) wraps the web UI. Build with
+`cargo tauri build` from the `crates/toku-desktop/` directory.
 
 ## Architecture
 
-See `.github/copilot-instructions.md` for the full architecture overview and `docs/adr/` for Architecture Decision Records.
+See `.github/copilot-instructions.md` for the full architecture overview, `docs/adr/` for Architecture Decision Records, and `toku-apple/` for the macOS/iOS Swift projects.
 
 ## License
 

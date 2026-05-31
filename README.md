@@ -20,8 +20,8 @@ toku stats --year 2025                 # See your reading stats
 toku browse                            # Interactive TUI browser
 ```
 
-> **Status**: Early development — functional CLI with import, tracking, search,
-> TUI browser, and export. Usable for personal reading management.
+> **Status**: Active development (v0.2.1) — full-featured CLI, web dashboard,
+> macOS/iOS apps, and Windows desktop app. Phases 0–5 complete.
 
 ---
 
@@ -62,19 +62,26 @@ their ever-growing libraries.
 - 📊 Reading progress tracking (pages, percentage, chapters, audiobook time)
 - 🏷️ Tags for organizing your library (imported Goodreads shelves become tags)
 - 📈 Reading statistics and analytics (pace, format breakdown, yearly filtering)
-- 📥 Import from Goodreads CSV and Calibre (with dry-run, dedup, and tag preservation)
+- 📥 Import from Goodreads CSV, Calibre, and StoryGraph (with dry-run, dedup, and tag preservation)
 - 📤 Export to CSV, JSON, Markdown, and canonical backup (ZIP)
 - 🔍 Full-text search across your entire library (titles, authors, descriptions)
 - 🖥️ Interactive TUI browser with split-pane layout, filters, and live detail view
 - 🔄 Bulk operations for tagging, status changes, and deletions across filtered sets
+- 🌐 Web dashboard (`toku serve`) with statistics, import wizard, library views, and dark mode
+- 🍎 macOS app (SwiftUI) with sidebar navigation, sortable table/grid views, and Swift Charts
+- 📱 iOS app (iPhone + iPad) with cover grid, barcode scanner, and reading progress updates
+- 🪟 Windows desktop app (Tauri v2) wrapping the web UI in a native window with system tray
 
 ## Tech Stack
 
 - **Language**: Rust
 - **Database**: SQLite with FTS5
 - **CLI**: clap v4
-- **Architecture**: Cargo workspace with separate crates for core, database, import,
-  metadata, CLI, and export
+- **Web**: Axum + maud (server-side rendered HTML with inline SVG charts)
+- **Desktop**: Tauri v2 (Windows)
+- **Mobile/macOS**: SwiftUI via Rust FFI (`toku-ffi` crate)
+- **Architecture**: Cargo workspace with 9 crates — core, database, import, export,
+  metadata, CLI, FFI, web, and desktop
 
 ## License
 

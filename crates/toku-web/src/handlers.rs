@@ -12,9 +12,9 @@ use crate::AppState;
 use crate::error::WebError;
 use crate::views;
 
-/// `GET /` → redirect to `/stats`.
+/// `GET /` → redirect to `/library`.
 pub async fn root() -> Redirect {
-    Redirect::permanent("/stats")
+    Redirect::permanent("/library")
 }
 
 #[derive(serde::Deserialize)]

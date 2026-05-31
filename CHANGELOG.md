@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Web import wizard with step-by-step flow: upload CSV or enter Calibre path → dry-run preview → live progress via SSE → results summary
 - Real-time import progress streaming with Server-Sent Events and automatic reconnect replay
 - Support for Goodreads, StoryGraph, and Calibre imports through the web interface
+- Library grid view with book covers, titles, authors, ratings, and status badges in a responsive layout
+- Library list view with sortable table (title, author, status, rating, format, pages, date added)
+- Book detail page with full metadata, reading sessions timeline, progress log, and tags grouped by type
+- FTS5-powered search with status and tag filter dropdowns
+- Cover image serving with content-addressed caching
+- Pagination for large libraries (60 books per page)
+- Filter bar with status, tag, sort controls, and grid/list view toggle
+- ADR-007: Web framework decision documenting the choice of Axum + maud over HTMX and Leptos
 
 ## [0.2.1] - 2026-05-30
 

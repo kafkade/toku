@@ -21,6 +21,10 @@ fn base(title: &str, content: Markup) -> Markup {
                     div.header-inner {
                         a.logo href="/" { "📚 Toku" }
                         nav {
+                            a.nav-link href="/library" { "Library" }
+                            " "
+                            a.nav-link href="/search" { "Search" }
+                            " "
                             a.nav-link href="/stats" { "Dashboard" }
                             " "
                             a.nav-link href="/import" { "Import" }

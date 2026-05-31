@@ -9,6 +9,9 @@ pub enum WebError {
     #[error("import error: {0}")]
     Import(#[from] toku_import::ImportError),
 
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -18,6 +21,7 @@ impl IntoResponse for WebError {
         let status = match &self {
             WebError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WebError::Import(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            WebError::NotFound(_) => StatusCode::NOT_FOUND,
             WebError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()

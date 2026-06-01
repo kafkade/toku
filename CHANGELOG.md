@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sync data model: `sync_ops`, `sync_cursors`, and `sync_device` tables (migration V12) for local op-log staging
+- Hybrid Logical Clock (HLC) implementation with fixed-width canonical format for causal ordering across devices
+- `SyncRepository` for sync persistence: insert ops, query unpushed, mark pushed, device identity, cursor management
+- `SyncOp` domain model with SHA-256 content checksums and `serde_json::Value` fields for canonical JSON
 - Web statistics dashboard (`toku serve`): reading stats, rating histogram, monthly pace chart, format breakdown donut, top authors and tags — all rendered as server-side SVG with dark mode support
 - Yearly wrap-up pages at `/stats/wrap/{year}` summarizing a single year's reading
 - JSON statistics API at `/api/stats` for programmatic access

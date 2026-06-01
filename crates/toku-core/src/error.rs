@@ -41,4 +41,13 @@ pub enum TokuError {
 
     #[error("invalid filter: {0}")]
     InvalidFilter(String),
+
+    #[error("invalid HLC timestamp: {0}")]
+    InvalidHlc(String),
+
+    #[error("invalid entity type: {0}")]
+    InvalidEntityType(String),
+
+    #[error("invalid op type: {0}")]
+    InvalidOpType(String),
 }

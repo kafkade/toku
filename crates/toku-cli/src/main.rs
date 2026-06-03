@@ -13,6 +13,7 @@ use toku_core::{
 use toku_db::{BookRepository, Database};
 
 mod import_ui;
+mod sync;
 mod tui;
 
 /// Toku — a private, offline-first personal book manager.
@@ -246,6 +247,12 @@ enum Commands {
     Shelf {
         #[command(subcommand)]
         action: ShelfAction,
+    },
+
+    /// Manage sync with a toku-sync server
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
     },
 }
 
@@ -549,6 +556,49 @@ enum ExportTarget {
     },
 }
 
+#[derive(Clone, Subcommand)]
+enum SyncAction {
+    /// Register this device with a sync server
+    Register {
+        /// Sync server URL (e.g. https://sync.example.com)
+        #[arg(long)]
+        server: String,
+
+        /// Library ID (UUID — use the same ID across all devices for one library)
+        #[arg(long)]
+        library_id: String,
+
+        /// Name for this device (e.g. "work-laptop")
+        #[arg(long)]
+        device_name: String,
+    },
+
+    /// List all devices registered to this library
+    Devices {
+        /// Sync server URL
+        #[arg(long)]
+        server: String,
+    },
+
+    /// Deregister another device from the sync server
+    Deregister {
+        /// Sync server URL
+        #[arg(long)]
+        server: String,
+
+        /// Device ID to deregister
+        #[arg(long)]
+        device_id: String,
+    },
+
+    /// Remove locally stored sync credentials
+    Logout {
+        /// Sync server URL
+        #[arg(long)]
+        server: String,
+    },
+}
+
 #[derive(Clone, ValueEnum)]
 enum OutputFormat {
     Table,
@@ -585,6 +635,9 @@ fn main() -> Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))
             });
+        }
+        Commands::Sync { action } => {
+            return cmd_sync(&data_dir, action.clone(), &cli.format);
         }
         _ => {}
     }
@@ -674,8 +727,10 @@ fn main() -> Result<()> {
         Commands::Work { action } => cmd_work(&repo, action, &cli.format),
         Commands::Merge { keep, remove } => cmd_merge(&repo, &keep, &remove, &cli.format),
         Commands::Shelf { action } => cmd_shelf(&repo, action, &cli.format),
-        // Already handled above
-        Commands::Config { .. } | Commands::Completions { .. } | Commands::Serve { .. } => {
+        Commands::Config { .. }
+        | Commands::Completions { .. }
+        | Commands::Serve { .. }
+        | Commands::Sync { .. } => {
             unreachable!()
         }
     }
@@ -2856,6 +2911,144 @@ fn cmd_shelf(
             let found = resolve_book(repo, &book)?;
             repo.remove_book_from_shelf(&found.id, &shelf)?;
             eprintln!("✓ Removed \"{}\" from shelf \"{shelf}\"", found.title);
+            Ok(())
+        }
+    }
+}
+
+fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    let token_store = sync::token_store::TokenStore::new(data_dir);
+
+    match action {
+        SyncAction::Register {
+            server,
+            library_id,
+            device_name,
+        } => {
+            let client = sync::client::SyncClient::new(&server)?;
+            let resp = rt.block_on(client.register(&library_id, &device_name))?;
+
+            token_store
+                .store(&server, &resp.auth_token)
+                .context("failed to store auth token")?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "device_id": resp.device_id,
+                            "library_id": resp.library_id,
+                            "server": server,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("device_id,library_id,server");
+                    println!("{},{},{server}", resp.device_id, resp.library_id);
+                }
+                OutputFormat::Table => {
+                    eprintln!("✓ Registered as \"{}\"", device_name);
+                    eprintln!("  Device ID:  {}", resp.device_id);
+                    eprintln!("  Library ID: {}", resp.library_id);
+                    eprintln!("  Token stored securely");
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Devices { server } => {
+            let token = token_store.load(&server)?.ok_or_else(|| {
+                anyhow::anyhow!("no auth token found for {server}. Run `toku sync register` first.")
+            })?;
+
+            let client = sync::client::SyncClient::new(&server)?;
+            let devices = rt.block_on(client.list_devices(&token))?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&devices)?);
+                }
+                OutputFormat::Csv => {
+                    println!("device_id,device_name,last_seen,created_at");
+                    for d in &devices {
+                        println!(
+                            "{},{},{},{}",
+                            d.device_id,
+                            d.device_name,
+                            d.last_seen.as_deref().unwrap_or(""),
+                            d.created_at
+                        );
+                    }
+                }
+                OutputFormat::Table => {
+                    if devices.is_empty() {
+                        eprintln!("No devices registered.");
+                        return Ok(());
+                    }
+                    use tabled::{Table, Tabled};
+                    #[derive(Tabled)]
+                    struct Row {
+                        #[tabled(rename = "Device ID")]
+                        id: String,
+                        #[tabled(rename = "Name")]
+                        name: String,
+                        #[tabled(rename = "Last Seen")]
+                        last_seen: String,
+                        #[tabled(rename = "Registered")]
+                        created: String,
+                    }
+                    let rows: Vec<Row> = devices
+                        .iter()
+                        .map(|d| Row {
+                            id: d.device_id.clone(),
+                            name: d.device_name.clone(),
+                            last_seen: d.last_seen.clone().unwrap_or_else(|| "—".into()),
+                            created: d.created_at.clone(),
+                        })
+                        .collect();
+                    println!("{}", Table::new(rows));
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Deregister { server, device_id } => {
+            let token = token_store.load(&server)?.ok_or_else(|| {
+                anyhow::anyhow!("no auth token found for {server}. Run `toku sync register` first.")
+            })?;
+
+            let client = sync::client::SyncClient::new(&server)?;
+            rt.block_on(client.deregister_device(&token, &device_id))?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "deleted": true,
+                            "device_id": device_id,
+                        }))?
+                    );
+                }
+                _ => {
+                    eprintln!("✓ Deregistered device {device_id}");
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Logout { server } => {
+            token_store
+                .delete(&server)
+                .context("failed to remove stored token")?;
+
+            eprintln!("✓ Removed local credentials for {server}");
             Ok(())
         }
     }

@@ -175,6 +175,34 @@ impl<'a> SyncRepository<'a> {
         Ok(())
     }
 
+    /// Insert a sync op received from the server.
+    ///
+    /// Remote ops are stored with `pushed_at` set to now (they don't need
+    /// to be pushed back — they came from the server). Duplicates are
+    /// silently ignored.
+    pub fn insert_remote_op(&self, op: &SyncOp) -> Result<(), DbError> {
+        let fields_json = op.fields.as_ref().map(|v| v.to_string());
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db.conn.execute(
+            "INSERT OR IGNORE INTO sync_ops (op_id, device_id, hlc, entity_type, entity_id,
+             op_type, fields_json, checksum, pushed_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                op.op_id.to_string(),
+                op.device_id.to_string(),
+                op.hlc.to_canonical(),
+                op.entity_type.as_str(),
+                op.entity_id.to_string(),
+                op.op_type.as_str(),
+                fields_json,
+                op.checksum,
+                now,
+                op.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Count the number of unpushed ops.
     pub fn count_unpushed_ops(&self) -> Result<i64, DbError> {
         let count: i64 = self.db.conn.query_row(

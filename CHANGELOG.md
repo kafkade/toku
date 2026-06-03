@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hybrid Logical Clock (HLC) implementation with fixed-width canonical format for causal ordering across devices
 - `SyncRepository` for sync persistence: insert ops, query unpushed, mark pushed, device identity, cursor management
 - `SyncOp` domain model with SHA-256 content checksums and `serde_json::Value` fields for canonical JSON
+- Sync relay server (`toku-sync`): standalone Axum HTTP service that stores and relays sync operations between devices
+- Device registration and authentication: `POST /api/v1/register` generates a 256-bit base64url auth token, stored as SHA-256 hash on the server
+- Sync REST API: push ops, pull ops (with cursor-based pagination), device management, and health check
+- `toku sync register` CLI command to register a device with a sync server and store the auth token in the OS keychain
+- `toku sync devices` to list registered devices with `--format table|json|csv` support
+- `toku sync deregister` to remove another device from the sync server
+- `toku sync logout` to remove locally stored sync credentials
+- Platform-native credential storage via OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service) with secure file fallback
 - Web statistics dashboard (`toku serve`): reading stats, rating histogram, monthly pace chart, format breakdown donut, top authors and tags — all rendered as server-side SVG with dark mode support
 - Yearly wrap-up pages at `/stats/wrap/{year}` summarizing a single year's reading
 - JSON statistics API at `/api/stats` for programmatic access

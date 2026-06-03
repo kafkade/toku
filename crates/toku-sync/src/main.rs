@@ -374,6 +374,11 @@ mod tests {
             .unwrap();
         let push: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(push["accepted"], 1);
+        assert!(
+            push["new_cursor"].is_string(),
+            "push should return new_cursor"
+        );
+        assert_eq!(push["new_cursor"], "dup-1");
 
         // Push same op again
         let resp = app
@@ -827,6 +832,338 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        cleanup(&db_path);
+    }
+
+    #[tokio::test]
+    async fn pull_excludes_own_device_ops() {
+        let db_path = test_db_path();
+        let app = build_router(db_path.clone());
+
+        // Register two devices
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "lib-1",
+                            "device_name": "dev-a"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reg_a: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token_a = reg_a["auth_token"].as_str().unwrap().to_string();
+        let device_a_id = reg_a["device_id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "lib-1",
+                            "device_name": "dev-b"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reg_b: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token_b = reg_b["auth_token"].as_str().unwrap().to_string();
+
+        // Device A pushes an op
+        let ops_json = serde_json::json!({
+            "ops": [{
+                "op_id": "op-from-a",
+                "device_id": &device_a_id,
+                "hlc": "2026-01-01T00:00:00.000Z-0001-aaaaaaaaaaaa",
+                "entity_type": "book",
+                "entity_id": "b1",
+                "op_type": "create",
+                "payload": {"title": "Test Book"}
+            }]
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/push")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token_a}"))
+                    .body(Body::from(serde_json::to_string(&ops_json).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Device A pulls — should NOT see its own op
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/pull")
+                    .header("Authorization", format!("Bearer {token_a}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pull: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pull["ops"].as_array().unwrap().len(), 0);
+        assert_eq!(pull["has_more"], false);
+
+        // Device B pulls — SHOULD see device A's op
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/pull")
+                    .header("Authorization", format!("Bearer {token_b}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pull: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pull["ops"].as_array().unwrap().len(), 1);
+        assert_eq!(pull["ops"][0]["op_id"], "op-from-a");
+        assert_eq!(pull["has_more"], false);
+        assert!(pull["cursor"].is_string());
+
+        cleanup(&db_path);
+    }
+
+    #[tokio::test]
+    async fn push_returns_new_cursor() {
+        let db_path = test_db_path();
+        let app = build_router(db_path.clone());
+
+        // Register
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "lib-1",
+                            "device_name": "dev"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reg: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = reg["auth_token"].as_str().unwrap().to_string();
+
+        // Push multiple ops
+        let ops_json = serde_json::json!({
+            "ops": [
+                {
+                    "op_id": "op-1",
+                    "device_id": "d",
+                    "hlc": "2026-01-01T00:00:00.000Z-0001-d",
+                    "entity_type": "book",
+                    "entity_id": "b1",
+                    "op_type": "create",
+                    "payload": {}
+                },
+                {
+                    "op_id": "op-2",
+                    "device_id": "d",
+                    "hlc": "2026-01-01T00:00:01.000Z-0001-d",
+                    "entity_type": "book",
+                    "entity_id": "b1",
+                    "op_type": "update",
+                    "payload": {"title": "Updated"}
+                }
+            ]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/push")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_string(&ops_json).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let push: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(push["accepted"], 2);
+        assert_eq!(push["new_cursor"], "op-2");
+
+        cleanup(&db_path);
+    }
+
+    #[tokio::test]
+    async fn pull_has_more_pagination() {
+        let db_path = test_db_path();
+        let app = build_router(db_path.clone());
+
+        // Register two devices
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "lib-1",
+                            "device_name": "pusher"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reg_push: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let push_token = reg_push["auth_token"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "lib-1",
+                            "device_name": "puller"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reg_pull: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let pull_token = reg_pull["auth_token"].as_str().unwrap().to_string();
+
+        // Push 5 ops from the pusher device (small batch to verify has_more=false)
+        let ops: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "op_id": format!("op-{i}"),
+                    "device_id": "d",
+                    "hlc": format!("2026-01-01T00:00:{i:02}.000Z-0001-d"),
+                    "entity_type": "book",
+                    "entity_id": format!("b{i}"),
+                    "op_type": "create",
+                    "payload": {}
+                })
+            })
+            .collect();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/push")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {push_token}"))
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({ "ops": ops })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Puller pulls — should get all 5 and has_more=false
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/pull")
+                    .header("Authorization", format!("Bearer {pull_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pull: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pull["ops"].as_array().unwrap().len(), 5);
+        assert_eq!(pull["has_more"], false);
+        assert!(pull["cursor"].is_string());
+
+        // Pull again with cursor — should get empty
+        let cursor = pull["cursor"].as_str().unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/pull?since={cursor}"))
+                    .header("Authorization", format!("Bearer {pull_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pull: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pull["ops"].as_array().unwrap().len(), 0);
+        assert_eq!(pull["has_more"], false);
 
         cleanup(&db_path);
     }

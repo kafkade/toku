@@ -50,12 +50,14 @@ pub struct DeviceResponse {
 pub struct PushResponse {
     pub accepted: usize,
     pub duplicates: usize,
+    pub new_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PullResponse {
     pub ops: Vec<OpPayload>,
     pub cursor: Option<String>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Serialize)]

@@ -23,6 +23,32 @@ pub struct DeviceInfo {
     pub created_at: String,
 }
 
+/// Wire format for a sync op (matches server's OpPayload).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WireOp {
+    pub op_id: String,
+    pub device_id: String,
+    pub hlc: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub op_type: String,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PushResult {
+    pub accepted: usize,
+    pub duplicates: usize,
+    pub new_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PullResult {
+    pub ops: Vec<WireOp>,
+    pub cursor: Option<String>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct ErrorBody {
     error: String,
@@ -92,6 +118,40 @@ impl SyncClient {
         }
 
         Ok(())
+    }
+
+    /// Push a batch of ops to the sync server.
+    pub async fn push_ops(&self, token: &str, ops: &[WireOp]) -> anyhow::Result<PushResult> {
+        let url = format!("{}/api/v1/push", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "ops": ops }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Pull ops from the sync server since the given cursor.
+    pub async fn pull_ops(&self, token: &str, since: Option<&str>) -> anyhow::Result<PullResult> {
+        let mut url = format!("{}/api/v1/pull", self.base_url);
+        if let Some(cursor) = since {
+            url = format!("{url}?since={cursor}");
+        }
+
+        let resp = self.http.get(&url).bearer_auth(token).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
     }
 }
 

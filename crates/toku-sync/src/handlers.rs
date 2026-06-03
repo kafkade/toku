@@ -204,14 +204,15 @@ pub async fn push_ops(
             }
 
             // Update push cursor to the last accepted op
-            if let Some(last_op) = ops.last() {
+            let new_cursor = ops.last().map(|op| op.op_id.clone());
+            if let Some(ref cursor_op_id) = new_cursor {
                 tx.execute(
                     "INSERT INTO cursors (device_id, cursor_type, op_id, updated_at)
                      VALUES (?1, 'push', ?2, datetime('now'))
                      ON CONFLICT (device_id, cursor_type) DO UPDATE SET
                        op_id = excluded.op_id,
                        updated_at = excluded.updated_at",
-                    rusqlite::params![device_id, last_op.op_id],
+                    rusqlite::params![device_id, cursor_op_id],
                 )?;
             }
 
@@ -220,6 +221,7 @@ pub async fn push_ops(
             Ok(PushResponse {
                 accepted,
                 duplicates,
+                new_cursor,
             })
         }
     })
@@ -244,7 +246,10 @@ pub async fn pull_ops(
         move || -> Result<PullResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
-            let ops: Vec<OpPayload> = if let Some(ref since_op_id) = since {
+            // Fetch one extra to determine has_more
+            let fetch_limit = MAX_BATCH_SIZE_SQL + 1;
+
+            let all_ops: Vec<OpPayload> = if let Some(ref since_op_id) = since {
                 // Get the HLC of the cursor op to filter from
                 let cursor_hlc: Option<String> = db
                     .conn
@@ -260,12 +265,14 @@ pub async fn pull_ops(
                         let mut stmt = db.conn.prepare(
                             "SELECT op_id, device_id, hlc, entity_type, entity_id, op_type, payload
                              FROM ops
-                             WHERE library_id = ?1 AND (hlc > ?2 OR (hlc = ?2 AND op_id > ?3))
+                             WHERE library_id = ?1
+                               AND device_id != ?2
+                               AND (hlc > ?3 OR (hlc = ?3 AND op_id > ?4))
                              ORDER BY hlc, op_id
-                             LIMIT ?4",
+                             LIMIT ?5",
                         )?;
                         stmt.query_map(
-                            rusqlite::params![library_id, hlc, since_op_id, MAX_BATCH_SIZE_SQL],
+                            rusqlite::params![library_id, device_id, hlc, since_op_id, fetch_limit],
                             row_to_op,
                         )?
                         .collect::<Result<Vec<_>, _>>()?
@@ -277,17 +284,23 @@ pub async fn pull_ops(
                     }
                 }
             } else {
-                // No cursor — return all ops from the beginning
+                // No cursor — return all ops from the beginning (excluding own)
                 let mut stmt = db.conn.prepare(
                     "SELECT op_id, device_id, hlc, entity_type, entity_id, op_type, payload
                      FROM ops
-                     WHERE library_id = ?1
+                     WHERE library_id = ?1 AND device_id != ?2
                      ORDER BY hlc, op_id
-                     LIMIT ?2",
+                     LIMIT ?3",
                 )?;
-                stmt.query_map(rusqlite::params![library_id, MAX_BATCH_SIZE_SQL], row_to_op)?
-                    .collect::<Result<Vec<_>, _>>()?
+                stmt.query_map(
+                    rusqlite::params![library_id, device_id, fetch_limit],
+                    row_to_op,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
             };
+
+            let has_more = all_ops.len() > MAX_BATCH_SIZE;
+            let ops: Vec<OpPayload> = all_ops.into_iter().take(MAX_BATCH_SIZE).collect();
 
             let cursor = ops.last().map(|op| op.op_id.clone());
 
@@ -303,7 +316,11 @@ pub async fn pull_ops(
                 )?;
             }
 
-            Ok(PullResponse { ops, cursor })
+            Ok(PullResponse {
+                ops,
+                cursor,
+                has_more,
+            })
         }
     })
     .await

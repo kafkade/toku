@@ -748,16 +748,27 @@ mod tests {
         let engine = MergeEngine::new(&db);
         let dev_a = Uuid::now_v7();
         let dev_b = Uuid::now_v7();
-        let mut clock_a = make_clock(&dev_a);
-        let mut clock_b = make_clock(&dev_b);
         let book_id = Uuid::now_v7();
 
-        // Create book
-        let create = make_book_create(dev_a, clock_a.now(), book_id, "Dune");
+        // Create book with deterministic HLC (earliest)
+        let hlc_create = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let create = make_book_create(dev_a, hlc_create, book_id, "Dune");
         engine.apply_op(&create).unwrap();
 
-        // Device A updates title at T1
-        let hlc_a = clock_a.now();
+        // Device A updates title at T1 (deterministic)
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
         let op_a = make_book_update(
             dev_a,
             hlc_a.clone(),
@@ -766,9 +777,18 @@ mod tests {
         );
         engine.apply_op(&op_a).unwrap();
 
-        // Device B updates title at T2 (later than T1)
-        let hlc_b = clock_b.now();
-        assert!(hlc_b > hlc_a, "B's HLC should be later");
+        // Device B updates title at T2 (later — deterministic)
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
+        assert!(
+            hlc_b.to_canonical() > hlc_a.to_canonical(),
+            "B's HLC should be later"
+        );
         let op_b = make_book_update(
             dev_b,
             hlc_b,
@@ -795,16 +815,27 @@ mod tests {
         let engine = MergeEngine::new(&db);
         let dev_a = Uuid::now_v7();
         let dev_b = Uuid::now_v7();
-        let mut clock_a = make_clock(&dev_a);
-        let mut clock_b = make_clock(&dev_b);
         let book_id = Uuid::now_v7();
 
-        // Create book
-        let create = make_book_create(dev_a, clock_a.now(), book_id, "Dune");
+        // Create book with deterministic HLC (earliest)
+        let hlc_create = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let create = make_book_create(dev_a, hlc_create, book_id, "Dune");
         engine.apply_op(&create).unwrap();
 
-        // Device B updates title at T1 (earlier)
-        let hlc_b = clock_b.now();
+        // Device B updates title at T1 (earlier — deterministic)
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
         let op_b = make_book_update(
             dev_b,
             hlc_b,
@@ -813,8 +844,14 @@ mod tests {
         );
         engine.apply_op(&op_b).unwrap();
 
-        // Device A updates title at T2 (later)
-        let hlc_a = clock_a.now();
+        // Device A updates title at T2 (later — deterministic)
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
         let op_a = make_book_update(
             dev_a,
             hlc_a,
@@ -823,9 +860,7 @@ mod tests {
         );
         engine.apply_op(&op_a).unwrap();
 
-        // Now try to apply an old B op again — should be skipped
-        let _hlc_old = clock_b.now(); // Even though this is a "new" hlc from B, it was generated before A's update
-        // Actually, let's use a deterministic older HLC
+        // Now try to apply an old B op — should be skipped
         let old_hlc = HlcTimestamp::new(
             chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
                 .unwrap()
@@ -1366,18 +1401,30 @@ mod tests {
         let dev_a = Uuid::now_v7();
         let dev_b = Uuid::now_v7();
         let mut clock_a = make_clock(&dev_a);
-        let mut clock_b = make_clock(&dev_b);
         let book_id = Uuid::now_v7();
 
         let create = make_book_create(dev_a, clock_a.now(), book_id, "Dune");
         engine.apply_op(&create).unwrap();
 
-        // Simulate: device A writes rating=7, then device B writes rating=9 (later HLC)
-        let hlc_a = clock_a.now();
+        // Simulate: device A writes rating=7 at T1 (earlier — deterministic)
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
         let op_a = make_book_update(dev_a, hlc_a, book_id, serde_json::json!({"rating": 7}));
         engine.apply_op(&op_a).unwrap();
 
-        let hlc_b = clock_b.now();
+        // Device B writes rating=9 at T2 (later — deterministic)
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
         let op_b = make_book_update(dev_b, hlc_b, book_id, serde_json::json!({"rating": 9}));
         engine.apply_op(&op_b).unwrap();
 

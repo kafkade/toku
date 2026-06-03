@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `toku sync deregister` to remove another device from the sync server
 - `toku sync logout` to remove locally stored sync credentials
 - Platform-native credential storage via OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service) with secure file fallback
+- `toku sync push --server <url>` to push local changes to the sync server with batched uploads and cursor tracking
+- `toku sync pull --server <url>` to pull remote changes with automatic pagination and cursor-based resumption
+- Pull endpoint excludes the requesting device's own ops to avoid echoing changes back
+- `has_more` pagination flag on pull responses for batched retrieval of large op sets
 - Web statistics dashboard (`toku serve`): reading stats, rating histogram, monthly pace chart, format breakdown donut, top authors and tags — all rendered as server-side SVG with dark mode support
 - Yearly wrap-up pages at `/stats/wrap/{year}` summarizing a single year's reading
 - JSON statistics API at `/api/stats` for programmatic access

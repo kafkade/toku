@@ -597,6 +597,20 @@ enum SyncAction {
         #[arg(long)]
         server: String,
     },
+
+    /// Push local changes to the sync server
+    Push {
+        /// Sync server URL
+        #[arg(long)]
+        server: String,
+    },
+
+    /// Pull remote changes from the sync server
+    Pull {
+        /// Sync server URL
+        #[arg(long)]
+        server: String,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -3049,6 +3063,149 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 .context("failed to remove stored token")?;
 
             eprintln!("✓ Removed local credentials for {server}");
+            Ok(())
+        }
+
+        SyncAction::Push { server } => {
+            let token = token_store.load(&server)?.ok_or_else(|| {
+                anyhow::anyhow!("no auth token found for {server}. Run `toku sync register` first.")
+            })?;
+
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let sync_repo = toku_db::SyncRepository::new(&db);
+            let client = sync::client::SyncClient::new(&server)?;
+
+            let unpushed = sync_repo.get_unpushed_ops()?;
+            if unpushed.is_empty() {
+                match output_format {
+                    OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "pushed": 0,
+                                "status": "up_to_date",
+                            }))?
+                        );
+                    }
+                    _ => {
+                        eprintln!("✓ Nothing to push — already up to date");
+                    }
+                }
+                return Ok(());
+            }
+
+            let total = unpushed.len();
+            let wire_ops: Vec<sync::client::WireOp> =
+                unpushed.iter().map(sync::wire::to_wire).collect();
+
+            // Push in batches of 1000
+            let mut total_accepted = 0usize;
+            let mut total_duplicates = 0usize;
+            let mut last_cursor = None;
+
+            for chunk in wire_ops.chunks(1000) {
+                let result = rt.block_on(client.push_ops(&token, chunk))?;
+                total_accepted += result.accepted;
+                total_duplicates += result.duplicates;
+                if result.new_cursor.is_some() {
+                    last_cursor = result.new_cursor;
+                }
+            }
+
+            // Mark ops as pushed locally
+            let op_ids: Vec<uuid::Uuid> = unpushed.iter().map(|op| op.op_id).collect();
+            sync_repo.mark_ops_pushed(&op_ids)?;
+
+            // Update local push cursor
+            if let Some(ref cursor) = last_cursor {
+                sync_repo.set_cursor("push_cursor", cursor)?;
+            }
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "pushed": total,
+                            "accepted": total_accepted,
+                            "duplicates": total_duplicates,
+                            "cursor": last_cursor,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("pushed,accepted,duplicates");
+                    println!("{total},{total_accepted},{total_duplicates}");
+                }
+                OutputFormat::Table => {
+                    eprintln!("✓ Pushed {total_accepted} ops ({total_duplicates} duplicates)");
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Pull { server } => {
+            let token = token_store.load(&server)?.ok_or_else(|| {
+                anyhow::anyhow!("no auth token found for {server}. Run `toku sync register` first.")
+            })?;
+
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let sync_repo = toku_db::SyncRepository::new(&db);
+            let client = sync::client::SyncClient::new(&server)?;
+
+            let mut cursor = sync_repo.get_cursor("pull_cursor")?;
+            let mut total_pulled = 0usize;
+
+            loop {
+                let result = rt.block_on(client.pull_ops(&token, cursor.as_deref()))?;
+
+                if result.ops.is_empty() {
+                    break;
+                }
+
+                for wire_op in &result.ops {
+                    let sync_op =
+                        sync::wire::from_wire(wire_op).context("failed to parse remote op")?;
+                    sync_repo.insert_remote_op(&sync_op)?;
+                }
+
+                total_pulled += result.ops.len();
+
+                // Update cursor to the last op we received
+                if let Some(new_cursor) = result.cursor {
+                    sync_repo.set_cursor("pull_cursor", &new_cursor)?;
+                    cursor = Some(new_cursor);
+                }
+
+                if !result.has_more {
+                    break;
+                }
+            }
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "pulled": total_pulled,
+                            "cursor": cursor,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("pulled,cursor");
+                    println!("{total_pulled},{}", cursor.as_deref().unwrap_or(""));
+                }
+                OutputFormat::Table => {
+                    if total_pulled == 0 {
+                        eprintln!("✓ Nothing to pull — already up to date");
+                    } else {
+                        eprintln!("✓ Pulled {total_pulled} ops");
+                    }
+                }
+            }
             Ok(())
         }
     }

@@ -611,6 +611,13 @@ enum SyncAction {
         #[arg(long)]
         server: String,
     },
+
+    /// Purge tombstoned books older than the retention period
+    Purge {
+        /// Retention period in days (default: 30)
+        #[arg(long, default_value = "30")]
+        days: i64,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -732,7 +739,7 @@ fn main() -> Result<()> {
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
-        Commands::Bulk { action } => cmd_bulk(&repo, action),
+        Commands::Bulk { action } => cmd_bulk(&db, &repo, action),
         Commands::Stats {
             year,
             author,
@@ -2043,7 +2050,7 @@ fn resolve_bulk_books(
     Ok(filtered)
 }
 
-fn cmd_bulk(repo: &BookRepository, action: BulkAction) -> Result<()> {
+fn cmd_bulk(db: &toku_db::Database, repo: &BookRepository, action: BulkAction) -> Result<()> {
     match action {
         BulkAction::Tag {
             tag,
@@ -2155,11 +2162,29 @@ fn cmd_bulk(repo: &BookRepository, action: BulkAction) -> Result<()> {
             let verb = if dry_run { "Would delete" } else { "Deleting" };
             eprintln!("{verb} {} book(s):\n", books.len());
 
+            // If sync is configured, create delete ops for each book
+            let sync_repo = toku_db::SyncRepository::new(db);
+            let device_identity = sync_repo.get_device()?;
+
             for book in &books {
                 if dry_run {
                     eprintln!("  [dry-run] \"{}\"", book.title);
                 } else {
                     repo.delete_book(&book.id)?;
+
+                    if let Some(ref identity) = device_identity {
+                        let mut clock = toku_core::HybridClock::new(&identity.device_id);
+                        let op = toku_core::SyncOp::new(
+                            identity.device_id,
+                            clock.now(),
+                            toku_core::EntityType::Book,
+                            book.id,
+                            toku_core::OpType::Delete,
+                            None,
+                        );
+                        sync_repo.insert_op(&op)?;
+                    }
+
                     eprintln!("  ✗ \"{}\"", book.title);
                 }
             }
@@ -3203,6 +3228,37 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                         eprintln!("✓ Nothing to pull — already up to date");
                     } else {
                         eprintln!("✓ Pulled {total_pulled} ops");
+                    }
+                }
+            }
+            Ok(())
+        }
+        SyncAction::Purge { days } => {
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let repo = toku_db::BookRepository::new(&db);
+
+            let purged = repo.purge_tombstones(days)?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "purged": purged,
+                            "retention_days": days,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("purged,retention_days");
+                    println!("{purged},{days}");
+                }
+                OutputFormat::Table => {
+                    if purged == 0 {
+                        eprintln!("✓ No tombstones older than {days} days to purge");
+                    } else {
+                        eprintln!("✓ Purged {purged} tombstoned book(s) older than {days} days");
                     }
                 }
             }

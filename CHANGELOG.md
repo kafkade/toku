@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `toku sync pull --server <url>` to pull remote changes with automatic pagination and cursor-based resumption
 - Pull endpoint excludes the requesting device's own ops to avoid echoing changes back
 - `has_more` pagination flag on pull responses for batched retrieval of large op sets
+- Entity-specific merge engine for applying remote sync ops to local state with per-entity strategies
+- Book field-level last-write-wins (LWW) merge using HLC timestamps — two devices editing different fields produces no conflict
+- Reading session append-only merge: remote sessions are inserted if new, never updated or deleted via sync
+- Reading progress monotonic merge: remote progress values are only accepted if they exceed the current local maximum
+- Tag sync: add/remove operations applied directly with deduplication
+- Soft delete for books via `deleted_at` column, driven by sync delete ops with HLC timestamps
+- Reading status transition validation during sync merge (rejects illegal state machine transitions)
+- `sync_conflicts` table for future note/review conflict resolution UI
+- Soft delete for books: `toku bulk delete` now sets `deleted_at` instead of removing the row, preserving data for sync propagation
+- Deleted books are automatically excluded from all queries (list, search, stats, shelves, tags, FTS)
+- `toku sync purge --days N` command to permanently remove tombstoned books after the retention period
+- Delete operations create sync ops automatically when a device identity is registered, enabling cross-device delete propagation
 - Web statistics dashboard (`toku serve`): reading stats, rating histogram, monthly pace chart, format breakdown donut, top authors and tags — all rendered as server-side SVG with dark mode support
 - Yearly wrap-up pages at `/stats/wrap/{year}` summarizing a single year's reading
 - JSON statistics API at `/api/stats` for programmatic access

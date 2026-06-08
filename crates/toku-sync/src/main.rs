@@ -23,6 +23,8 @@ fn build_router(db_path: PathBuf) -> Router {
         .route("/api/v1/devices/{id}", delete(handlers::delete_device))
         .route("/api/v1/push", post(handlers::push_ops))
         .route("/api/v1/pull", get(handlers::pull_ops))
+        .route("/api/v1/pull/all", get(handlers::pull_all_ops))
+        .route("/api/v1/salt", get(handlers::get_salt))
         .route("/api/v1/snapshot", get(handlers::snapshot))
         .route("/api/v1/rekey", post(handlers::rekey))
         .layer(middleware::from_fn_with_state(
@@ -35,7 +37,7 @@ fn build_router(db_path: PathBuf) -> Router {
         .route("/health", get(handlers::health))
         .route("/api/v1/register", post(handlers::register))
         .merge(authenticated)
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB (rekey may be large)
         .with_state(db_path)
 }
 
@@ -1164,6 +1166,246 @@ mod tests {
         let pull: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(pull["ops"].as_array().unwrap().len(), 0);
         assert_eq!(pull["has_more"], false);
+
+        cleanup(&db_path);
+    }
+
+    #[tokio::test]
+    async fn rekey_replaces_ops_and_updates_salt() {
+        let db_path = test_db_path();
+        let app = build_router(db_path.clone());
+
+        // Register
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "lib-rekey",
+                            "device_name": "dev"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let register: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = register["auth_token"].as_str().unwrap().to_string();
+
+        // Push two ops
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/push")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "ops": [
+                                {
+                                    "op_id": "rk-op-1",
+                                    "device_id": "d1",
+                                    "hlc": "2026-01-01T00:00:00.000Z-0001-d1",
+                                    "entity_type": "book",
+                                    "entity_id": "b1",
+                                    "op_type": "create",
+                                    "payload": {"title": "Dune"}
+                                },
+                                {
+                                    "op_id": "rk-op-2",
+                                    "device_id": "d1",
+                                    "hlc": "2026-01-01T00:00:01.000Z-0001-d1",
+                                    "entity_type": "book",
+                                    "entity_id": "b1",
+                                    "op_type": "update",
+                                    "payload": {"rating": 9}
+                                }
+                            ]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Rekey with "re-encrypted" ops (different payloads simulating re-encryption)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rekey")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "new_salt": "bmV3LXNhbHQ=",
+                            "ops": [
+                                {
+                                    "op_id": "rk-op-1",
+                                    "device_id": "d1",
+                                    "hlc": "2026-01-01T00:00:00.000Z-0001-d1",
+                                    "entity_type": "book",
+                                    "entity_id": "b1",
+                                    "op_type": "create",
+                                    "payload": {"ev": 1, "alg": "aes-256-gcm", "ciphertext": "new-ct-1"}
+                                },
+                                {
+                                    "op_id": "rk-op-2",
+                                    "device_id": "d1",
+                                    "hlc": "2026-01-01T00:00:01.000Z-0001-d1",
+                                    "entity_type": "book",
+                                    "entity_id": "b1",
+                                    "op_type": "update",
+                                    "payload": {"ev": 1, "alg": "aes-256-gcm", "ciphertext": "new-ct-2"}
+                                }
+                            ]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rekey: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rekey["ops_replaced"], 2);
+        assert_eq!(rekey["new_salt"], "bmV3LXNhbHQ=");
+
+        // Verify salt was updated
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/salt")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let salt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(salt["salt"], "bmV3LXNhbHQ=");
+
+        // Verify ops are the re-encrypted versions via pull/all
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/pull/all")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pull: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ops = pull["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        // Verify payloads are the re-encrypted versions
+        assert_eq!(ops[0]["payload"]["ciphertext"], "new-ct-1");
+        assert_eq!(ops[1]["payload"]["ciphertext"], "new-ct-2");
+
+        cleanup(&db_path);
+    }
+
+    #[tokio::test]
+    async fn push_blocked_during_rekey() {
+        let db_path = test_db_path();
+        let app = build_router(db_path.clone());
+
+        // Register
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "lib-lock",
+                            "device_name": "dev"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let register: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = register["auth_token"].as_str().unwrap().to_string();
+
+        // Manually set rekey lock
+        {
+            let db = SyncDatabase::open_no_migrate(&db_path).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE libraries SET rekey_in_progress = 1 WHERE id = 'lib-lock'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Push should be rejected
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/push")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "ops": [{
+                                "op_id": "blocked-op",
+                                "device_id": "d1",
+                                "hlc": "2026-01-01T00:00:00.000Z-0001-d1",
+                                "entity_type": "book",
+                                "entity_id": "b1",
+                                "op_type": "create",
+                                "payload": {}
+                            }]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("re-keyed"));
 
         cleanup(&db_path);
     }

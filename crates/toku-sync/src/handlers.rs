@@ -8,7 +8,7 @@ use crate::db::SyncDatabase;
 use crate::error::SyncError;
 use crate::models::{
     DeviceResponse, HealthResponse, OpPayload, PullQuery, PullResponse, PushRequest, PushResponse,
-    RegisterRequest, RegisterResponse,
+    RegisterRequest, RegisterResponse, RekeyRequest, RekeyResponse,
 };
 
 const MAX_BATCH_SIZE: usize = 1000;
@@ -172,6 +172,22 @@ pub async fn push_ops(
         let ops = req.ops;
         move || -> Result<PushResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // Reject pushes while a rekey is in progress
+            let locked: bool = db
+                .conn
+                .query_row(
+                    "SELECT rekey_in_progress FROM libraries WHERE id = ?1",
+                    [&library_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if locked {
+                return Err(SyncError::BadRequest(
+                    "library is being re-keyed; try again shortly".into(),
+                ));
+            }
+
             let tx = db.conn.unchecked_transaction()?;
 
             let mut accepted = 0usize;
@@ -329,7 +345,7 @@ pub async fn pull_ops(
     Ok(Json(resp))
 }
 
-// ── Snapshot / Rekey stubs ──────────────────────────────────────────────────
+// ── Snapshot / Salt ─────────────────────────────────────────────────────────
 
 pub async fn snapshot() -> (axum::http::StatusCode, Json<serde_json::Value>) {
     (
@@ -340,13 +356,164 @@ pub async fn snapshot() -> (axum::http::StatusCode, Json<serde_json::Value>) {
     )
 }
 
-pub async fn rekey() -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    (
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "re-keying is not yet implemented"
-        })),
-    )
+/// Get the library salt (needed for key derivation on new devices).
+pub async fn get_salt(
+    State(db_path): State<PathBuf>,
+    device: AuthDevice,
+) -> Result<Json<serde_json::Value>, SyncError> {
+    let salt = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let library_id = device.library_id.clone();
+        move || -> Result<Option<String>, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let salt: Option<String> = db
+                .conn
+                .query_row(
+                    "SELECT salt FROM libraries WHERE id = ?1",
+                    [&library_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| SyncError::NotFound("library not found".into()))?;
+            Ok(salt)
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(serde_json::json!({ "salt": salt })))
+}
+
+/// Pull ALL ops for this library (including own device's ops).
+/// Used during re-keying when the client needs to decrypt and re-encrypt everything.
+pub async fn pull_all_ops(
+    State(db_path): State<PathBuf>,
+    device: AuthDevice,
+) -> Result<Json<PullResponse>, SyncError> {
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let library_id = device.library_id.clone();
+        move || -> Result<PullResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let mut stmt = db.conn.prepare(
+                "SELECT op_id, device_id, hlc, entity_type, entity_id, op_type, payload
+                 FROM ops
+                 WHERE library_id = ?1
+                 ORDER BY hlc, op_id",
+            )?;
+            let ops: Vec<OpPayload> = stmt
+                .query_map([&library_id], row_to_op)?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(PullResponse {
+                cursor: ops.last().map(|op| op.op_id.clone()),
+                has_more: false,
+                ops,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
+}
+
+// ── Rekey ───────────────────────────────────────────────────────────────────
+
+pub async fn rekey(
+    State(db_path): State<PathBuf>,
+    device: AuthDevice,
+    Json(req): Json<RekeyRequest>,
+) -> Result<Json<RekeyResponse>, SyncError> {
+    if req.new_salt.is_empty() {
+        return Err(SyncError::BadRequest("new_salt is required".into()));
+    }
+    if req.ops.is_empty() {
+        return Err(SyncError::BadRequest("ops array is empty".into()));
+    }
+
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let library_id = device.library_id.clone();
+        let new_salt = req.new_salt;
+        let ops = req.ops;
+        move || -> Result<RekeyResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // Set rekey lock
+            db.conn.execute(
+                "UPDATE libraries SET rekey_in_progress = 1 WHERE id = ?1",
+                [&library_id],
+            )?;
+
+            // Run the replacement in a transaction so failure rolls back
+            let result = (|| -> Result<RekeyResponse, SyncError> {
+                let tx = db.conn.unchecked_transaction()?;
+
+                // Delete all existing ops for this library
+                let deleted: usize = tx.execute(
+                    "DELETE FROM ops WHERE library_id = ?1",
+                    [&library_id],
+                )?;
+                let _ = deleted;
+
+                // Insert the re-encrypted ops
+                let mut inserted = 0usize;
+                for op in &ops {
+                    let payload_str = serde_json::to_string(&op.payload)
+                        .map_err(|e| SyncError::BadRequest(format!("invalid payload: {e}")))?;
+
+                    tx.execute(
+                        "INSERT INTO ops (op_id, library_id, device_id, hlc, entity_type, entity_id, op_type, payload, received_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))",
+                        rusqlite::params![
+                            op.op_id,
+                            library_id,
+                            op.device_id,
+                            op.hlc,
+                            op.entity_type,
+                            op.entity_id,
+                            op.op_type,
+                            payload_str,
+                        ],
+                    )?;
+                    inserted += 1;
+                }
+
+                // Update salt
+                tx.execute(
+                    "UPDATE libraries SET salt = ?1 WHERE id = ?2",
+                    rusqlite::params![new_salt, library_id],
+                )?;
+
+                // Invalidate all cursors for this library's devices
+                tx.execute(
+                    "DELETE FROM cursors WHERE device_id IN (
+                         SELECT device_id FROM devices WHERE library_id = ?1
+                     )",
+                    [&library_id],
+                )?;
+
+                tx.commit()?;
+
+                Ok(RekeyResponse {
+                    ops_replaced: inserted,
+                    new_salt: new_salt.clone(),
+                })
+            })();
+
+            // Always release the rekey lock, even on failure
+            let _ = db.conn.execute(
+                "UPDATE libraries SET rekey_in_progress = 0 WHERE id = ?1",
+                [&library_id],
+            );
+
+            result
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

@@ -54,6 +54,18 @@ struct ErrorBody {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RekeyResult {
+    pub ops_replaced: usize,
+    #[allow(dead_code)]
+    pub new_salt: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaltResult {
+    pub salt: Option<String>,
+}
+
 impl SyncClient {
     pub fn new(server_url: &str) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -146,6 +158,57 @@ impl SyncClient {
         }
 
         let resp = self.http.get(&url).bearer_auth(token).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Pull ALL ops for this library (including own device's).
+    /// Used during re-keying.
+    pub async fn pull_all_ops(&self, token: &str) -> anyhow::Result<PullResult> {
+        let url = format!("{}/api/v1/pull/all", self.base_url);
+        let resp = self.http.get(&url).bearer_auth(token).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Get the library salt for key derivation.
+    pub async fn get_salt(&self, token: &str) -> anyhow::Result<SaltResult> {
+        let url = format!("{}/api/v1/salt", self.base_url);
+        let resp = self.http.get(&url).bearer_auth(token).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Submit re-encrypted ops and new salt to the server.
+    pub async fn rekey(
+        &self,
+        token: &str,
+        new_salt: &str,
+        ops: &[WireOp],
+    ) -> anyhow::Result<RekeyResult> {
+        let url = format!("{}/api/v1/rekey", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "new_salt": new_salt,
+                "ops": ops,
+            }))
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             return Err(extract_error(resp).await);

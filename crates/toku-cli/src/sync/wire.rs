@@ -61,6 +61,7 @@ pub fn from_wire(wire: &WireOp) -> anyhow::Result<SyncOp> {
         entity_id,
         op_type,
         fields,
+        encrypted: None,
         checksum: String::new(),
         created_at: chrono::Utc::now(),
     };

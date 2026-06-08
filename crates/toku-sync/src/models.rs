@@ -29,6 +29,12 @@ pub struct PullQuery {
     pub since: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RekeyRequest {
+    pub new_salt: String,
+    pub ops: Vec<OpPayload>,
+}
+
 // ── Responses ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -69,4 +75,10 @@ pub struct HealthResponse {
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     pub error: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RekeyResponse {
+    pub ops_replaced: usize,
+    pub new_salt: String,
 }

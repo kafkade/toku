@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+
 /// Stores sync auth tokens using the OS keychain or a local file fallback.
 ///
 /// Tokens are keyed by the normalized server URL.
@@ -9,6 +11,7 @@ pub struct TokenStore {
 }
 
 const KEYRING_SERVICE: &str = "toku-sync";
+const KEYRING_SERVICE_SYNCKEY: &str = "toku-sync-key";
 
 impl TokenStore {
     pub fn new(data_dir: &Path) -> Self {
@@ -67,6 +70,64 @@ impl TokenStore {
 
         // Also remove from file fallback
         self.delete_file(&key)
+    }
+
+    /// Store the derived sync encryption key in the OS keychain.
+    pub fn store_sync_key(&self, server_url: &str, key_bytes: &[u8]) -> anyhow::Result<()> {
+        let key = normalize_url(server_url);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+            match entry.set_password(&encoded) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not store sync key in OS keychain ({e}), using file fallback"
+                    );
+                }
+            }
+        }
+
+        self.store_file(&format!("{key}:synckey"), &encoded)
+    }
+
+    /// Load the derived sync encryption key from the OS keychain.
+    #[allow(dead_code)]
+    pub fn load_sync_key(&self, server_url: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        use base64::Engine;
+        let key = normalize_url(server_url);
+
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+            match entry.get_password() {
+                Ok(encoded) => {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(&encoded)?;
+                    return Ok(Some(bytes));
+                }
+                Err(keyring::Error::NoEntry) => {}
+                Err(_) => {}
+            }
+        }
+
+        // File fallback
+        match self.load_file(&format!("{key}:synckey"))? {
+            Some(encoded) => {
+                let bytes = base64::engine::general_purpose::STANDARD.decode(&encoded)?;
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete the stored sync encryption key.
+    #[allow(dead_code)]
+    pub fn delete_sync_key(&self, server_url: &str) -> anyhow::Result<()> {
+        let key = normalize_url(server_url);
+
+        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+            let _ = entry.delete_credential();
+        }
+
+        self.delete_file(&format!("{key}:synckey"))
     }
 
     // ── File fallback ───────────────────────────────────────────────────

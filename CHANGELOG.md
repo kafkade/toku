@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Notes and reviews merge: LWW with conflict detection — two devices editing the same note stores a `sync_conflict` for user review, while edits to different notes merge cleanly
+- Review field-level merge: content and rating are tracked independently, so two devices editing different review fields produces no conflict
+- Settings sync: LWW per key for user settings with HLC-based ordering
+- Notes, reviews, and user settings tables (migration V15) with soft delete support for notes and reviews
+- Client-side encryption for sync ops: AES-256-GCM with Argon2id key derivation (m=64MB, t=3, p=1)
+- Encrypted ops envelope per ADR-008: fields JSON is encrypted before leaving the device, server stores opaque blobs
+- AAD (Additional Authenticated Data) binds envelope version, entity type, entity ID, and op type to prevent payload swapping between ops
+- `SyncKey` with zeroize-on-drop for key material protection
+- `SyncOp.encrypt()` and `SyncOp.decrypt()` convenience methods for in-place encryption/decryption
+- `toku sync rekey --server <url>` command to change the sync encryption passphrase and re-encrypt all server-side ops
+- Rekey server endpoint (`POST /api/v1/rekey`): atomically replaces all ops with re-encrypted versions, updates library salt, invalidates all device cursors
+- Push lock during re-keying: server rejects push requests while a rekey is in progress to prevent corruption
+- Salt endpoint (`GET /api/v1/salt`) for clients to fetch the library's current encryption salt
+- Full-library pull endpoint (`GET /api/v1/pull/all`) for re-keying that includes the requesting device's own ops
+- Sync key storage in OS keychain alongside auth tokens
 - Sync data model: `sync_ops`, `sync_cursors`, and `sync_device` tables (migration V12) for local op-log staging
 - Hybrid Logical Clock (HLC) implementation with fixed-width canonical format for causal ordering across devices
 - `SyncRepository` for sync persistence: insert ops, query unpushed, mark pushed, device identity, cursor management

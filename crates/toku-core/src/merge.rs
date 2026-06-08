@@ -16,6 +16,11 @@ pub enum MergeOutcome {
     AppliedWithConflicts(Vec<MergeConflict>),
     /// The op was skipped (duplicate, stale, or not applicable).
     Skipped { reason: &'static str },
+    /// The op was skipped, but a conflict was stored for user review.
+    ///
+    /// This happens when the incoming op is older than local state but both
+    /// sides independently modified the same entity (e.g. notes/reviews).
+    SkippedWithConflicts(Vec<MergeConflict>),
     /// The op was rejected (e.g. invalid reading status transition).
     Rejected { reason: String },
 }
@@ -36,5 +41,21 @@ impl MergeOutcome {
     /// Returns `true` if the outcome represents a successful application.
     pub fn was_applied(&self) -> bool {
         matches!(self, Self::Applied | Self::AppliedWithConflicts(_))
+    }
+
+    /// Returns `true` if conflicts were stored (regardless of whether the op was applied).
+    pub fn has_conflicts(&self) -> bool {
+        matches!(
+            self,
+            Self::AppliedWithConflicts(_) | Self::SkippedWithConflicts(_)
+        )
+    }
+
+    /// Returns the stored conflicts, if any.
+    pub fn conflicts(&self) -> &[MergeConflict] {
+        match self {
+            Self::AppliedWithConflicts(c) | Self::SkippedWithConflicts(c) => c,
+            _ => &[],
+        }
     }
 }

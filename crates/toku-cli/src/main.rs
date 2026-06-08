@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use toku_core::{
@@ -617,6 +618,13 @@ enum SyncAction {
         /// Retention period in days (default: 30)
         #[arg(long, default_value = "30")]
         days: i64,
+    },
+
+    /// Change the sync encryption passphrase and re-encrypt all server ops
+    Rekey {
+        /// Sync server URL
+        #[arg(long)]
+        server: String,
     },
 }
 
@@ -3263,6 +3271,145 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 }
             }
             Ok(())
+        }
+        SyncAction::Rekey { server } => {
+            let token = token_store.load(&server)?.ok_or_else(|| {
+                anyhow::anyhow!("no auth token found for {server}. Run `toku sync register` first.")
+            })?;
+            let client = sync::client::SyncClient::new(&server)?;
+
+            // Prompt for old passphrase
+            eprint!("Old passphrase: ");
+            let old_passphrase =
+                rpassword::read_password().context("failed to read old passphrase")?;
+            if old_passphrase.is_empty() {
+                anyhow::bail!("old passphrase cannot be empty");
+            }
+
+            // Prompt for new passphrase (twice)
+            eprint!("New passphrase: ");
+            let new_passphrase =
+                rpassword::read_password().context("failed to read new passphrase")?;
+            if new_passphrase.is_empty() {
+                anyhow::bail!("new passphrase cannot be empty");
+            }
+            eprint!("Confirm new passphrase: ");
+            let confirm =
+                rpassword::read_password().context("failed to read passphrase confirmation")?;
+            if new_passphrase != confirm {
+                anyhow::bail!("passphrases do not match");
+            }
+
+            rt.block_on(async {
+                // Step 1: Get current salt from server
+                eprintln!("Fetching library salt...");
+                let salt_result = client.get_salt(&token).await?;
+                let old_salt_b64 = salt_result.salt.ok_or_else(|| {
+                    anyhow::anyhow!("library has no salt — encryption was never enabled")
+                })?;
+                let old_salt_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&old_salt_b64)
+                    .context("invalid salt encoding")?;
+                let old_salt: [u8; 16] = old_salt_bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid salt length"))?;
+
+                // Step 2: Derive old key
+                let old_key = toku_core::SyncKey::derive(&old_passphrase, &old_salt)
+                    .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+
+                // Step 3: Pull all ops from server
+                eprintln!("Pulling all ops from server...");
+                let pull_result = client.pull_all_ops(&token).await?;
+                let total = pull_result.ops.len();
+                eprintln!("  {} ops to re-encrypt", total);
+
+                if total == 0 {
+                    anyhow::bail!("no ops on server — nothing to re-key");
+                }
+
+                // Step 4: Derive new key with new salt
+                let new_salt = toku_core::SyncKey::generate_salt();
+                let new_key = toku_core::SyncKey::derive(&new_passphrase, &new_salt)
+                    .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+                let new_salt_b64 = base64::engine::general_purpose::STANDARD.encode(new_salt);
+
+                // Step 5: Decrypt each op with old key, re-encrypt with new key
+                eprintln!("Re-encrypting ops...");
+                let mut re_encrypted_ops = Vec::with_capacity(total);
+                for (i, wire_op) in pull_result.ops.iter().enumerate() {
+                    let mut re_wire = wire_op.clone();
+
+                    // Only process encrypted payloads
+                    if wire_op.payload.is_object() && wire_op.payload.get("ev").is_some() {
+                        let envelope: toku_core::EncryptedEnvelope =
+                            serde_json::from_value(wire_op.payload.clone())
+                                .context("invalid encrypted envelope")?;
+
+                        let entity_type: toku_core::EntityType = wire_op
+                            .entity_type
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("invalid entity_type"))?;
+                        let entity_id: uuid::Uuid = wire_op
+                            .entity_id
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("invalid entity_id: {e}"))?;
+                        let op_type: toku_core::OpType = wire_op
+                            .op_type
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("invalid op_type"))?;
+
+                        let plaintext = toku_core::decrypt_fields(
+                            &old_key,
+                            &envelope,
+                            &entity_type,
+                            &entity_id,
+                            &op_type,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "decryption failed for op {}: {e} (wrong old passphrase?)",
+                                wire_op.op_id
+                            )
+                        })?;
+
+                        let new_envelope = toku_core::encrypt_fields(
+                            &new_key,
+                            &plaintext,
+                            &entity_type,
+                            &entity_id,
+                            &op_type,
+                        )
+                        .map_err(|e| anyhow::anyhow!("re-encryption failed: {e}"))?;
+
+                        re_wire.payload = serde_json::to_value(&new_envelope)?;
+                    }
+
+                    re_encrypted_ops.push(re_wire);
+
+                    // Progress indicator every 100 ops
+                    if (i + 1) % 100 == 0 || i + 1 == total {
+                        eprint!("\r  {}/{} ops re-encrypted", i + 1, total);
+                    }
+                }
+                eprintln!();
+
+                // Step 6: Push re-encrypted ops to server
+                eprintln!("Uploading re-encrypted ops...");
+                let rekey_result = client
+                    .rekey(&token, &new_salt_b64, &re_encrypted_ops)
+                    .await
+                    .context("rekey request failed — server state unchanged")?;
+
+                // Step 7: Update local keychain with new key
+                token_store.store_sync_key(&server, new_key.as_exported_bytes())?;
+
+                eprintln!(
+                    "✓ Re-keyed {} ops with new passphrase",
+                    rekey_result.ops_replaced
+                );
+                Ok(())
+            })
         }
     }
 }

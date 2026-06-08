@@ -9,7 +9,7 @@
 //! - **Setting** — Not yet implemented (no syncable settings table)
 
 use rusqlite::{OptionalExtension, params};
-use toku_core::merge::MergeOutcome;
+use toku_core::merge::{MergeConflict, MergeOutcome};
 use toku_core::sync::{EntityType, OpType, SyncOp};
 use uuid::Uuid;
 
@@ -54,12 +54,9 @@ impl<'a> MergeEngine<'a> {
             EntityType::Session => self.merge_session(op),
             EntityType::Progress => self.merge_progress(op),
             EntityType::Tag => self.merge_tag(op),
-            EntityType::Note | EntityType::Review => Ok(MergeOutcome::Skipped {
-                reason: "note/review merge not yet implemented",
-            }),
-            EntityType::Setting => Ok(MergeOutcome::Skipped {
-                reason: "setting merge not yet implemented",
-            }),
+            EntityType::Note => self.merge_note(op),
+            EntityType::Review => self.merge_review(op),
+            EntityType::Setting => self.merge_setting(op),
             EntityType::Device => Ok(MergeOutcome::Skipped {
                 reason: "device ops handled separately",
             }),
@@ -593,6 +590,469 @@ impl<'a> MergeEngine<'a> {
     }
 
     // -----------------------------------------------------------------------
+    // Note — LWW with conflict detection
+    // -----------------------------------------------------------------------
+
+    fn merge_note(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        match op.op_type {
+            OpType::Create => self.merge_note_create(op),
+            OpType::Update => self.merge_note_update(op),
+            OpType::Delete => self.merge_note_delete(op),
+        }
+    }
+
+    fn merge_note_create(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        let note_id = op.entity_id.to_string();
+
+        let exists: bool = self.db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notes WHERE id = ?1)",
+            params![note_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return self.merge_note_update(op);
+        }
+
+        let fields = match &op.fields {
+            Some(v) if v.is_object() => v,
+            _ => {
+                return Ok(MergeOutcome::Rejected {
+                    reason: "note create op missing fields".to_string(),
+                });
+            }
+        };
+        let obj = fields.as_object().unwrap();
+
+        let book_id = obj
+            .get("book_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DbError::InvalidOperation("note missing book_id".to_string()))?;
+        let content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let now = op.created_at.to_rfc3339();
+
+        self.db.conn.execute(
+            "INSERT INTO notes (id, book_id, content, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![note_id, book_id, content, now, now],
+        )?;
+
+        Ok(MergeOutcome::Applied)
+    }
+
+    fn merge_note_update(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        let note_id = op.entity_id.to_string();
+        let hlc_str = op.hlc.to_canonical();
+        let device_id = op.device_id.to_string();
+
+        // Check note exists and is not deleted
+        let row: Option<(String, bool)> = self
+            .db
+            .conn
+            .query_row(
+                "SELECT content, deleted_at IS NOT NULL FROM notes WHERE id = ?1",
+                params![note_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((local_content, deleted)) = row else {
+            return Ok(MergeOutcome::Skipped {
+                reason: "note not found",
+            });
+        };
+        if deleted {
+            return Ok(MergeOutcome::Skipped {
+                reason: "note is deleted",
+            });
+        }
+
+        let fields = match &op.fields {
+            Some(v) if v.is_object() => v,
+            _ => {
+                return Ok(MergeOutcome::Skipped {
+                    reason: "update op has no fields",
+                });
+            }
+        };
+        let obj = fields.as_object().unwrap();
+        let new_content = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        let (local_hlc, local_device) = self.get_entity_hlc("note", &note_id, "content")?;
+
+        // Determine if this is a genuine conflict (different device edited)
+        let is_conflict = local_hlc.is_some()
+            && local_device.as_deref() != Some(&device_id)
+            && local_content != new_content;
+
+        if let Some(ref lh) = local_hlc
+            && hlc_str <= *lh
+        {
+            // Incoming is older — skip but store conflict if genuine
+            if is_conflict {
+                let conflict = self.store_conflict(
+                    &op.entity_type,
+                    &op.entity_id,
+                    "content",
+                    Some(&local_content),
+                    Some(new_content),
+                    lh,
+                    &hlc_str,
+                )?;
+                return Ok(MergeOutcome::SkippedWithConflicts(vec![conflict]));
+            }
+            return Ok(MergeOutcome::Skipped {
+                reason: "note content is up to date",
+            });
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db.conn.execute(
+            "UPDATE notes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+            params![new_content, now, note_id],
+        )?;
+        self.upsert_entity_hlc("note", &note_id, "content", &hlc_str, &device_id)?;
+
+        if is_conflict {
+            let conflict = self.store_conflict(
+                &op.entity_type,
+                &op.entity_id,
+                "content",
+                Some(&local_content),
+                Some(new_content),
+                local_hlc.as_deref().unwrap_or(""),
+                &hlc_str,
+            )?;
+            return Ok(MergeOutcome::AppliedWithConflicts(vec![conflict]));
+        }
+
+        Ok(MergeOutcome::Applied)
+    }
+
+    fn merge_note_delete(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        let note_id = op.entity_id.to_string();
+        let hlc_str = op.hlc.to_canonical();
+        let device_id = op.device_id.to_string();
+
+        let count = self.db.conn.execute(
+            "UPDATE notes SET deleted_at = ?1, deleted_by_device = ?2
+             WHERE id = ?3 AND deleted_at IS NULL",
+            params![hlc_str, device_id, note_id],
+        )?;
+
+        if count > 0 {
+            Ok(MergeOutcome::Applied)
+        } else {
+            Ok(MergeOutcome::Skipped {
+                reason: "note not found or already deleted",
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Review — LWW per field with conflict detection
+    // -----------------------------------------------------------------------
+
+    fn merge_review(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        match op.op_type {
+            OpType::Create => self.merge_review_create(op),
+            OpType::Update => self.merge_review_update(op),
+            OpType::Delete => self.merge_review_delete(op),
+        }
+    }
+
+    fn merge_review_create(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        let review_id = op.entity_id.to_string();
+
+        let exists: bool = self.db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reviews WHERE id = ?1)",
+            params![review_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return self.merge_review_update(op);
+        }
+
+        let fields = match &op.fields {
+            Some(v) if v.is_object() => v,
+            _ => {
+                return Ok(MergeOutcome::Rejected {
+                    reason: "review create op missing fields".to_string(),
+                });
+            }
+        };
+        let obj = fields.as_object().unwrap();
+
+        let book_id = obj
+            .get("book_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DbError::InvalidOperation("review missing book_id".to_string()))?;
+        let content = obj.get("content").and_then(|v| v.as_str());
+        let rating = obj.get("rating").and_then(|v| v.as_i64());
+        let now = op.created_at.to_rfc3339();
+
+        self.db.conn.execute(
+            "INSERT INTO reviews (id, book_id, content, rating, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![review_id, book_id, content, rating, now, now],
+        )?;
+
+        Ok(MergeOutcome::Applied)
+    }
+
+    fn merge_review_update(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        let review_id = op.entity_id.to_string();
+        let hlc_str = op.hlc.to_canonical();
+        let device_id = op.device_id.to_string();
+
+        // Check review exists and is not deleted
+        let row: Option<(Option<String>, Option<i64>, bool)> = self
+            .db
+            .conn
+            .query_row(
+                "SELECT content, rating, deleted_at IS NOT NULL FROM reviews WHERE id = ?1",
+                params![review_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((local_content, local_rating, deleted)) = row else {
+            return Ok(MergeOutcome::Skipped {
+                reason: "review not found",
+            });
+        };
+        if deleted {
+            return Ok(MergeOutcome::Skipped {
+                reason: "review is deleted",
+            });
+        }
+
+        let fields = match &op.fields {
+            Some(v) if v.is_object() => v,
+            _ => {
+                return Ok(MergeOutcome::Skipped {
+                    reason: "update op has no fields",
+                });
+            }
+        };
+        let obj = fields.as_object().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut applied_any = false;
+        let mut conflicts = Vec::new();
+
+        // Field: content
+        if let Some(new_content_val) = obj.get("content") {
+            let new_content = new_content_val.as_str();
+            let (lh, ld) = self.get_entity_hlc("review", &review_id, "content")?;
+
+            let is_conflict = lh.is_some()
+                && ld.as_deref() != Some(&device_id)
+                && local_content.as_deref() != new_content;
+
+            let should_apply = match &lh {
+                Some(lh) => hlc_str > *lh,
+                None => true,
+            };
+
+            if should_apply {
+                self.db.conn.execute(
+                    "UPDATE reviews SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![new_content, now, review_id],
+                )?;
+                self.upsert_entity_hlc("review", &review_id, "content", &hlc_str, &device_id)?;
+                applied_any = true;
+
+                if is_conflict {
+                    conflicts.push(self.store_conflict(
+                        &op.entity_type,
+                        &op.entity_id,
+                        "content",
+                        local_content.as_deref(),
+                        new_content,
+                        lh.as_deref().unwrap_or(""),
+                        &hlc_str,
+                    )?);
+                }
+            } else if is_conflict {
+                conflicts.push(self.store_conflict(
+                    &op.entity_type,
+                    &op.entity_id,
+                    "content",
+                    local_content.as_deref(),
+                    new_content,
+                    lh.as_deref().unwrap_or(""),
+                    &hlc_str,
+                )?);
+            }
+        }
+
+        // Field: rating
+        if let Some(new_rating_val) = obj.get("rating") {
+            let new_rating = new_rating_val.as_i64();
+            let (lh, ld) = self.get_entity_hlc("review", &review_id, "rating")?;
+
+            let local_rating_str = local_rating.map(|r| r.to_string());
+            let new_rating_str = new_rating.map(|r| r.to_string());
+            let is_conflict = lh.is_some()
+                && ld.as_deref() != Some(&device_id)
+                && local_rating_str != new_rating_str;
+
+            let should_apply = match &lh {
+                Some(lh) => hlc_str > *lh,
+                None => true,
+            };
+
+            if should_apply {
+                self.db.conn.execute(
+                    "UPDATE reviews SET rating = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![new_rating, now, review_id],
+                )?;
+                self.upsert_entity_hlc("review", &review_id, "rating", &hlc_str, &device_id)?;
+                applied_any = true;
+
+                if is_conflict {
+                    conflicts.push(self.store_conflict(
+                        &op.entity_type,
+                        &op.entity_id,
+                        "rating",
+                        local_rating_str.as_deref(),
+                        new_rating_str.as_deref(),
+                        lh.as_deref().unwrap_or(""),
+                        &hlc_str,
+                    )?);
+                }
+            } else if is_conflict {
+                conflicts.push(self.store_conflict(
+                    &op.entity_type,
+                    &op.entity_id,
+                    "rating",
+                    local_rating_str.as_deref(),
+                    new_rating_str.as_deref(),
+                    lh.as_deref().unwrap_or(""),
+                    &hlc_str,
+                )?);
+            }
+        }
+
+        if !conflicts.is_empty() {
+            if applied_any {
+                return Ok(MergeOutcome::AppliedWithConflicts(conflicts));
+            } else {
+                return Ok(MergeOutcome::SkippedWithConflicts(conflicts));
+            }
+        }
+        if applied_any {
+            Ok(MergeOutcome::Applied)
+        } else {
+            Ok(MergeOutcome::Skipped {
+                reason: "all review fields are up to date",
+            })
+        }
+    }
+
+    fn merge_review_delete(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        let review_id = op.entity_id.to_string();
+        let hlc_str = op.hlc.to_canonical();
+        let device_id = op.device_id.to_string();
+
+        let count = self.db.conn.execute(
+            "UPDATE reviews SET deleted_at = ?1, deleted_by_device = ?2
+             WHERE id = ?3 AND deleted_at IS NULL",
+            params![hlc_str, device_id, review_id],
+        )?;
+
+        if count > 0 {
+            Ok(MergeOutcome::Applied)
+        } else {
+            Ok(MergeOutcome::Skipped {
+                reason: "review not found or already deleted",
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Setting — LWW per key
+    // -----------------------------------------------------------------------
+
+    fn merge_setting(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        match op.op_type {
+            OpType::Create => self.merge_setting_upsert(op),
+            OpType::Update => self.merge_setting_upsert(op),
+            OpType::Delete => self.merge_setting_delete(op),
+        }
+    }
+
+    fn merge_setting_upsert(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        let setting_id = op.entity_id.to_string();
+        let hlc_str = op.hlc.to_canonical();
+
+        let fields = match &op.fields {
+            Some(v) if v.is_object() => v,
+            _ => {
+                return Ok(MergeOutcome::Rejected {
+                    reason: "setting op missing fields".to_string(),
+                });
+            }
+        };
+        let obj = fields.as_object().unwrap();
+
+        let key = obj
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DbError::InvalidOperation("setting missing key".to_string()))?;
+        let value = obj
+            .get("value")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DbError::InvalidOperation("setting missing value".to_string()))?;
+
+        // Check if setting exists and compare HLC
+        let existing: Option<(String, Option<String>)> = self
+            .db
+            .conn
+            .query_row(
+                "SELECT value, sync_hlc FROM user_settings WHERE id = ?1",
+                params![setting_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if let Some((_, Some(ref lh))) = existing
+            && hlc_str <= *lh
+        {
+            return Ok(MergeOutcome::Skipped {
+                reason: "setting is up to date",
+            });
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db.conn.execute(
+            "INSERT INTO user_settings (id, key, value, sync_hlc, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET value = ?3, sync_hlc = ?4, updated_at = ?5
+             WHERE sync_hlc IS NULL OR sync_hlc < ?4",
+            params![setting_id, key, value, hlc_str, now],
+        )?;
+
+        Ok(MergeOutcome::Applied)
+    }
+
+    fn merge_setting_delete(&self, op: &SyncOp) -> Result<MergeOutcome, DbError> {
+        let setting_id = op.entity_id.to_string();
+
+        let count = self.db.conn.execute(
+            "DELETE FROM user_settings WHERE id = ?1",
+            params![setting_id],
+        )?;
+
+        if count > 0 {
+            Ok(MergeOutcome::Applied)
+        } else {
+            Ok(MergeOutcome::Skipped {
+                reason: "setting not found",
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -606,6 +1066,94 @@ impl<'a> MergeEngine<'a> {
             params![book_id, field_name, hlc],
         )?;
         Ok(())
+    }
+
+    /// Upsert an entity-level HLC record for non-book entities.
+    fn upsert_entity_hlc(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        field_name: &str,
+        hlc: &str,
+        device_id: &str,
+    ) -> Result<(), DbError> {
+        self.db.conn.execute(
+            "INSERT INTO sync_entity_hlc (entity_type, entity_id, field_name, sync_hlc, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (entity_type, entity_id, field_name) DO UPDATE
+             SET sync_hlc = ?4, device_id = ?5
+             WHERE sync_hlc < ?4",
+            params![entity_type, entity_id, field_name, hlc, device_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get the current HLC and device for an entity field.
+    fn get_entity_hlc(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        field_name: &str,
+    ) -> Result<(Option<String>, Option<String>), DbError> {
+        let result: Option<(String, Option<String>)> = self
+            .db
+            .conn
+            .query_row(
+                "SELECT sync_hlc, device_id FROM sync_entity_hlc
+                 WHERE entity_type = ?1 AND entity_id = ?2 AND field_name = ?3",
+                params![entity_type, entity_id, field_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        match result {
+            Some((hlc, device)) => Ok((Some(hlc), device)),
+            None => Ok((None, None)),
+        }
+    }
+
+    /// Store a conflict in the sync_conflicts table for user review.
+    #[allow(clippy::too_many_arguments)]
+    fn store_conflict(
+        &self,
+        entity_type: &EntityType,
+        entity_id: &Uuid,
+        field_name: &str,
+        local_value: Option<&str>,
+        remote_value: Option<&str>,
+        local_hlc: &str,
+        remote_hlc: &str,
+    ) -> Result<MergeConflict, DbError> {
+        let conflict_id = Uuid::now_v7().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        self.db.conn.execute(
+            "INSERT OR IGNORE INTO sync_conflicts
+             (id, entity_type, entity_id, field_name, local_value, remote_value,
+              local_hlc, remote_hlc, resolved, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+            params![
+                conflict_id,
+                entity_type.as_str(),
+                entity_id.to_string(),
+                field_name,
+                local_value,
+                remote_value,
+                local_hlc,
+                remote_hlc,
+                now,
+            ],
+        )?;
+
+        Ok(MergeConflict {
+            entity_type: *entity_type,
+            entity_id: *entity_id,
+            field_name: field_name.to_string(),
+            local_value: local_value.map(|s| s.to_string()),
+            remote_value: remote_value.map(|s| s.to_string()),
+            local_hlc: local_hlc.to_string(),
+            remote_hlc: remote_hlc.to_string(),
+        })
     }
 }
 
@@ -1569,8 +2117,78 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    // -------------------------------------------------------------------
+    // Note — LWW with conflict detection
+    // -------------------------------------------------------------------
+
+    fn make_note_create(
+        device_id: uuid::Uuid,
+        hlc: HlcTimestamp,
+        note_id: uuid::Uuid,
+        book_id: uuid::Uuid,
+        content: &str,
+    ) -> SyncOp {
+        SyncOp::new(
+            device_id,
+            hlc,
+            EntityType::Note,
+            note_id,
+            OpType::Create,
+            Some(serde_json::json!({
+                "book_id": book_id.to_string(),
+                "content": content,
+            })),
+        )
+    }
+
+    fn make_note_update(
+        device_id: uuid::Uuid,
+        hlc: HlcTimestamp,
+        note_id: uuid::Uuid,
+        content: &str,
+    ) -> SyncOp {
+        SyncOp::new(
+            device_id,
+            hlc,
+            EntityType::Note,
+            note_id,
+            OpType::Update,
+            Some(serde_json::json!({
+                "content": content,
+            })),
+        )
+    }
+
     #[test]
-    fn note_review_merge_skipped_for_now() {
+    fn note_create_inserts_new() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+        let book_id = Uuid::now_v7();
+        let note_id = Uuid::now_v7();
+
+        let create = make_book_create(dev_a, clock.now(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+
+        let op = make_note_create(dev_a, clock.now(), note_id, book_id, "Great book");
+        let result = engine.apply_op(&op).unwrap();
+        assert!(result.was_applied());
+        assert!(!result.has_conflicts());
+
+        let content: String = db
+            .conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                params![note_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "Great book");
+    }
+
+    #[test]
+    fn note_create_missing_fields_rejected() {
         let db = setup_db();
         let engine = MergeEngine::new(&db);
         let dev_a = Uuid::now_v7();
@@ -1585,18 +2203,758 @@ mod tests {
             None,
         );
         let result = engine.apply_op(&op).unwrap();
-        assert!(matches!(result, MergeOutcome::Skipped { .. }));
+        assert!(matches!(result, MergeOutcome::Rejected { .. }));
+    }
+
+    #[test]
+    fn note_update_from_same_device_no_conflict() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+        let book_id = Uuid::now_v7();
+        let note_id = Uuid::now_v7();
+
+        let create = make_book_create(dev_a, clock.now(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+
+        let op = make_note_create(dev_a, clock.now(), note_id, book_id, "Draft 1");
+        engine.apply_op(&op).unwrap();
+
+        // Same device updates note — no conflict
+        let update = make_note_update(dev_a, clock.now(), note_id, "Draft 2");
+        let result = engine.apply_op(&update).unwrap();
+        assert!(result.was_applied());
+        assert!(!result.has_conflicts());
+
+        let content: String = db
+            .conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                params![note_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "Draft 2");
+    }
+
+    #[test]
+    fn note_two_devices_conflict_detected() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let dev_b = Uuid::now_v7();
+        let book_id = Uuid::now_v7();
+        let note_id = Uuid::now_v7();
+
+        // Device A creates book and note
+        let hlc_create = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let create = make_book_create(dev_a, hlc_create.clone(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+
+        let hlc_note = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let note_create = make_note_create(dev_a, hlc_note, note_id, book_id, "Original");
+        engine.apply_op(&note_create).unwrap();
+
+        // Device A updates note at T1
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let op_a = make_note_update(dev_a, hlc_a, note_id, "Edit from A");
+        engine.apply_op(&op_a).unwrap();
+
+        // Device B updates note at T2 (later) — conflict: both devices edited
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
+        let op_b = make_note_update(dev_b, hlc_b, note_id, "Edit from B");
+        let result = engine.apply_op(&op_b).unwrap();
+
+        // B's edit wins (newer HLC), but conflict is stored
+        assert!(result.was_applied());
+        assert!(result.has_conflicts());
+        let conflicts = result.conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].field_name, "content");
+        assert_eq!(conflicts[0].local_value.as_deref(), Some("Edit from A"));
+        assert_eq!(conflicts[0].remote_value.as_deref(), Some("Edit from B"));
+
+        // Note content should be B's edit
+        let content: String = db
+            .conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                params![note_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "Edit from B");
+
+        // Conflict should be in sync_conflicts table
+        let conflict_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_conflicts
+                 WHERE entity_type = 'note' AND entity_id = ?1",
+                params![note_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conflict_count, 1);
+    }
+
+    #[test]
+    fn note_two_devices_older_edit_skipped_with_conflict() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let dev_b = Uuid::now_v7();
+        let book_id = Uuid::now_v7();
+        let note_id = Uuid::now_v7();
+
+        // Setup: create book and note
+        let hlc_0 = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let create = make_book_create(dev_a, hlc_0.clone(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+        let note_op = make_note_create(dev_a, hlc_0, note_id, book_id, "Original");
+        engine.apply_op(&note_op).unwrap();
+
+        // Device A edits at T2 (later)
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let op_a = make_note_update(dev_a, hlc_a, note_id, "Latest from A");
+        engine.apply_op(&op_a).unwrap();
+
+        // Device B edits at T1 (earlier) — arrives after A's edit
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
+        let op_b = make_note_update(dev_b, hlc_b, note_id, "Older from B");
+        let result = engine.apply_op(&op_b).unwrap();
+
+        // B's edit is skipped (older HLC), but conflict is stored
+        assert!(!result.was_applied());
+        assert!(result.has_conflicts());
+        assert!(matches!(result, MergeOutcome::SkippedWithConflicts(_)));
+
+        // Note content should still be A's edit
+        let content: String = db
+            .conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                params![note_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "Latest from A");
+    }
+
+    #[test]
+    fn note_delete_sets_tombstone() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+        let book_id = Uuid::now_v7();
+        let note_id = Uuid::now_v7();
+
+        let create = make_book_create(dev_a, clock.now(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+        let note = make_note_create(dev_a, clock.now(), note_id, book_id, "A note");
+        engine.apply_op(&note).unwrap();
+
+        let del = SyncOp::new(
+            dev_a,
+            clock.now(),
+            EntityType::Note,
+            note_id,
+            OpType::Delete,
+            None,
+        );
+        let result = engine.apply_op(&del).unwrap();
+        assert!(result.was_applied());
+
+        let deleted: bool = db
+            .conn
+            .query_row(
+                "SELECT deleted_at IS NOT NULL FROM notes WHERE id = ?1",
+                params![note_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(deleted);
+    }
+
+    #[test]
+    fn note_update_after_delete_is_skipped() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+        let book_id = Uuid::now_v7();
+        let note_id = Uuid::now_v7();
+
+        let create = make_book_create(dev_a, clock.now(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+        let note = make_note_create(dev_a, clock.now(), note_id, book_id, "A note");
+        engine.apply_op(&note).unwrap();
+
+        let del = SyncOp::new(
+            dev_a,
+            clock.now(),
+            EntityType::Note,
+            note_id,
+            OpType::Delete,
+            None,
+        );
+        engine.apply_op(&del).unwrap();
+
+        let update = make_note_update(dev_a, clock.now(), note_id, "Updated after delete");
+        let result = engine.apply_op(&update).unwrap();
+        assert!(matches!(result, MergeOutcome::Skipped { reason } if reason == "note is deleted"));
+    }
+
+    // -------------------------------------------------------------------
+    // Review — LWW per field with conflict detection
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn review_create_inserts_new() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+        let book_id = Uuid::now_v7();
+        let review_id = Uuid::now_v7();
+
+        let create = make_book_create(dev_a, clock.now(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
 
         let op = SyncOp::new(
             dev_a,
             clock.now(),
             EntityType::Review,
-            Uuid::now_v7(),
+            review_id,
+            OpType::Create,
+            Some(serde_json::json!({
+                "book_id": book_id.to_string(),
+                "content": "Amazing book",
+                "rating": 9,
+            })),
+        );
+        let result = engine.apply_op(&op).unwrap();
+        assert!(result.was_applied());
+
+        let (content, rating): (Option<String>, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT content, rating FROM reviews WHERE id = ?1",
+                params![review_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(content.as_deref(), Some("Amazing book"));
+        assert_eq!(rating, Some(9));
+    }
+
+    #[test]
+    fn review_two_devices_different_fields_no_conflict() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let dev_b = Uuid::now_v7();
+        let book_id = Uuid::now_v7();
+        let review_id = Uuid::now_v7();
+
+        // Create book and review
+        let hlc_0 = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let create = make_book_create(dev_a, hlc_0.clone(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+
+        let review_create = SyncOp::new(
+            dev_a,
+            hlc_0,
+            EntityType::Review,
+            review_id,
+            OpType::Create,
+            Some(serde_json::json!({
+                "book_id": book_id.to_string(),
+                "content": "Good",
+                "rating": 7,
+            })),
+        );
+        engine.apply_op(&review_create).unwrap();
+
+        // Device A edits content
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let op_a = SyncOp::new(
+            dev_a,
+            hlc_a,
+            EntityType::Review,
+            review_id,
             OpType::Update,
+            Some(serde_json::json!({"content": "Updated review text"})),
+        );
+        engine.apply_op(&op_a).unwrap();
+
+        // Device B edits rating (different field — no conflict)
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
+        let op_b = SyncOp::new(
+            dev_b,
+            hlc_b,
+            EntityType::Review,
+            review_id,
+            OpType::Update,
+            Some(serde_json::json!({"rating": 9})),
+        );
+        let result = engine.apply_op(&op_b).unwrap();
+        assert!(result.was_applied());
+        assert!(!result.has_conflicts());
+
+        let (content, rating): (Option<String>, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT content, rating FROM reviews WHERE id = ?1",
+                params![review_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(content.as_deref(), Some("Updated review text"));
+        assert_eq!(rating, Some(9));
+    }
+
+    #[test]
+    fn review_two_devices_same_field_conflict_detected() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let dev_b = Uuid::now_v7();
+        let book_id = Uuid::now_v7();
+        let review_id = Uuid::now_v7();
+
+        let hlc_0 = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let create = make_book_create(dev_a, hlc_0.clone(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+
+        let review_create = SyncOp::new(
+            dev_a,
+            hlc_0,
+            EntityType::Review,
+            review_id,
+            OpType::Create,
+            Some(serde_json::json!({
+                "book_id": book_id.to_string(),
+                "content": "Original",
+                "rating": 7,
+            })),
+        );
+        engine.apply_op(&review_create).unwrap();
+
+        // Device A edits content
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let op_a = SyncOp::new(
+            dev_a,
+            hlc_a,
+            EntityType::Review,
+            review_id,
+            OpType::Update,
+            Some(serde_json::json!({"content": "Review from A"})),
+        );
+        engine.apply_op(&op_a).unwrap();
+
+        // Device B also edits content (later HLC — wins, but conflict stored)
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
+        let op_b = SyncOp::new(
+            dev_b,
+            hlc_b,
+            EntityType::Review,
+            review_id,
+            OpType::Update,
+            Some(serde_json::json!({"content": "Review from B"})),
+        );
+        let result = engine.apply_op(&op_b).unwrap();
+
+        assert!(result.was_applied());
+        assert!(result.has_conflicts());
+        let conflicts = result.conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].field_name, "content");
+
+        let content: String = db
+            .conn
+            .query_row(
+                "SELECT content FROM reviews WHERE id = ?1",
+                params![review_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "Review from B");
+    }
+
+    #[test]
+    fn review_delete_sets_tombstone() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+        let book_id = Uuid::now_v7();
+        let review_id = Uuid::now_v7();
+
+        let create = make_book_create(dev_a, clock.now(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+
+        let review = SyncOp::new(
+            dev_a,
+            clock.now(),
+            EntityType::Review,
+            review_id,
+            OpType::Create,
+            Some(serde_json::json!({
+                "book_id": book_id.to_string(),
+                "content": "Great",
+            })),
+        );
+        engine.apply_op(&review).unwrap();
+
+        let del = SyncOp::new(
+            dev_a,
+            clock.now(),
+            EntityType::Review,
+            review_id,
+            OpType::Delete,
+            None,
+        );
+        let result = engine.apply_op(&del).unwrap();
+        assert!(result.was_applied());
+
+        let deleted: bool = db
+            .conn
+            .query_row(
+                "SELECT deleted_at IS NOT NULL FROM reviews WHERE id = ?1",
+                params![review_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(deleted);
+    }
+
+    // -------------------------------------------------------------------
+    // Setting — LWW per key
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn setting_create_inserts_new() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+        let setting_id = Uuid::now_v7();
+
+        let op = SyncOp::new(
+            dev_a,
+            clock.now(),
+            EntityType::Setting,
+            setting_id,
+            OpType::Create,
+            Some(serde_json::json!({
+                "key": "theme",
+                "value": "dark",
+            })),
+        );
+        let result = engine.apply_op(&op).unwrap();
+        assert!(result.was_applied());
+
+        let value: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM user_settings WHERE id = ?1",
+                params![setting_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "dark");
+    }
+
+    #[test]
+    fn setting_lww_later_wins() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let dev_b = Uuid::now_v7();
+        let setting_id = Uuid::now_v7();
+
+        // Device A sets theme=dark at T1
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let op_a = SyncOp::new(
+            dev_a,
+            hlc_a,
+            EntityType::Setting,
+            setting_id,
+            OpType::Create,
+            Some(serde_json::json!({"key": "theme", "value": "dark"})),
+        );
+        engine.apply_op(&op_a).unwrap();
+
+        // Device B sets theme=light at T2 (later — wins)
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
+        let op_b = SyncOp::new(
+            dev_b,
+            hlc_b,
+            EntityType::Setting,
+            setting_id,
+            OpType::Update,
+            Some(serde_json::json!({"key": "theme", "value": "light"})),
+        );
+        let result = engine.apply_op(&op_b).unwrap();
+        assert!(result.was_applied());
+
+        let value: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM user_settings WHERE id = ?1",
+                params![setting_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "light");
+    }
+
+    #[test]
+    fn setting_lww_older_skipped() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let dev_b = Uuid::now_v7();
+        let setting_id = Uuid::now_v7();
+
+        // Device A sets theme=dark at T2 (later)
+        let hlc_a = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "aaaaaaaaaaaa",
+        );
+        let op_a = SyncOp::new(
+            dev_a,
+            hlc_a,
+            EntityType::Setting,
+            setting_id,
+            OpType::Create,
+            Some(serde_json::json!({"key": "theme", "value": "dark"})),
+        );
+        engine.apply_op(&op_a).unwrap();
+
+        // Device B sets theme=light at T1 (earlier — skipped)
+        let hlc_b = HlcTimestamp::new(
+            chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            0,
+            "bbbbbbbbbbbb",
+        );
+        let op_b = SyncOp::new(
+            dev_b,
+            hlc_b,
+            EntityType::Setting,
+            setting_id,
+            OpType::Update,
+            Some(serde_json::json!({"key": "theme", "value": "light"})),
+        );
+        let result = engine.apply_op(&op_b).unwrap();
+        assert!(matches!(result, MergeOutcome::Skipped { .. }));
+
+        let value: String = db
+            .conn
+            .query_row(
+                "SELECT value FROM user_settings WHERE id = ?1",
+                params![setting_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "dark");
+    }
+
+    #[test]
+    fn setting_delete_removes() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+        let setting_id = Uuid::now_v7();
+
+        let create = SyncOp::new(
+            dev_a,
+            clock.now(),
+            EntityType::Setting,
+            setting_id,
+            OpType::Create,
+            Some(serde_json::json!({"key": "theme", "value": "dark"})),
+        );
+        engine.apply_op(&create).unwrap();
+
+        let del = SyncOp::new(
+            dev_a,
+            clock.now(),
+            EntityType::Setting,
+            setting_id,
+            OpType::Delete,
+            None,
+        );
+        let result = engine.apply_op(&del).unwrap();
+        assert!(result.was_applied());
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_settings WHERE id = ?1",
+                params![setting_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn setting_missing_fields_rejected() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let mut clock = make_clock(&dev_a);
+
+        let op = SyncOp::new(
+            dev_a,
+            clock.now(),
+            EntityType::Setting,
+            Uuid::now_v7(),
+            OpType::Create,
             None,
         );
         let result = engine.apply_op(&op).unwrap();
-        assert!(matches!(result, MergeOutcome::Skipped { .. }));
+        assert!(matches!(result, MergeOutcome::Rejected { .. }));
+    }
+
+    // -------------------------------------------------------------------
+    // Two-device note scenarios
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn two_devices_edit_different_notes_no_conflict() {
+        let db = setup_db();
+        let engine = MergeEngine::new(&db);
+        let dev_a = Uuid::now_v7();
+        let dev_b = Uuid::now_v7();
+        let mut clock_a = make_clock(&dev_a);
+        let mut clock_b = make_clock(&dev_b);
+        let book_id = Uuid::now_v7();
+        let note_a = Uuid::now_v7();
+        let note_b = Uuid::now_v7();
+
+        let create = make_book_create(dev_a, clock_a.now(), book_id, "Dune");
+        engine.apply_op(&create).unwrap();
+
+        // Device A creates note A
+        let op_a = make_note_create(dev_a, clock_a.now(), note_a, book_id, "Note A");
+        engine.apply_op(&op_a).unwrap();
+
+        // Device B creates note B (different note — no conflict)
+        let op_b = make_note_create(dev_b, clock_b.now(), note_b, book_id, "Note B");
+        let result = engine.apply_op(&op_b).unwrap();
+        assert!(result.was_applied());
+        assert!(!result.has_conflicts());
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE book_id = ?1",
+                params![book_id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

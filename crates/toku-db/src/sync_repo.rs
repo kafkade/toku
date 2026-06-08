@@ -266,6 +266,7 @@ impl SyncOpRow {
             entity_id,
             op_type,
             fields,
+            encrypted: None,
             checksum: self.checksum,
             created_at,
         })

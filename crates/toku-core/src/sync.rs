@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::crypto::EncryptedEnvelope;
+
 // ---------------------------------------------------------------------------
 // HLC Timestamp
 // ---------------------------------------------------------------------------
@@ -328,8 +330,14 @@ pub struct SyncOp {
     pub entity_id: Uuid,
     /// The type of mutation.
     pub op_type: OpType,
-    /// Field-level changes as a canonical JSON object. `None` for deletes.
+    /// Field-level changes as a canonical JSON object. `None` for deletes
+    /// or when encryption is enabled (see `encrypted`).
     pub fields: Option<serde_json::Value>,
+    /// Encrypted fields envelope. Present when client-side encryption is
+    /// enabled; `fields` is `None` in this case. Mutually exclusive with
+    /// `fields` (except for deletes where both may be `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<EncryptedEnvelope>,
     /// SHA-256 hash of the canonical op (without the checksum field).
     pub checksum: String,
     /// When this op was created locally.
@@ -355,6 +363,7 @@ impl SyncOp {
             entity_id,
             op_type,
             fields,
+            encrypted: None,
             checksum: String::new(),
             created_at: Utc::now(),
         };
@@ -365,7 +374,8 @@ impl SyncOp {
     /// Compute the SHA-256 checksum of this op's canonical representation.
     ///
     /// The checksum covers all fields except `checksum` itself, serialized
-    /// as a canonical JSON object with sorted keys.
+    /// as a canonical JSON object with sorted keys. When encryption is
+    /// enabled, `encrypted` replaces `fields` in the checksum input.
     pub fn compute_checksum(&self) -> String {
         let mut map = BTreeMap::new();
         map.insert("v", serde_json::json!(self.v));
@@ -375,10 +385,20 @@ impl SyncOp {
         map.insert("entity_type", serde_json::json!(self.entity_type.as_str()));
         map.insert("entity_id", serde_json::json!(self.entity_id.to_string()));
         map.insert("op_type", serde_json::json!(self.op_type.as_str()));
-        map.insert(
-            "fields",
-            self.fields.clone().unwrap_or(serde_json::Value::Null),
-        );
+
+        if let Some(ref enc) = self.encrypted {
+            map.insert(
+                "encrypted",
+                serde_json::to_value(enc).expect("EncryptedEnvelope serialization cannot fail"),
+            );
+            map.insert("fields", serde_json::Value::Null);
+        } else {
+            map.insert(
+                "fields",
+                self.fields.clone().unwrap_or(serde_json::Value::Null),
+            );
+        }
+
         map.insert(
             "created_at",
             serde_json::json!(self.created_at.to_rfc3339()),
@@ -392,6 +412,48 @@ impl SyncOp {
     /// Verify this op's checksum is correct.
     pub fn verify_checksum(&self) -> bool {
         self.checksum == self.compute_checksum()
+    }
+
+    /// Encrypt this op's `fields` in place, replacing them with an
+    /// [`EncryptedEnvelope`]. The checksum is recomputed after encryption.
+    ///
+    /// No-op if `fields` is already `None` (e.g. delete ops).
+    pub fn encrypt(&mut self, key: &crate::crypto::SyncKey) -> Result<(), crate::TokuError> {
+        let Some(ref fields) = self.fields else {
+            return Ok(());
+        };
+        let envelope = crate::crypto::encrypt_fields(
+            key,
+            fields,
+            &self.entity_type,
+            &self.entity_id,
+            &self.op_type,
+        )?;
+        self.encrypted = Some(envelope);
+        self.fields = None;
+        self.checksum = self.compute_checksum();
+        Ok(())
+    }
+
+    /// Decrypt this op's encrypted envelope in place, restoring `fields`.
+    /// The checksum is recomputed after decryption.
+    ///
+    /// No-op if there is no encrypted envelope.
+    pub fn decrypt(&mut self, key: &crate::crypto::SyncKey) -> Result<(), crate::TokuError> {
+        let Some(ref envelope) = self.encrypted else {
+            return Ok(());
+        };
+        let fields = crate::crypto::decrypt_fields(
+            key,
+            envelope,
+            &self.entity_type,
+            &self.entity_id,
+            &self.op_type,
+        )?;
+        self.fields = Some(fields);
+        self.encrypted = None;
+        self.checksum = self.compute_checksum();
+        Ok(())
     }
 }
 

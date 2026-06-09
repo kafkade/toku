@@ -480,6 +480,42 @@ impl DeviceIdentity {
 }
 
 // ---------------------------------------------------------------------------
+// Library Snapshot
+// ---------------------------------------------------------------------------
+
+/// A point-in-time snapshot of the entire library state.
+///
+/// Used for snapshot compaction (pruning old ops) and bootstrapping new
+/// devices without replaying the full op history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibrarySnapshot {
+    /// Snapshot format version (currently 1).
+    pub version: u16,
+    /// When this snapshot was created.
+    pub created_at: DateTime<Utc>,
+    /// The device that created this snapshot.
+    pub created_by_device: Uuid,
+    /// HLC at the time of snapshot. Ops older than this can be pruned.
+    pub hlc_at_snapshot: String,
+    /// The complete library state.
+    pub library: SnapshotLibrary,
+}
+
+/// The library content within a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotLibrary {
+    pub books: Vec<serde_json::Value>,
+    pub book_authors: Vec<serde_json::Value>,
+    pub sessions: Vec<serde_json::Value>,
+    pub progress: Vec<serde_json::Value>,
+    pub tags: Vec<serde_json::Value>,
+    pub book_tags: Vec<serde_json::Value>,
+    pub notes: Vec<serde_json::Value>,
+    pub reviews: Vec<serde_json::Value>,
+    pub settings: Vec<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -35,6 +35,12 @@ pub struct RekeyRequest {
     pub ops: Vec<OpPayload>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UploadSnapshotRequest {
+    pub snapshot_json: String,
+    pub hlc_at_snapshot: String,
+}
+
 // ── Responses ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -81,4 +87,18 @@ pub struct ErrorBody {
 pub struct RekeyResponse {
     pub ops_replaced: usize,
     pub new_salt: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UploadSnapshotResponse {
+    pub ops_pruned: usize,
+    pub hlc_at_snapshot: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DownloadSnapshotResponse {
+    pub snapshot_json: String,
+    pub hlc_at_snapshot: String,
+    pub created_at: String,
+    pub created_by_device: String,
 }

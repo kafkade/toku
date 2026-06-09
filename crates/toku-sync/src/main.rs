@@ -25,7 +25,8 @@ fn build_router(db_path: PathBuf) -> Router {
         .route("/api/v1/pull", get(handlers::pull_ops))
         .route("/api/v1/pull/all", get(handlers::pull_all_ops))
         .route("/api/v1/salt", get(handlers::get_salt))
-        .route("/api/v1/snapshot", get(handlers::snapshot))
+        .route("/api/v1/snapshot", get(handlers::download_snapshot))
+        .route("/api/v1/snapshot", post(handlers::upload_snapshot))
         .route("/api/v1/rekey", post(handlers::rekey))
         .layer(middleware::from_fn_with_state(
             db_path.clone(),
@@ -527,7 +528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_returns_501() {
+    async fn snapshot_download_returns_404_when_none_exists() {
         let db_path = test_db_path();
         let app = build_router(db_path.clone());
 
@@ -567,7 +568,147 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        cleanup(&db_path);
+    }
+
+    #[tokio::test]
+    async fn snapshot_upload_and_download_round_trip() {
+        let db_path = test_db_path();
+        let app = build_router(db_path.clone());
+
+        // Register
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "lib-snap",
+                            "device_name": "dev"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let register: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let token = register["auth_token"].as_str().unwrap().to_string();
+
+        // Push some ops first
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/push")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "ops": [
+                                {
+                                    "op_id": "snap-op-1",
+                                    "device_id": "d1",
+                                    "hlc": "2026-01-01T00:00:00.000Z-0001-aaaaaaaaaaaa",
+                                    "entity_type": "book",
+                                    "entity_id": "b1",
+                                    "op_type": "create",
+                                    "payload": {"title": "Dune"}
+                                },
+                                {
+                                    "op_id": "snap-op-2",
+                                    "device_id": "d1",
+                                    "hlc": "2026-01-01T00:00:01.000Z-0001-aaaaaaaaaaaa",
+                                    "entity_type": "book",
+                                    "entity_id": "b1",
+                                    "op_type": "update",
+                                    "payload": {"rating": 9}
+                                }
+                            ]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Upload a snapshot at a HLC that covers the first op
+        let snapshot_hlc = "2026-01-01T00:00:00.500Z-0000-aaaaaaaaaaaa";
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/snapshot")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "snapshot_json": "{\"version\":1,\"books\":[{\"title\":\"Dune\"}]}",
+                            "hlc_at_snapshot": snapshot_hlc,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let upload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // First op (hlc ...00.000Z) should be pruned, second (...01.000Z) kept
+        assert_eq!(upload["ops_pruned"], 1);
+
+        // Download the snapshot
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/snapshot")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let download: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(download["hlc_at_snapshot"], snapshot_hlc);
+        assert!(download["snapshot_json"].as_str().unwrap().contains("Dune"));
+
+        // Verify the first op was pruned — pull/all should only return the second
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/pull/all")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pull: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ops = pull["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["op_id"], "snap-op-2");
 
         cleanup(&db_path);
     }

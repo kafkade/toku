@@ -35,3 +35,4 @@ csv = "1"
 uuid.workspace = true
 rpassword = "5"
 base64 = "0.22"
+hostname = "0.4"

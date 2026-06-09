@@ -7,8 +7,9 @@ use crate::auth::{AuthDevice, sha256_hex};
 use crate::db::SyncDatabase;
 use crate::error::SyncError;
 use crate::models::{
-    DeviceResponse, HealthResponse, OpPayload, PullQuery, PullResponse, PushRequest, PushResponse,
-    RegisterRequest, RegisterResponse, RekeyRequest, RekeyResponse,
+    DeviceResponse, DownloadSnapshotResponse, HealthResponse, OpPayload, PullQuery, PullResponse,
+    PushRequest, PushResponse, RegisterRequest, RegisterResponse, RekeyRequest, RekeyResponse,
+    UploadSnapshotRequest, UploadSnapshotResponse,
 };
 
 const MAX_BATCH_SIZE: usize = 1000;
@@ -347,13 +348,104 @@ pub async fn pull_ops(
 
 // ── Snapshot / Salt ─────────────────────────────────────────────────────────
 
-pub async fn snapshot() -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    (
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "snapshots are not yet implemented"
-        })),
-    )
+// ── Snapshot ────────────────────────────────────────────────────────────────
+
+/// Download the latest snapshot for this library.
+pub async fn download_snapshot(
+    State(db_path): State<PathBuf>,
+    device: AuthDevice,
+) -> Result<Json<DownloadSnapshotResponse>, SyncError> {
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let library_id = device.library_id.clone();
+        move || -> Result<DownloadSnapshotResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let row: Option<(String, String, String, String)> = db
+                .conn
+                .query_row(
+                    "SELECT snapshot_json, hlc_at_snapshot, created_at, created_by_device
+                     FROM snapshots
+                     WHERE library_id = ?1
+                     ORDER BY created_at DESC
+                     LIMIT 1",
+                    [&library_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .ok();
+
+            match row {
+                Some((snapshot_json, hlc, created_at, device_id)) => Ok(DownloadSnapshotResponse {
+                    snapshot_json,
+                    hlc_at_snapshot: hlc,
+                    created_at,
+                    created_by_device: device_id,
+                }),
+                None => Err(SyncError::NotFound("no snapshot available".into())),
+            }
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
+}
+
+/// Upload a snapshot and prune ops older than the snapshot HLC.
+pub async fn upload_snapshot(
+    State(db_path): State<PathBuf>,
+    device: AuthDevice,
+    Json(req): Json<UploadSnapshotRequest>,
+) -> Result<Json<UploadSnapshotResponse>, SyncError> {
+    if req.snapshot_json.is_empty() {
+        return Err(SyncError::BadRequest("snapshot_json is required".into()));
+    }
+    if req.hlc_at_snapshot.is_empty() {
+        return Err(SyncError::BadRequest("hlc_at_snapshot is required".into()));
+    }
+
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let library_id = device.library_id.clone();
+        let device_id = device.device_id.clone();
+        let snapshot_json = req.snapshot_json;
+        let hlc = req.hlc_at_snapshot;
+        move || -> Result<UploadSnapshotResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let tx = db.conn.unchecked_transaction()?;
+
+            // Store the snapshot
+            tx.execute(
+                "INSERT INTO snapshots (library_id, snapshot_json, hlc_at_snapshot, created_by_device, created_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                rusqlite::params![library_id, snapshot_json, hlc, device_id],
+            )?;
+
+            // Prune ops older than the snapshot HLC
+            let pruned = tx.execute(
+                "DELETE FROM ops WHERE library_id = ?1 AND hlc <= ?2",
+                rusqlite::params![library_id, hlc],
+            )?;
+
+            // Keep only the latest snapshot per library
+            tx.execute(
+                "DELETE FROM snapshots
+                 WHERE library_id = ?1
+                   AND id != (SELECT id FROM snapshots WHERE library_id = ?1 ORDER BY created_at DESC LIMIT 1)",
+                [&library_id],
+            )?;
+
+            tx.commit()?;
+
+            Ok(UploadSnapshotResponse {
+                ops_pruned: pruned,
+                hlc_at_snapshot: hlc,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
 }
 
 /// Get the library salt (needed for key derivation on new devices).

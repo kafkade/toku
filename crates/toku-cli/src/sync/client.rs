@@ -66,6 +66,24 @@ pub struct SaltResult {
     pub salt: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UploadSnapshotResult {
+    pub ops_pruned: usize,
+    #[allow(dead_code)]
+    pub hlc_at_snapshot: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DownloadSnapshotResult {
+    pub snapshot_json: String,
+    pub hlc_at_snapshot: String,
+    #[allow(dead_code)]
+    pub created_at: String,
+    #[allow(dead_code)]
+    pub created_by_device: String,
+}
+
 impl SyncClient {
     pub fn new(server_url: &str) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -215,6 +233,51 @@ impl SyncClient {
         }
 
         Ok(resp.json().await?)
+    }
+
+    /// Upload a snapshot to the server and prune old ops.
+    pub async fn upload_snapshot(
+        &self,
+        token: &str,
+        snapshot_json: &str,
+        hlc_at_snapshot: &str,
+    ) -> anyhow::Result<UploadSnapshotResult> {
+        let url = format!("{}/api/v1/snapshot", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "snapshot_json": snapshot_json,
+                "hlc_at_snapshot": hlc_at_snapshot,
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Download the latest snapshot from the server.
+    #[allow(dead_code)]
+    pub async fn download_snapshot(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<DownloadSnapshotResult>> {
+        let url = format!("{}/api/v1/snapshot", self.base_url);
+        let resp = self.http.get(&url).bearer_auth(token).send().await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(Some(resp.json().await?))
     }
 }
 

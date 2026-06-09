@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Snapshot compaction: `toku sync compact` creates a point-in-time snapshot of the entire library and uploads it to the server, pruning old ops to prevent unbounded op-log growth
+- New-device bootstrap via snapshot: `GET /api/v1/snapshot` downloads the latest snapshot, `POST /api/v1/snapshot` uploads one with automatic op pruning
+- `toku sync init` command for one-step sync setup: registers device, stores credentials, saves sync config to `config.toml`, with optional `--passphrase` for enabling encryption
+- `toku sync status` command showing sync state: server, device, library, pending ops, cursors, encryption status, and registered device count
+- `toku sync disable` command to remove sync configuration while preserving local data
+- Sync config persisted in `config.toml` under `[sync]` section — push, pull, devices, rekey, and compact no longer require `--server` on every invocation
+- Automatic device naming from hostname when `--device-name` is not specified during `toku sync init`
 - Notes and reviews merge: LWW with conflict detection — two devices editing the same note stores a `sync_conflict` for user review, while edits to different notes merge cleanly
 - Review field-level merge: content and rating are tracked independently, so two devices editing different review fields produces no conflict
 - Settings sync: LWW per key for user settings with HLC-based ordering
@@ -71,6 +78,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - macOS app (`toku-apple`) with SwiftUI: sidebar navigation, sortable table and grid views, book detail inspector, Swift Charts statistics dashboard, and drag-and-drop Goodreads CSV import
 - iOS app (iPhone + iPad) with SwiftUI: library cover grid, book detail, barcode scanner (ISBN-13 via camera), quick progress update sheet, statistics glance with Swift Charts, full-text search, Goodreads CSV import, adaptive navigation (TabView on iPhone, NavigationSplitView on iPad), status filter chips, and pull-to-refresh
 - TokuKitUI shared SwiftUI component library (StarRatingView, FlowLayout, MetadataRow, StatCard) for reuse across macOS and iOS apps
+
+### Changed
+
+- `toku sync register` replaced by `toku sync init` with automatic defaults (hostname-based device name, auto-generated library ID)
+- `toku sync push`, `pull`, `devices`, `rekey`, and `compact` no longer require `--server` flag — server URL is read from sync config
+- `toku sync logout` replaced by `toku sync disable` which also clears sync config
+
+### Removed
+
+- `toku sync register` command (replaced by `toku sync init`)
+- `toku sync logout` command (replaced by `toku sync disable`)
+- `--server` flag from push, pull, devices, rekey, and compact subcommands (now read from config)
 
 ## [0.2.1] - 2026-05-30
 

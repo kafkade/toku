@@ -406,7 +406,8 @@ impl SyncOp {
 
         let canonical = serde_json::to_string(&map).expect("BTreeMap serialization cannot fail");
         let hash = Sha256::digest(canonical.as_bytes());
-        format!("sha256:{:x}", hash)
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        format!("sha256:{hex}")
     }
 
     /// Verify this op's checksum is correct.

@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 anyhow = "1"
 chrono.workspace = true
-keyring = "3"
+keyring-core = "1"
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -36,3 +36,17 @@ uuid.workspace = true
 rpassword = "7"
 base64 = "0.22"
 hostname = "0.4"
+
+# Platform-native credential stores for the keyring-core ecosystem (keyring 4.x).
+# The umbrella `keyring` crate is intentionally not used: on desktop it pulls in
+# the SQLite (Turso) fallback store and its heavy transitive deps, some of which
+# require a newer rustc than our MSRV. Depending on the specific native stores
+# keeps the dependency tree small and MSRV-compatible.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"

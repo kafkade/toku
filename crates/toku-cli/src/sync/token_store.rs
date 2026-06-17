@@ -1,7 +1,51 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use base64::Engine as _;
+
+static KEYRING_INIT: Once = Once::new();
+
+/// Register the OS-native credential store as the keyring default.
+///
+/// keyring 4.x decouples the API (`keyring-core`) from the platform stores, so
+/// a default store must be registered before any [`keyring_core::Entry`] is
+/// created. This runs once; if no OS keychain is available the entry calls
+/// below fail gracefully and callers fall back to file storage.
+fn ensure_keyring_store() {
+    KEYRING_INIT.call_once(|| {
+        if let Some(store) = native_store() {
+            keyring_core::set_default_store(store);
+        }
+    });
+}
+
+/// Build the platform-native credential store, if one is available.
+#[cfg(target_os = "linux")]
+fn native_store() -> Option<std::sync::Arc<keyring_core::CredentialStore>> {
+    let store: std::sync::Arc<keyring_core::CredentialStore> =
+        zbus_secret_service_keyring_store::Store::new().ok()?;
+    Some(store)
+}
+
+#[cfg(target_os = "macos")]
+fn native_store() -> Option<std::sync::Arc<keyring_core::CredentialStore>> {
+    let store: std::sync::Arc<keyring_core::CredentialStore> =
+        apple_native_keyring_store::keychain::Store::new().ok()?;
+    Some(store)
+}
+
+#[cfg(target_os = "windows")]
+fn native_store() -> Option<std::sync::Arc<keyring_core::CredentialStore>> {
+    let store: std::sync::Arc<keyring_core::CredentialStore> =
+        windows_native_keyring_store::Store::new().ok()?;
+    Some(store)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn native_store() -> Option<std::sync::Arc<keyring_core::CredentialStore>> {
+    None
+}
 
 /// Stores sync auth tokens using the OS keychain or a local file fallback.
 ///
@@ -25,7 +69,8 @@ impl TokenStore {
         let key = normalize_url(server_url);
 
         // Try OS keychain first
-        match keyring::Entry::new(KEYRING_SERVICE, &key) {
+        ensure_keyring_store();
+        match keyring_core::Entry::new(KEYRING_SERVICE, &key) {
             Ok(entry) => match entry.set_password(token) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -47,10 +92,11 @@ impl TokenStore {
         let key = normalize_url(server_url);
 
         // Try OS keychain first
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+        ensure_keyring_store();
+        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE, &key) {
             match entry.get_password() {
                 Ok(token) => return Ok(Some(token)),
-                Err(keyring::Error::NoEntry) => {}
+                Err(keyring_core::Error::NoEntry) => {}
                 Err(_) => {}
             }
         }
@@ -64,7 +110,8 @@ impl TokenStore {
         let key = normalize_url(server_url);
 
         // Try OS keychain
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &key) {
+        ensure_keyring_store();
+        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE, &key) {
             let _ = entry.delete_credential();
         }
 
@@ -77,7 +124,8 @@ impl TokenStore {
         let key = normalize_url(server_url);
         let encoded = base64::engine::general_purpose::STANDARD.encode(key_bytes);
 
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+        ensure_keyring_store();
+        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
             match entry.set_password(&encoded) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -97,13 +145,14 @@ impl TokenStore {
         use base64::Engine;
         let key = normalize_url(server_url);
 
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+        ensure_keyring_store();
+        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
             match entry.get_password() {
                 Ok(encoded) => {
                     let bytes = base64::engine::general_purpose::STANDARD.decode(&encoded)?;
                     return Ok(Some(bytes));
                 }
-                Err(keyring::Error::NoEntry) => {}
+                Err(keyring_core::Error::NoEntry) => {}
                 Err(_) => {}
             }
         }
@@ -123,7 +172,8 @@ impl TokenStore {
     pub fn delete_sync_key(&self, server_url: &str) -> anyhow::Result<()> {
         let key = normalize_url(server_url);
 
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+        ensure_keyring_store();
+        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
             let _ = entry.delete_credential();
         }
 

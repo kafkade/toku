@@ -17,7 +17,7 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 chrono.workspace = true
-rand = "0.9"
+rand = "0.10"
 rusqlite.workspace = true
 refinery = { version = "0.9", features = ["rusqlite"] }
 serde.workspace = true

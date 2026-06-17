@@ -629,7 +629,7 @@ fn row_to_op(row: &rusqlite::Row) -> rusqlite::Result<OpPayload> {
 /// Generate a cryptographically random auth token (256-bit, base64url no-pad).
 fn generate_token() -> String {
     use base64::Engine;
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)

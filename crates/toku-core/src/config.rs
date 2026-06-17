@@ -14,6 +14,23 @@ pub struct TokuConfig {
     pub color: String,
     /// Primary metadata source (openlibrary, google)
     pub metadata_source: String,
+    /// Sync configuration (optional — absent until `toku sync init`)
+    pub sync: Option<SyncConfig>,
+}
+
+/// Sync configuration stored in `config.toml` under `[sync]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncConfig {
+    /// Sync server URL
+    pub server: String,
+    /// Library ID on the server
+    pub library_id: String,
+    /// This device's ID
+    pub device_id: String,
+    /// This device's name
+    pub device_name: String,
+    /// Whether client-side encryption is enabled
+    pub encryption: bool,
 }
 
 impl Default for TokuConfig {
@@ -22,6 +39,7 @@ impl Default for TokuConfig {
             default_format: "table".to_string(),
             color: "auto".to_string(),
             metadata_source: "openlibrary".to_string(),
+            sync: None,
         }
     }
 }
@@ -90,6 +108,7 @@ mod tests {
             default_format: "json".to_string(),
             color: "never".to_string(),
             metadata_source: "google".to_string(),
+            sync: None,
         };
         cfg.save(&dir).expect("save should succeed");
 

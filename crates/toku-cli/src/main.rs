@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use toku_core::{
@@ -13,6 +14,7 @@ use toku_core::{
 use toku_db::{BookRepository, Database};
 
 mod import_ui;
+mod sync;
 mod tui;
 
 /// Toku — a private, offline-first personal book manager.
@@ -246,6 +248,12 @@ enum Commands {
     Shelf {
         #[command(subcommand)]
         action: ShelfAction,
+    },
+
+    /// Manage sync with a toku-sync server
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
     },
 }
 
@@ -549,6 +557,62 @@ enum ExportTarget {
     },
 }
 
+#[derive(Clone, Subcommand)]
+enum SyncAction {
+    /// Set up sync for the first time
+    Init {
+        /// Sync server URL (default: http://localhost:8080)
+        #[arg(long, default_value = "http://localhost:8080")]
+        server: String,
+
+        /// Library ID (UUID — use the same ID across all devices for one library)
+        #[arg(long)]
+        library_id: Option<String>,
+
+        /// Name for this device (defaults to hostname)
+        #[arg(long)]
+        device_name: Option<String>,
+
+        /// Enable client-side encryption (prompts for passphrase)
+        #[arg(long)]
+        passphrase: bool,
+    },
+
+    /// Show sync status
+    Status,
+
+    /// Push local changes to the sync server
+    Push,
+
+    /// Pull remote changes from the sync server
+    Pull,
+
+    /// List all devices registered to this library
+    Devices,
+
+    /// Deregister another device from the sync server
+    Deregister {
+        /// Device ID to deregister
+        device_id: String,
+    },
+
+    /// Disable sync (local data preserved)
+    Disable,
+
+    /// Purge tombstoned books older than the retention period
+    Purge {
+        /// Retention period in days (default: 30)
+        #[arg(long, default_value = "30")]
+        days: i64,
+    },
+
+    /// Change the sync encryption passphrase and re-encrypt all server ops
+    Rekey,
+
+    /// Compact the op log by creating a snapshot and pruning old ops
+    Compact,
+}
+
 #[derive(Clone, ValueEnum)]
 enum OutputFormat {
     Table,
@@ -585,6 +649,9 @@ fn main() -> Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))
             });
+        }
+        Commands::Sync { action } => {
+            return cmd_sync(&data_dir, action.clone(), &cli.format);
         }
         _ => {}
     }
@@ -665,7 +732,7 @@ fn main() -> Result<()> {
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
-        Commands::Bulk { action } => cmd_bulk(&repo, action),
+        Commands::Bulk { action } => cmd_bulk(&db, &repo, action),
         Commands::Stats {
             year,
             author,
@@ -674,8 +741,10 @@ fn main() -> Result<()> {
         Commands::Work { action } => cmd_work(&repo, action, &cli.format),
         Commands::Merge { keep, remove } => cmd_merge(&repo, &keep, &remove, &cli.format),
         Commands::Shelf { action } => cmd_shelf(&repo, action, &cli.format),
-        // Already handled above
-        Commands::Config { .. } | Commands::Completions { .. } | Commands::Serve { .. } => {
+        Commands::Config { .. }
+        | Commands::Completions { .. }
+        | Commands::Serve { .. }
+        | Commands::Sync { .. } => {
             unreachable!()
         }
     }
@@ -1974,7 +2043,7 @@ fn resolve_bulk_books(
     Ok(filtered)
 }
 
-fn cmd_bulk(repo: &BookRepository, action: BulkAction) -> Result<()> {
+fn cmd_bulk(db: &toku_db::Database, repo: &BookRepository, action: BulkAction) -> Result<()> {
     match action {
         BulkAction::Tag {
             tag,
@@ -2086,11 +2155,29 @@ fn cmd_bulk(repo: &BookRepository, action: BulkAction) -> Result<()> {
             let verb = if dry_run { "Would delete" } else { "Deleting" };
             eprintln!("{verb} {} book(s):\n", books.len());
 
+            // If sync is configured, create delete ops for each book
+            let sync_repo = toku_db::SyncRepository::new(db);
+            let device_identity = sync_repo.get_device()?;
+
             for book in &books {
                 if dry_run {
                     eprintln!("  [dry-run] \"{}\"", book.title);
                 } else {
                     repo.delete_book(&book.id)?;
+
+                    if let Some(ref identity) = device_identity {
+                        let mut clock = toku_core::HybridClock::new(&identity.device_id);
+                        let op = toku_core::SyncOp::new(
+                            identity.device_id,
+                            clock.now(),
+                            toku_core::EntityType::Book,
+                            book.id,
+                            toku_core::OpType::Delete,
+                            None,
+                        );
+                        sync_repo.insert_op(&op)?;
+                    }
+
                     eprintln!("  ✗ \"{}\"", book.title);
                 }
             }
@@ -2856,6 +2943,662 @@ fn cmd_shelf(
             let found = resolve_book(repo, &book)?;
             repo.remove_book_from_shelf(&found.id, &shelf)?;
             eprintln!("✓ Removed \"{}\" from shelf \"{shelf}\"", found.title);
+            Ok(())
+        }
+    }
+}
+
+fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    let token_store = sync::token_store::TokenStore::new(data_dir);
+    let config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
+
+    /// Helper: get sync config or error with a helpful message.
+    fn require_sync(config: &toku_core::TokuConfig) -> Result<&toku_core::SyncConfig> {
+        config
+            .sync
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("sync is not configured. Run `toku sync init` first."))
+    }
+
+    /// Helper: get auth token for the configured server.
+    fn require_token(token_store: &sync::token_store::TokenStore, server: &str) -> Result<String> {
+        token_store.load(server)?.ok_or_else(|| {
+            anyhow::anyhow!("no auth token found for {server}. Run `toku sync init` first.")
+        })
+    }
+
+    match action {
+        SyncAction::Init {
+            server,
+            library_id,
+            device_name,
+            passphrase,
+        } => {
+            let library_id = library_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+            let device_name = device_name.unwrap_or_else(|| {
+                hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_else(|| "unknown-device".to_string())
+            });
+
+            let client = sync::client::SyncClient::new(&server)?;
+            let resp = rt.block_on(client.register(&library_id, &device_name))?;
+
+            token_store
+                .store(&server, &resp.auth_token)
+                .context("failed to store auth token")?;
+
+            let encryption_enabled = if passphrase {
+                eprint!("Encryption passphrase: ");
+                let pass = rpassword::read_password().context("failed to read passphrase")?;
+                if pass.is_empty() {
+                    anyhow::bail!("passphrase cannot be empty");
+                }
+                eprint!("Confirm passphrase: ");
+                let confirm = rpassword::read_password().context("failed to read confirmation")?;
+                if pass != confirm {
+                    anyhow::bail!("passphrases do not match");
+                }
+                let salt = toku_core::SyncKey::generate_salt();
+                let key = toku_core::SyncKey::derive(&pass, &salt)
+                    .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+                token_store
+                    .store_sync_key(&server, key.as_exported_bytes())
+                    .context("failed to store sync key")?;
+                true
+            } else {
+                false
+            };
+
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let sync_repo = toku_db::SyncRepository::new(&db);
+            sync_repo.get_or_create_device(&device_name)?;
+
+            let mut config = config;
+            config.sync = Some(toku_core::SyncConfig {
+                server: server.clone(),
+                library_id: resp.library_id.clone(),
+                device_id: resp.device_id.clone(),
+                device_name: device_name.clone(),
+                encryption: encryption_enabled,
+            });
+            config
+                .save(data_dir)
+                .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "device_id": resp.device_id,
+                            "library_id": resp.library_id,
+                            "device_name": device_name,
+                            "server": server,
+                            "encryption": encryption_enabled,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("device_id,library_id,device_name,server,encryption");
+                    println!(
+                        "{},{},{device_name},{server},{encryption_enabled}",
+                        resp.device_id, resp.library_id
+                    );
+                }
+                OutputFormat::Table => {
+                    eprintln!("Sync initialized");
+                    eprintln!("  Server:     {server}");
+                    eprintln!("  Device:     {device_name} ({})", resp.device_id);
+                    eprintln!("  Library:    {}", resp.library_id);
+                    eprintln!(
+                        "  Encryption: {}",
+                        if encryption_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Status => {
+            let sync_config = require_sync(&config)?;
+            let server = &sync_config.server;
+
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let sync_repo = toku_db::SyncRepository::new(&db);
+
+            let pending = sync_repo.count_unpushed_ops()?;
+            let push_cursor = sync_repo.get_cursor("push_cursor")?;
+            let pull_cursor = sync_repo.get_cursor("pull_cursor")?;
+            let device = sync_repo.get_device()?;
+
+            let device_count = token_store
+                .load(server)?
+                .and_then(|token| {
+                    let client = sync::client::SyncClient::new(server).ok()?;
+                    rt.block_on(client.list_devices(&token))
+                        .ok()
+                        .map(|d| d.len())
+                })
+                .unwrap_or(0);
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "enabled": true,
+                            "server": server,
+                            "device_id": sync_config.device_id,
+                            "device_name": sync_config.device_name,
+                            "library_id": sync_config.library_id,
+                            "encryption": sync_config.encryption,
+                            "pending_ops": pending,
+                            "push_cursor": push_cursor,
+                            "pull_cursor": pull_cursor,
+                            "device_count": device_count,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("key,value");
+                    println!("enabled,true");
+                    println!("server,{server}");
+                    println!("device,{}", sync_config.device_name);
+                    println!("pending_ops,{pending}");
+                    println!("device_count,{device_count}");
+                }
+                OutputFormat::Table => {
+                    eprintln!("Sync: enabled");
+                    eprintln!("Server: {server}");
+                    if let Some(dev) = &device {
+                        eprintln!("Device: {} ({})", dev.device_name, dev.device_id);
+                    } else {
+                        eprintln!(
+                            "Device: {} ({})",
+                            sync_config.device_name, sync_config.device_id
+                        );
+                    }
+                    eprintln!("Library: {}", sync_config.library_id);
+                    eprintln!("Pending ops: {pending}");
+                    eprintln!(
+                        "Last push cursor: {}",
+                        push_cursor.as_deref().unwrap_or("none")
+                    );
+                    eprintln!(
+                        "Last pull cursor: {}",
+                        pull_cursor.as_deref().unwrap_or("none")
+                    );
+                    eprintln!(
+                        "Encryption: {}",
+                        if sync_config.encryption {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    if device_count > 0 {
+                        eprintln!("Devices: {device_count} registered");
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Push => {
+            let sync_config = require_sync(&config)?;
+            let server = &sync_config.server;
+            let token = require_token(&token_store, server)?;
+
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let sync_repo = toku_db::SyncRepository::new(&db);
+            let client = sync::client::SyncClient::new(server)?;
+
+            let unpushed = sync_repo.get_unpushed_ops()?;
+            if unpushed.is_empty() {
+                match output_format {
+                    OutputFormat::Json => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "pushed": 0,
+                                "status": "up_to_date",
+                            }))?
+                        );
+                    }
+                    _ => eprintln!("Nothing to push already up to date"),
+                }
+                return Ok(());
+            }
+
+            let total = unpushed.len();
+            let wire_ops: Vec<sync::client::WireOp> =
+                unpushed.iter().map(sync::wire::to_wire).collect();
+
+            let mut total_accepted = 0usize;
+            let mut total_duplicates = 0usize;
+            let mut last_cursor = None;
+
+            for chunk in wire_ops.chunks(1000) {
+                let result = rt.block_on(client.push_ops(&token, chunk))?;
+                total_accepted += result.accepted;
+                total_duplicates += result.duplicates;
+                if result.new_cursor.is_some() {
+                    last_cursor = result.new_cursor;
+                }
+            }
+
+            let op_ids: Vec<uuid::Uuid> = unpushed.iter().map(|op| op.op_id).collect();
+            sync_repo.mark_ops_pushed(&op_ids)?;
+
+            if let Some(ref cursor) = last_cursor {
+                sync_repo.set_cursor("push_cursor", cursor)?;
+            }
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "pushed": total,
+                            "accepted": total_accepted,
+                            "duplicates": total_duplicates,
+                            "cursor": last_cursor,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("pushed,accepted,duplicates");
+                    println!("{total},{total_accepted},{total_duplicates}");
+                }
+                OutputFormat::Table => {
+                    eprintln!("Pushed {total_accepted} ops ({total_duplicates} duplicates)");
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Pull => {
+            let sync_config = require_sync(&config)?;
+            let server = &sync_config.server;
+            let token = require_token(&token_store, server)?;
+
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let sync_repo = toku_db::SyncRepository::new(&db);
+            let client = sync::client::SyncClient::new(server)?;
+
+            let mut cursor = sync_repo.get_cursor("pull_cursor")?;
+            let mut total_pulled = 0usize;
+
+            loop {
+                let result = rt.block_on(client.pull_ops(&token, cursor.as_deref()))?;
+                if result.ops.is_empty() {
+                    break;
+                }
+                for wire_op in &result.ops {
+                    let sync_op =
+                        sync::wire::from_wire(wire_op).context("failed to parse remote op")?;
+                    sync_repo.insert_remote_op(&sync_op)?;
+                }
+                total_pulled += result.ops.len();
+                if let Some(new_cursor) = result.cursor {
+                    sync_repo.set_cursor("pull_cursor", &new_cursor)?;
+                    cursor = Some(new_cursor);
+                }
+                if !result.has_more {
+                    break;
+                }
+            }
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "pulled": total_pulled,
+                            "cursor": cursor,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("pulled,cursor");
+                    println!("{total_pulled},{}", cursor.as_deref().unwrap_or(""));
+                }
+                OutputFormat::Table => {
+                    if total_pulled == 0 {
+                        eprintln!("Nothing to pull already up to date");
+                    } else {
+                        eprintln!("Pulled {total_pulled} ops");
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Devices => {
+            let sync_config = require_sync(&config)?;
+            let server = &sync_config.server;
+            let token = require_token(&token_store, server)?;
+
+            let client = sync::client::SyncClient::new(server)?;
+            let devices = rt.block_on(client.list_devices(&token))?;
+
+            match output_format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&devices)?),
+                OutputFormat::Csv => {
+                    println!("device_id,device_name,last_seen,created_at");
+                    for d in &devices {
+                        println!(
+                            "{},{},{},{}",
+                            d.device_id,
+                            d.device_name,
+                            d.last_seen.as_deref().unwrap_or(""),
+                            d.created_at
+                        );
+                    }
+                }
+                OutputFormat::Table => {
+                    if devices.is_empty() {
+                        eprintln!("No devices registered.");
+                        return Ok(());
+                    }
+                    use tabled::{Table, Tabled};
+                    #[derive(Tabled)]
+                    struct Row {
+                        #[tabled(rename = "Device ID")]
+                        id: String,
+                        #[tabled(rename = "Name")]
+                        name: String,
+                        #[tabled(rename = "Last Seen")]
+                        last_seen: String,
+                        #[tabled(rename = "Registered")]
+                        created: String,
+                    }
+                    let rows: Vec<Row> = devices
+                        .iter()
+                        .map(|d| Row {
+                            id: d.device_id.clone(),
+                            name: d.device_name.clone(),
+                            last_seen: d.last_seen.clone().unwrap_or_else(|| "n/a".into()),
+                            created: d.created_at.clone(),
+                        })
+                        .collect();
+                    println!("{}", Table::new(rows));
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Deregister { device_id } => {
+            let sync_config = require_sync(&config)?;
+            let server = &sync_config.server;
+            let token = require_token(&token_store, server)?;
+
+            let client = sync::client::SyncClient::new(server)?;
+            rt.block_on(client.deregister_device(&token, &device_id))?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "deleted": true,
+                            "device_id": device_id,
+                        }))?
+                    );
+                }
+                _ => eprintln!("Deregistered device {device_id}"),
+            }
+            Ok(())
+        }
+
+        SyncAction::Disable => {
+            if config.sync.is_none() {
+                eprintln!("Sync is not configured.");
+                return Ok(());
+            }
+            let sync_config = config.sync.as_ref().unwrap();
+            let server = &sync_config.server;
+            let _ = token_store.delete(server);
+            let _ = token_store.delete_sync_key(server);
+
+            let mut config = config;
+            config.sync = None;
+            config
+                .save(data_dir)
+                .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({ "sync": "disabled" }))?
+                    );
+                }
+                _ => {
+                    eprintln!("Sync disabled. Local data preserved.");
+                    eprintln!("  Run `toku sync init` to re-enable.");
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Purge { days } => {
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let repo = toku_db::BookRepository::new(&db);
+            let purged = repo.purge_tombstones(days)?;
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "purged": purged,
+                            "retention_days": days,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("purged,retention_days");
+                    println!("{purged},{days}");
+                }
+                OutputFormat::Table => {
+                    if purged == 0 {
+                        eprintln!("No tombstones older than {days} days to purge");
+                    } else {
+                        eprintln!("Purged {purged} tombstoned book(s) older than {days} days");
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Rekey => {
+            let sync_config = require_sync(&config)?;
+            let server = &sync_config.server;
+            let token = require_token(&token_store, server)?;
+            let client = sync::client::SyncClient::new(server)?;
+
+            eprint!("Old passphrase: ");
+            let old_passphrase =
+                rpassword::read_password().context("failed to read old passphrase")?;
+            if old_passphrase.is_empty() {
+                anyhow::bail!("old passphrase cannot be empty");
+            }
+
+            eprint!("New passphrase: ");
+            let new_passphrase =
+                rpassword::read_password().context("failed to read new passphrase")?;
+            if new_passphrase.is_empty() {
+                anyhow::bail!("new passphrase cannot be empty");
+            }
+            eprint!("Confirm new passphrase: ");
+            let confirm =
+                rpassword::read_password().context("failed to read passphrase confirmation")?;
+            if new_passphrase != confirm {
+                anyhow::bail!("passphrases do not match");
+            }
+
+            rt.block_on(async {
+                eprintln!("Fetching library salt...");
+                let salt_result = client.get_salt(&token).await?;
+                let old_salt_b64 = salt_result
+                    .salt
+                    .ok_or_else(|| anyhow::anyhow!("library has no salt"))?;
+                let old_salt_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&old_salt_b64)
+                    .context("invalid salt encoding")?;
+                let old_salt: [u8; 16] = old_salt_bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid salt length"))?;
+                let old_key = toku_core::SyncKey::derive(&old_passphrase, &old_salt)
+                    .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+
+                eprintln!("Pulling all ops from server...");
+                let pull_result = client.pull_all_ops(&token).await?;
+                let total = pull_result.ops.len();
+                eprintln!("  {} ops to re-encrypt", total);
+                if total == 0 {
+                    anyhow::bail!("no ops on server");
+                }
+
+                let new_salt = toku_core::SyncKey::generate_salt();
+                let new_key = toku_core::SyncKey::derive(&new_passphrase, &new_salt)
+                    .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
+                let new_salt_b64 = base64::engine::general_purpose::STANDARD.encode(new_salt);
+
+                eprintln!("Re-encrypting ops...");
+                let mut re_encrypted_ops = Vec::with_capacity(total);
+                for (i, wire_op) in pull_result.ops.iter().enumerate() {
+                    let mut re_wire = wire_op.clone();
+                    if wire_op.payload.is_object() && wire_op.payload.get("ev").is_some() {
+                        let envelope: toku_core::EncryptedEnvelope =
+                            serde_json::from_value(wire_op.payload.clone())
+                                .context("invalid encrypted envelope")?;
+                        let entity_type: toku_core::EntityType = wire_op
+                            .entity_type
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("invalid entity_type"))?;
+                        let entity_id: uuid::Uuid = wire_op
+                            .entity_id
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("invalid entity_id: {e}"))?;
+                        let op_type: toku_core::OpType = wire_op
+                            .op_type
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("invalid op_type"))?;
+                        let plaintext = toku_core::decrypt_fields(
+                            &old_key,
+                            &envelope,
+                            &entity_type,
+                            &entity_id,
+                            &op_type,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("decryption failed for op {}: {e}", wire_op.op_id)
+                        })?;
+                        let new_envelope = toku_core::encrypt_fields(
+                            &new_key,
+                            &plaintext,
+                            &entity_type,
+                            &entity_id,
+                            &op_type,
+                        )
+                        .map_err(|e| anyhow::anyhow!("re-encryption failed: {e}"))?;
+                        re_wire.payload = serde_json::to_value(&new_envelope)?;
+                    }
+                    re_encrypted_ops.push(re_wire);
+                    if (i + 1) % 100 == 0 || i + 1 == total {
+                        eprint!("\r  {}/{} ops re-encrypted", i + 1, total);
+                    }
+                }
+                eprintln!();
+
+                eprintln!("Uploading re-encrypted ops...");
+                let rekey_result = client
+                    .rekey(&token, &new_salt_b64, &re_encrypted_ops)
+                    .await
+                    .context("rekey request failed")?;
+                token_store.store_sync_key(server, new_key.as_exported_bytes())?;
+                eprintln!(
+                    "Re-keyed {} ops with new passphrase",
+                    rekey_result.ops_replaced
+                );
+                Ok(())
+            })
+        }
+
+        SyncAction::Compact => {
+            let sync_config = require_sync(&config)?;
+            let server = &sync_config.server;
+            let token = require_token(&token_store, server)?;
+
+            let db_path = data_dir.join("toku.db");
+            let db = Database::open(&db_path).context("failed to open database")?;
+            let sync_repo = toku_db::SyncRepository::new(&db);
+            let snapshot_repo = toku_db::SnapshotRepository::new(&db);
+            let client = sync::client::SyncClient::new(server)?;
+
+            let device = sync_repo.get_device()?.ok_or_else(|| {
+                anyhow::anyhow!("no device identity found. Run `toku sync init` first.")
+            })?;
+            let mut clock = toku_core::HybridClock::new(&device.device_id);
+            let hlc_str = clock.now().to_canonical();
+
+            eprintln!("Creating snapshot...");
+            let snapshot = snapshot_repo
+                .export_snapshot(device.device_id, &hlc_str)
+                .context("failed to export snapshot")?;
+            let snapshot_json =
+                serde_json::to_string(&snapshot).context("failed to serialize snapshot")?;
+            let size_kb = snapshot_json.len() / 1024;
+            eprintln!(
+                "  {} books, {} sessions, {} tags ({} KB)",
+                snapshot.library.books.len(),
+                snapshot.library.sessions.len(),
+                snapshot.library.tags.len(),
+                size_kb
+            );
+
+            eprintln!("Uploading snapshot and pruning old ops...");
+            let result = rt.block_on(async {
+                client
+                    .upload_snapshot(&token, &snapshot_json, &hlc_str)
+                    .await
+            })?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ops_pruned": result.ops_pruned,
+                            "snapshot_size_bytes": snapshot_json.len(),
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("ops_pruned,snapshot_size_bytes");
+                    println!("{},{}", result.ops_pruned, snapshot_json.len());
+                }
+                OutputFormat::Table => {
+                    eprintln!("Snapshot uploaded, {} ops pruned", result.ops_pruned);
+                }
+            }
             Ok(())
         }
     }

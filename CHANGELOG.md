@@ -9,10 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Snapshot compaction: `toku sync compact` creates a point-in-time snapshot of the entire library and uploads it to the server, pruning old ops to prevent unbounded op-log growth
+- New-device bootstrap via snapshot: `GET /api/v1/snapshot` downloads the latest snapshot, `POST /api/v1/snapshot` uploads one with automatic op pruning
+- `toku sync init` command for one-step sync setup: registers device, stores credentials, saves sync config to `config.toml`, with optional `--passphrase` for enabling encryption
+- `toku sync status` command showing sync state: server, device, library, pending ops, cursors, encryption status, and registered device count
+- `toku sync disable` command to remove sync configuration while preserving local data
+- Sync config persisted in `config.toml` under `[sync]` section — push, pull, devices, rekey, and compact no longer require `--server` on every invocation
+- Automatic device naming from hostname when `--device-name` is not specified during `toku sync init`
+- Notes and reviews merge: LWW with conflict detection — two devices editing the same note stores a `sync_conflict` for user review, while edits to different notes merge cleanly
+- Review field-level merge: content and rating are tracked independently, so two devices editing different review fields produces no conflict
+- Settings sync: LWW per key for user settings with HLC-based ordering
+- Notes, reviews, and user settings tables (migration V15) with soft delete support for notes and reviews
+- Client-side encryption for sync ops: AES-256-GCM with Argon2id key derivation (m=64MB, t=3, p=1)
+- Encrypted ops envelope per ADR-008: fields JSON is encrypted before leaving the device, server stores opaque blobs
+- AAD (Additional Authenticated Data) binds envelope version, entity type, entity ID, and op type to prevent payload swapping between ops
+- `SyncKey` with zeroize-on-drop for key material protection
+- `SyncOp.encrypt()` and `SyncOp.decrypt()` convenience methods for in-place encryption/decryption
+- `toku sync rekey --server <url>` command to change the sync encryption passphrase and re-encrypt all server-side ops
+- Rekey server endpoint (`POST /api/v1/rekey`): atomically replaces all ops with re-encrypted versions, updates library salt, invalidates all device cursors
+- Push lock during re-keying: server rejects push requests while a rekey is in progress to prevent corruption
+- Salt endpoint (`GET /api/v1/salt`) for clients to fetch the library's current encryption salt
+- Full-library pull endpoint (`GET /api/v1/pull/all`) for re-keying that includes the requesting device's own ops
+- Sync key storage in OS keychain alongside auth tokens
 - Sync data model: `sync_ops`, `sync_cursors`, and `sync_device` tables (migration V12) for local op-log staging
 - Hybrid Logical Clock (HLC) implementation with fixed-width canonical format for causal ordering across devices
 - `SyncRepository` for sync persistence: insert ops, query unpushed, mark pushed, device identity, cursor management
 - `SyncOp` domain model with SHA-256 content checksums and `serde_json::Value` fields for canonical JSON
+- Sync relay server (`toku-sync`): standalone Axum HTTP service that stores and relays sync operations between devices
+- Device registration and authentication: `POST /api/v1/register` generates a 256-bit base64url auth token, stored as SHA-256 hash on the server
+- Sync REST API: push ops, pull ops (with cursor-based pagination), device management, and health check
+- `toku sync register` CLI command to register a device with a sync server and store the auth token in the OS keychain
+- `toku sync devices` to list registered devices with `--format table|json|csv` support
+- `toku sync deregister` to remove another device from the sync server
+- `toku sync logout` to remove locally stored sync credentials
+- Platform-native credential storage via OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service) with secure file fallback
+- `toku sync push --server <url>` to push local changes to the sync server with batched uploads and cursor tracking
+- `toku sync pull --server <url>` to pull remote changes with automatic pagination and cursor-based resumption
+- Pull endpoint excludes the requesting device's own ops to avoid echoing changes back
+- `has_more` pagination flag on pull responses for batched retrieval of large op sets
+- Entity-specific merge engine for applying remote sync ops to local state with per-entity strategies
+- Book field-level last-write-wins (LWW) merge using HLC timestamps — two devices editing different fields produces no conflict
+- Reading session append-only merge: remote sessions are inserted if new, never updated or deleted via sync
+- Reading progress monotonic merge: remote progress values are only accepted if they exceed the current local maximum
+- Tag sync: add/remove operations applied directly with deduplication
+- Soft delete for books via `deleted_at` column, driven by sync delete ops with HLC timestamps
+- Reading status transition validation during sync merge (rejects illegal state machine transitions)
+- `sync_conflicts` table for future note/review conflict resolution UI
+- Soft delete for books: `toku bulk delete` now sets `deleted_at` instead of removing the row, preserving data for sync propagation
+- Deleted books are automatically excluded from all queries (list, search, stats, shelves, tags, FTS)
+- `toku sync purge --days N` command to permanently remove tombstoned books after the retention period
+- Delete operations create sync ops automatically when a device identity is registered, enabling cross-device delete propagation
 - Web statistics dashboard (`toku serve`): reading stats, rating histogram, monthly pace chart, format breakdown donut, top authors and tags — all rendered as server-side SVG with dark mode support
 - Yearly wrap-up pages at `/stats/wrap/{year}` summarizing a single year's reading
 - JSON statistics API at `/api/stats` for programmatic access
@@ -32,6 +78,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - macOS app (`toku-apple`) with SwiftUI: sidebar navigation, sortable table and grid views, book detail inspector, Swift Charts statistics dashboard, and drag-and-drop Goodreads CSV import
 - iOS app (iPhone + iPad) with SwiftUI: library cover grid, book detail, barcode scanner (ISBN-13 via camera), quick progress update sheet, statistics glance with Swift Charts, full-text search, Goodreads CSV import, adaptive navigation (TabView on iPhone, NavigationSplitView on iPad), status filter chips, and pull-to-refresh
 - TokuKitUI shared SwiftUI component library (StarRatingView, FlowLayout, MetadataRow, StatCard) for reuse across macOS and iOS apps
+
+### Changed
+
+- `toku sync register` replaced by `toku sync init` with automatic defaults (hostname-based device name, auto-generated library ID)
+- `toku sync push`, `pull`, `devices`, `rekey`, and `compact` no longer require `--server` flag — server URL is read from sync config
+- `toku sync logout` replaced by `toku sync disable` which also clears sync config
+
+### Removed
+
+- `toku sync register` command (replaced by `toku sync init`)
+- `toku sync logout` command (replaced by `toku sync disable`)
+- `--server` flag from push, pull, devices, rekey, and compact subcommands (now read from config)
 
 ## [0.2.1] - 2026-05-30
 

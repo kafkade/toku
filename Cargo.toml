@@ -10,6 +10,7 @@ members = [
     "crates/toku-ffi",
     "crates/toku-web",
     "crates/toku-desktop",
+    "crates/toku-sync",
 ]
 
 [workspace.package]
@@ -35,5 +36,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt", "macros"] }
-sha2 = "0.10"
+sha2 = "0.11"
 toml = "1.1"

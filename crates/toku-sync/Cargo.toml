@@ -1,0 +1,32 @@
+[package]
+name = "toku-sync"
+description = "Sync relay server for Toku personal book manager"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "toku-sync"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+chrono.workspace = true
+rand = "0.10"
+rusqlite.workspace = true
+refinery = { version = "0.9", features = ["rusqlite"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
+uuid.workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }
+tower = "0.5"

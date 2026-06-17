@@ -61,7 +61,7 @@ impl<'a> BookRepository<'a> {
                 "SELECT id, title, subtitle, description, page_count, pub_date,
                  language, format, duration_minutes, cover_hash, work_id, status,
                  rating, created_at, updated_at
-                 FROM books WHERE id = ?1",
+                 FROM books WHERE id = ?1 AND deleted_at IS NULL",
                 params![id.to_string()],
                 |row| Ok(row_to_book(row)),
             )?
@@ -74,7 +74,7 @@ impl<'a> BookRepository<'a> {
             "SELECT id, title, subtitle, description, page_count, pub_date,
              language, format, duration_minutes, cover_hash, work_id, status,
              rating, created_at, updated_at
-             FROM books ORDER BY title COLLATE NOCASE",
+             FROM books WHERE deleted_at IS NULL ORDER BY title COLLATE NOCASE",
         )?;
 
         let books = stmt
@@ -105,7 +105,7 @@ impl<'a> BookRepository<'a> {
              b.rating, b.created_at, b.updated_at
              FROM books_fts f
              JOIN books b ON b.rowid = f.rowid
-             WHERE books_fts MATCH ?1",
+             WHERE books_fts MATCH ?1 AND b.deleted_at IS NULL",
         );
 
         let mut param_index = 2u32;
@@ -160,13 +160,44 @@ impl<'a> BookRepository<'a> {
         Ok(books)
     }
 
-    /// Delete a book by ID.
+    /// Soft-delete a book by ID. Sets `deleted_at` instead of removing the row.
     pub fn delete_book(&self, id: &Uuid) -> Result<bool, DbError> {
-        let rows = self
-            .db
-            .conn
-            .execute("DELETE FROM books WHERE id = ?1", params![id.to_string()])?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = self.db.conn.execute(
+            "UPDATE books SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            params![now, id.to_string()],
+        )?;
         Ok(rows > 0)
+    }
+
+    /// Retrieve a book by ID, including soft-deleted books.
+    pub fn get_book_including_deleted(&self, id: &Uuid) -> Result<Book, DbError> {
+        self.db
+            .conn
+            .query_row(
+                "SELECT id, title, subtitle, description, page_count, pub_date,
+                 language, format, duration_minutes, cover_hash, work_id, status,
+                 rating, created_at, updated_at
+                 FROM books WHERE id = ?1",
+                params![id.to_string()],
+                |row| Ok(row_to_book(row)),
+            )?
+            .map_err(|e| DbError::Sqlite(rusqlite::Error::InvalidParameterName(e.to_string())))
+    }
+
+    /// Purge tombstoned books older than `retention_days`.
+    /// Returns the number of permanently deleted rows.
+    ///
+    /// Only call this when all synced devices have had a chance to pull the
+    /// delete ops — premature purging can cause deleted books to reappear on
+    /// stale devices.
+    pub fn purge_tombstones(&self, retention_days: i64) -> Result<usize, DbError> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+        let rows = self.db.conn.execute(
+            "DELETE FROM books WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(rows)
     }
 
     /// Recompute and store the `search_text` column for a book, including author names.
@@ -289,7 +320,7 @@ impl<'a> BookRepository<'a> {
              b.rating, b.created_at, b.updated_at
              FROM isbns i
              JOIN books b ON b.id = i.book_id
-             WHERE i.isbn = ?1",
+             WHERE i.isbn = ?1 AND b.deleted_at IS NULL",
             params![isbn],
             |row| Ok(row_to_book(row)),
         );
@@ -308,7 +339,7 @@ impl<'a> BookRepository<'a> {
             "SELECT id, title, subtitle, description, page_count, pub_date,
              language, format, duration_minutes, cover_hash, work_id, status,
              rating, created_at, updated_at
-             FROM books WHERE title = ?1 COLLATE NOCASE",
+             FROM books WHERE title = ?1 COLLATE NOCASE AND deleted_at IS NULL",
             params![title],
             |row| Ok(row_to_book(row)),
         );
@@ -324,7 +355,7 @@ impl<'a> BookRepository<'a> {
     /// Update a book's reading status.
     pub fn update_book_status(&self, id: &Uuid, status: ReadingStatus) -> Result<bool, DbError> {
         let rows = self.db.conn.execute(
-            "UPDATE books SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE books SET status = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
             params![
                 status.as_str(),
                 chrono::Utc::now().to_rfc3339(),
@@ -337,7 +368,7 @@ impl<'a> BookRepository<'a> {
     /// Update a book's rating.
     pub fn update_book_rating(&self, id: &Uuid, rating: i32) -> Result<bool, DbError> {
         let rows = self.db.conn.execute(
-            "UPDATE books SET rating = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE books SET rating = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
             params![rating, chrono::Utc::now().to_rfc3339(), id.to_string(),],
         )?;
         Ok(rows > 0)
@@ -614,7 +645,7 @@ impl<'a> BookRepository<'a> {
                      FROM books b
                      JOIN book_shelves bs ON bs.book_id = b.id
                      JOIN shelves s ON s.id = bs.shelf_id
-                     WHERE s.name = ?1
+                     WHERE s.name = ?1 AND b.deleted_at IS NULL
                      ORDER BY b.title COLLATE NOCASE",
                 )?;
 
@@ -695,7 +726,7 @@ impl<'a> BookRepository<'a> {
             "SELECT b.id, b.title, b.subtitle, b.description, b.page_count, b.pub_date,
              b.language, b.format, b.duration_minutes, b.cover_hash, b.work_id, b.status,
              b.rating, b.created_at, b.updated_at
-             FROM books b WHERE {where_clause}
+             FROM books b WHERE b.deleted_at IS NULL AND ({where_clause})
              ORDER BY b.title COLLATE NOCASE"
         );
 
@@ -915,7 +946,7 @@ impl<'a> BookRepository<'a> {
              FROM books b
              JOIN book_tags bt ON bt.book_id = b.id
              JOIN tags t ON t.id = bt.tag_id
-             WHERE t.name = ?1 AND t.tag_type = ?2
+             WHERE t.name = ?1 AND t.tag_type = ?2 AND b.deleted_at IS NULL
              ORDER BY b.title COLLATE NOCASE",
         )?;
 
@@ -930,12 +961,13 @@ impl<'a> BookRepository<'a> {
         Ok(books)
     }
 
-    /// List all tags with book counts.
+    /// List all tags with book counts (excluding soft-deleted books).
     pub fn list_tags_with_counts(&self) -> Result<Vec<(Tag, i64)>, DbError> {
         let mut stmt = self.db.conn.prepare(
-            "SELECT t.id, t.name, t.tag_type, t.created_at, COUNT(bt.book_id) as book_count
+            "SELECT t.id, t.name, t.tag_type, t.created_at, COUNT(b.id) as book_count
              FROM tags t
              LEFT JOIN book_tags bt ON bt.tag_id = t.id
+             LEFT JOIN books b ON b.id = bt.book_id AND b.deleted_at IS NULL
              GROUP BY t.id
              ORDER BY t.tag_type, t.name COLLATE NOCASE",
         )?;
@@ -968,15 +1000,16 @@ impl<'a> BookRepository<'a> {
         Ok(tags)
     }
 
-    /// List tags of a specific type with book counts.
+    /// List tags of a specific type with book counts (excluding soft-deleted books).
     pub fn list_tags_with_counts_by_type(
         &self,
         tag_type: TagType,
     ) -> Result<Vec<(Tag, i64)>, DbError> {
         let mut stmt = self.db.conn.prepare(
-            "SELECT t.id, t.name, t.tag_type, t.created_at, COUNT(bt.book_id) as book_count
+            "SELECT t.id, t.name, t.tag_type, t.created_at, COUNT(b.id) as book_count
              FROM tags t
              LEFT JOIN book_tags bt ON bt.tag_id = t.id
+             LEFT JOIN books b ON b.id = bt.book_id AND b.deleted_at IS NULL
              WHERE t.tag_type = ?1
              GROUP BY t.id
              ORDER BY t.name COLLATE NOCASE",
@@ -1058,10 +1091,9 @@ impl<'a> BookRepository<'a> {
     pub fn count_books_by_status(
         &self,
     ) -> Result<std::collections::HashMap<String, usize>, DbError> {
-        let mut stmt = self
-            .db
-            .conn
-            .prepare("SELECT status, COUNT(*) FROM books GROUP BY status")?;
+        let mut stmt = self.db.conn.prepare(
+            "SELECT status, COUNT(*) FROM books WHERE deleted_at IS NULL GROUP BY status",
+        )?;
 
         let mut map = std::collections::HashMap::new();
         let rows = stmt.query_map([], |row| {
@@ -1086,7 +1118,7 @@ impl<'a> BookRepository<'a> {
             "SELECT id, title, subtitle, description, page_count, pub_date,
              language, format, duration_minutes, cover_hash, work_id, status,
              rating, created_at, updated_at
-             FROM books WHERE status = 'reading'
+             FROM books WHERE status = 'reading' AND deleted_at IS NULL
              ORDER BY updated_at DESC",
         )?;
 
@@ -1390,7 +1422,7 @@ impl<'a> BookRepository<'a> {
              FROM books b
              JOIN book_authors ba ON ba.book_id = b.id
              JOIN authors a ON a.id = ba.author_id
-             WHERE LOWER(a.name) = LOWER(?1)
+             WHERE LOWER(a.name) = LOWER(?1) AND b.deleted_at IS NULL
              ORDER BY b.title COLLATE NOCASE",
         )?;
 
@@ -1579,7 +1611,7 @@ impl<'a> BookRepository<'a> {
             "SELECT id, title, subtitle, description, page_count, pub_date,
                     language, format, duration_minutes, cover_hash, work_id,
                     status, rating, created_at, updated_at
-             FROM books WHERE work_id = ?1",
+             FROM books WHERE work_id = ?1 AND deleted_at IS NULL",
         )?;
         let books = stmt
             .query_map(params![work_id.to_string()], |row| {
@@ -1600,7 +1632,7 @@ impl<'a> BookRepository<'a> {
                 "SELECT id, title, subtitle, description, page_count, pub_date,
                         language, format, duration_minutes, cover_hash, work_id,
                         status, rating, created_at, updated_at
-                 FROM books WHERE work_id IS NULL",
+                 FROM books WHERE work_id IS NULL AND deleted_at IS NULL",
             )?;
             let books: Vec<Book> = stmt
                 .query_map([], |row| {
@@ -3179,5 +3211,199 @@ mod tests {
         let shelf = repo.get_shelf_by_name("Best Reads").unwrap().unwrap();
         let stored_filter = SmartFilter::from_json(shelf.smart_filter.as_ref().unwrap()).unwrap();
         assert_eq!(filter, stored_filter);
+    }
+
+    // --- Soft delete tests ---
+
+    #[test]
+    fn soft_delete_hides_from_list() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("To Delete");
+        repo.create_book(&book).unwrap();
+        assert_eq!(repo.list_books().unwrap().len(), 1);
+
+        assert!(repo.delete_book(&book.id).unwrap());
+        assert!(repo.list_books().unwrap().is_empty());
+    }
+
+    #[test]
+    fn soft_delete_hides_from_get() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Ghost Book");
+        repo.create_book(&book).unwrap();
+        repo.delete_book(&book.id).unwrap();
+
+        let result = repo.get_book(&book.id);
+        assert!(result.is_err()); // deleted book not found via get_book
+    }
+
+    #[test]
+    fn get_book_including_deleted_returns_tombstoned_book() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Recoverable");
+        repo.create_book(&book).unwrap();
+        repo.delete_book(&book.id).unwrap();
+
+        let found = repo.get_book_including_deleted(&book.id).unwrap();
+        assert_eq!(found.title, "Recoverable");
+    }
+
+    #[test]
+    fn soft_delete_hides_from_search() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Searchable Secret");
+        repo.create_book(&book).unwrap();
+
+        assert_eq!(repo.search_books("Searchable").unwrap().len(), 1);
+
+        repo.delete_book(&book.id).unwrap();
+        assert!(repo.search_books("Searchable").unwrap().is_empty());
+    }
+
+    #[test]
+    fn soft_delete_hides_from_count_by_status() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Counter");
+        repo.create_book(&book).unwrap();
+
+        let counts = repo.count_books_by_status().unwrap();
+        assert_eq!(*counts.get("want-to-read").unwrap_or(&0), 1);
+
+        repo.delete_book(&book.id).unwrap();
+        let counts = repo.count_books_by_status().unwrap();
+        assert_eq!(*counts.get("want-to-read").unwrap_or(&0), 0);
+    }
+
+    #[test]
+    fn soft_delete_prevents_mutation() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Immutable After Delete");
+        repo.create_book(&book).unwrap();
+        repo.delete_book(&book.id).unwrap();
+
+        let updated = repo
+            .update_book_status(&book.id, ReadingStatus::Reading)
+            .unwrap();
+        assert!(!updated); // mutation returns false for deleted book
+    }
+
+    #[test]
+    fn soft_delete_is_idempotent() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Delete Twice");
+        repo.create_book(&book).unwrap();
+
+        assert!(repo.delete_book(&book.id).unwrap()); // first delete succeeds
+        assert!(!repo.delete_book(&book.id).unwrap()); // second delete is no-op
+    }
+
+    #[test]
+    fn purge_tombstones_removes_old_deletes() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Ancient Delete");
+        repo.create_book(&book).unwrap();
+
+        // Manually set deleted_at to 60 days ago
+        let old_date = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+        db.conn
+            .execute(
+                "UPDATE books SET deleted_at = ?1 WHERE id = ?2",
+                params![old_date, book.id.to_string()],
+            )
+            .unwrap();
+
+        let purged = repo.purge_tombstones(30).unwrap();
+        assert_eq!(purged, 1);
+
+        // Verify the book is truly gone (not even via including_deleted)
+        assert!(repo.get_book_including_deleted(&book.id).is_err());
+    }
+
+    #[test]
+    fn purge_tombstones_keeps_recent_deletes() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Recent Delete");
+        repo.create_book(&book).unwrap();
+        repo.delete_book(&book.id).unwrap(); // just now
+
+        let purged = repo.purge_tombstones(30).unwrap();
+        assert_eq!(purged, 0);
+
+        // Still accessible via including_deleted
+        assert!(repo.get_book_including_deleted(&book.id).is_ok());
+    }
+
+    #[test]
+    fn soft_delete_hides_from_find_by_isbn() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("ISBN Book");
+        repo.create_book(&book).unwrap();
+        repo.add_isbn("9780000000001", &book.id).unwrap();
+
+        assert!(repo.find_by_isbn("9780000000001").unwrap().is_some());
+
+        repo.delete_book(&book.id).unwrap();
+        assert!(repo.find_by_isbn("9780000000001").unwrap().is_none());
+    }
+
+    #[test]
+    fn soft_delete_hides_from_find_by_title() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Unique Title XYZ");
+        repo.create_book(&book).unwrap();
+
+        assert!(
+            repo.find_book_by_title("Unique Title XYZ")
+                .unwrap()
+                .is_some()
+        );
+
+        repo.delete_book(&book.id).unwrap();
+        assert!(
+            repo.find_book_by_title("Unique Title XYZ")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tag_counts_exclude_deleted_books() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let book = Book::new("Tagged Book");
+        repo.create_book(&book).unwrap();
+        repo.add_tag_to_book(&book.id, "sci-fi").unwrap();
+
+        let counts = repo.list_tags_with_counts().unwrap();
+        let sci_fi = counts.iter().find(|(t, _)| t.name == "sci-fi").unwrap();
+        assert_eq!(sci_fi.1, 1);
+
+        repo.delete_book(&book.id).unwrap();
+        let counts = repo.list_tags_with_counts().unwrap();
+        let sci_fi = counts.iter().find(|(t, _)| t.name == "sci-fi").unwrap();
+        assert_eq!(sci_fi.1, 0); // tag still exists but count is 0
     }
 }

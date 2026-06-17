@@ -50,4 +50,7 @@ pub enum TokuError {
 
     #[error("invalid op type: {0}")]
     InvalidOpType(String),
+
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }

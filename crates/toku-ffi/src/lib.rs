@@ -1019,13 +1019,7 @@ pub unsafe extern "C" fn toku_sync_init(
             Err(st) => return st,
         };
 
-        match toku_sync_client::init(
-            Path::new(data_dir),
-            server,
-            None,
-            device_name,
-            passphrase,
-        ) {
+        match toku_sync_client::init(Path::new(data_dir), server, None, device_name, passphrase) {
             Ok(outcome) => write_sync_json(&outcome, out_json),
             Err(e) => {
                 set_last_error(&format!("sync init failed: {e}"));

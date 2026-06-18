@@ -263,7 +263,9 @@ pub fn status(data_dir: &Path) -> anyhow::Result<StatusOutcome> {
         .load(&server)?
         .and_then(|token| {
             let client = SyncClient::new(&server).ok()?;
-            rt.block_on(client.list_devices(&token)).ok().map(|d| d.len())
+            rt.block_on(client.list_devices(&token))
+                .ok()
+                .map(|d| d.len())
         })
         .unwrap_or(0);
 

@@ -3030,7 +3030,10 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 OutputFormat::Table => {
                     eprintln!("Sync initialized");
                     eprintln!("  Server:     {}", outcome.server);
-                    eprintln!("  Device:     {} ({})", outcome.device_name, outcome.device_id);
+                    eprintln!(
+                        "  Device:     {} ({})",
+                        outcome.device_name, outcome.device_id
+                    );
                     eprintln!("  Library:    {}", outcome.library_id);
                     eprintln!(
                         "  Encryption: {}",
@@ -3167,7 +3170,11 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 }
                 OutputFormat::Csv => {
                     println!("pulled,cursor");
-                    println!("{},{}", outcome.pulled, outcome.cursor.as_deref().unwrap_or(""));
+                    println!(
+                        "{},{}",
+                        outcome.pulled,
+                        outcome.cursor.as_deref().unwrap_or("")
+                    );
                 }
                 OutputFormat::Table => {
                     if outcome.pulled == 0 {

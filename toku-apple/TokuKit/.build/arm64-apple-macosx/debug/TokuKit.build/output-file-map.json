@@ -1,0 +1,65 @@
+{
+  "": {
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/master.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/FFI/TokuFFI.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/TokuFFI.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/TokuFFI.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/TokuFFI~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/TokuFFI.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/Models/Book.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Book.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Book.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Book~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Book.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/Models/Collections.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Collections.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Collections.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Collections~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Collections.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/Models/ReadingStats.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/ReadingStats.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/ReadingStats.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/ReadingStats~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/ReadingStats.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/Models/Sync.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Sync.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Sync.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Sync~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/Sync.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/ViewModels/BookDetailViewModel.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/BookDetailViewModel.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/BookDetailViewModel.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/BookDetailViewModel~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/BookDetailViewModel.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/ViewModels/ImportViewModel.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/ImportViewModel.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/ImportViewModel.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/ImportViewModel~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/ImportViewModel.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/ViewModels/LibraryViewModel.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/LibraryViewModel.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/LibraryViewModel.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/LibraryViewModel~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/LibraryViewModel.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/ViewModels/StatsViewModel.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/StatsViewModel.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/StatsViewModel.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/StatsViewModel~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/StatsViewModel.swiftdeps"
+  },
+  "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/Sources/TokuKit/ViewModels/SyncViewModel.swift": {
+    "dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/SyncViewModel.d",
+    "object": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/SyncViewModel.swift.o",
+    "swiftmodule": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/SyncViewModel~partial.swiftmodule",
+    "swift-dependencies": "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/SyncViewModel.swiftdeps"
+  }
+}

@@ -1,0 +1,4 @@
+module TokuKit {
+    header "/Users/javier/dev/kafkade/copilot-worktrees/toku/kafkade-studious-umbrella/toku-apple/TokuKit/.build/arm64-apple-macosx/debug/TokuKit.build/TokuKit-Swift.h"
+    requires objc
+}

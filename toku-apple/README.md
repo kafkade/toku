@@ -90,7 +90,7 @@ project in Xcode:
 1. **File → New → Project → macOS → App** (SwiftUI, Swift)
 2. Product name: `Toku`, bundle ID: `dev.toku.app`
 3. Set deployment target to **macOS 14.0**
-4. Add `TokuKit` as a local Swift Package dependency:
+4. Add `TokuKit` and `TokuKitUI` as local Swift Package dependencies:
    **File → Add Package → Add Local → select `toku-apple/TokuKit/`**
 5. Add the existing Swift source files from `Toku/` to the app target
 6. In **Build Settings**:

@@ -1,5 +1,6 @@
 import SwiftUI
 import TokuKit
+import TokuKitUI
 
 /// Root view that adapts between iPhone (TabView) and iPad (NavigationSplitView).
 struct ContentView: View {
@@ -50,6 +51,9 @@ struct ContentView: View {
                 }
             }
         }
+        .task {
+            appState.performLaunchSync()
+        }
     }
 
     // MARK: - iPad: Sidebar navigation
@@ -80,6 +84,10 @@ struct ContentView: View {
                         appState.libraryVM?.loadBooks()
                     })
                 }
+            case .sync:
+                if let vm = appState.syncVM {
+                    SyncSettingsView(viewModel: vm)
+                }
             case .none:
                 Text("Select an item from the sidebar")
                     .foregroundStyle(.secondary)
@@ -91,6 +99,9 @@ struct ContentView: View {
                 Text("Select a book to see details")
                     .foregroundStyle(.secondary)
             }
+        }
+        .task {
+            appState.performLaunchSync()
         }
     }
 
@@ -111,6 +122,11 @@ struct ContentView: View {
             Section("Manage") {
                 Label("Import", systemImage: "square.and.arrow.down")
                     .tag(SidebarItem.importBooks)
+            }
+
+            Section("Settings") {
+                Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+                    .tag(SidebarItem.sync)
             }
         }
         .listStyle(.sidebar)
@@ -141,6 +157,7 @@ enum SidebarItem: String, Identifiable, CaseIterable {
     case search = "Search"
     case stats = "Statistics"
     case importBooks = "Import"
+    case sync = "Sync"
 
     var id: String { rawValue }
 }
@@ -165,6 +182,16 @@ struct MoreView: View {
                 BarcodeScannerView(ffi: appState.ffi)
             } label: {
                 Label("Scan ISBN Barcode", systemImage: "barcode.viewfinder")
+            }
+
+            if let vm = appState.syncVM {
+                Section("Settings") {
+                    NavigationLink {
+                        SyncSettingsView(viewModel: vm)
+                    } label: {
+                        Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
             }
 
             Section("About") {

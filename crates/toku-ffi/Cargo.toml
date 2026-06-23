@@ -14,6 +14,7 @@ crate-type = ["cdylib", "staticlib"]
 toku-core.workspace = true
 toku-db.workspace = true
 toku-import.workspace = true
+toku-sync-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

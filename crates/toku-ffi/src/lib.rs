@@ -54,6 +54,8 @@ pub enum TokuStatus {
     ErrorDb = 4,
     /// A Rust panic was caught at the FFI boundary.
     ErrorPanic = 5,
+    /// A sync operation failed (network, auth, configuration, or merge error).
+    ErrorSync = 6,
 }
 
 // ── Opaque handle ───────────────────────────────────────────────────────
@@ -938,6 +940,233 @@ pub unsafe extern "C" fn toku_import_goodreads(
 
         unsafe { *out_json = rust_string_to_c(&json) };
         TokuStatus::Ok
+    }))
+}
+
+// ── Sync ────────────────────────────────────────────────────────────────
+
+/// Read an optional C string: null → `None`, otherwise borrow as `&str`.
+///
+/// # Safety
+/// `ptr` must be null or a valid NUL-terminated UTF-8 string.
+unsafe fn cstr_opt<'a>(ptr: *const c_char) -> Result<Option<&'a str>, TokuStatus> {
+    if ptr.is_null() {
+        Ok(None)
+    } else {
+        unsafe { cstr_to_str(ptr) }.map(Some)
+    }
+}
+
+/// Serialize a sync outcome to JSON and write it to `*out_json`.
+fn write_sync_json<T: Serialize>(value: &T, out_json: *mut *mut c_char) -> TokuStatus {
+    match serde_json::to_string(value) {
+        Ok(json) => {
+            unsafe { *out_json = rust_string_to_c(&json) };
+            TokuStatus::Ok
+        }
+        Err(e) => {
+            set_last_error(&format!("failed to serialize sync result: {e}"));
+            TokuStatus::ErrorSync
+        }
+    }
+}
+
+/// Initialize sync: register this device with the server, persist the auth token and
+/// sync configuration under `data_dir`, and (optionally) enable client-side encryption.
+///
+/// - `data_dir`: directory holding `toku.db` and `config.toml` (the app's data dir).
+/// - `server`: sync server base URL (e.g. `https://sync.example.com`).
+/// - `device_name`: human-readable device name, or null to derive one from the host name.
+/// - `passphrase`: encryption passphrase, or null to disable encryption.
+///
+/// On success, writes a JSON object describing the initialized sync state to `*out_json`.
+/// The caller must free `*out_json` with `toku_free_string`.
+///
+/// # Safety
+/// - `data_dir` and `server` must be valid NUL-terminated UTF-8 strings.
+/// - `device_name` and `passphrase` must each be null or a valid NUL-terminated UTF-8 string.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_sync_init(
+    data_dir: *const c_char,
+    server: *const c_char,
+    device_name: *const c_char,
+    passphrase: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out_json.is_null() {
+            set_last_error("out_json pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let data_dir = match unsafe { cstr_to_str(data_dir) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let server = match unsafe { cstr_to_str(server) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let device_name = match unsafe { cstr_opt(device_name) } {
+            Ok(v) => v.map(str::to_string),
+            Err(st) => return st,
+        };
+        let passphrase = match unsafe { cstr_opt(passphrase) } {
+            Ok(v) => v,
+            Err(st) => return st,
+        };
+
+        match toku_sync_client::init(Path::new(data_dir), server, None, device_name, passphrase) {
+            Ok(outcome) => write_sync_json(&outcome, out_json),
+            Err(e) => {
+                set_last_error(&format!("sync init failed: {e}"));
+                TokuStatus::ErrorSync
+            }
+        }
+    }))
+}
+
+/// Push all locally pending ops to the configured sync server.
+///
+/// On success, writes a JSON object (`pushed`, `accepted`, `duplicates`, `cursor`,
+/// `up_to_date`) to `*out_json`, which the caller must free with `toku_free_string`.
+///
+/// # Safety
+/// - `data_dir` must be a valid NUL-terminated UTF-8 string.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_sync_push(
+    data_dir: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out_json.is_null() {
+            set_last_error("out_json pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        let data_dir = match unsafe { cstr_to_str(data_dir) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        match toku_sync_client::push(Path::new(data_dir)) {
+            Ok(outcome) => write_sync_json(&outcome, out_json),
+            Err(e) => {
+                set_last_error(&format!("sync push failed: {e}"));
+                TokuStatus::ErrorSync
+            }
+        }
+    }))
+}
+
+/// Pull remote ops from the configured sync server and apply them locally.
+///
+/// On success, writes a JSON object (`pulled`, `cursor`) to `*out_json`, which the
+/// caller must free with `toku_free_string`.
+///
+/// # Safety
+/// - `data_dir` must be a valid NUL-terminated UTF-8 string.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_sync_pull(
+    data_dir: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out_json.is_null() {
+            set_last_error("out_json pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        let data_dir = match unsafe { cstr_to_str(data_dir) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        match toku_sync_client::pull(Path::new(data_dir)) {
+            Ok(outcome) => write_sync_json(&outcome, out_json),
+            Err(e) => {
+                set_last_error(&format!("sync pull failed: {e}"));
+                TokuStatus::ErrorSync
+            }
+        }
+    }))
+}
+
+/// Report the current sync status: configuration, pending op count, cursors, and the
+/// number of registered devices.
+///
+/// On success, writes a JSON object to `*out_json`, which the caller must free with
+/// `toku_free_string`. Fails with `ErrorSync` if sync is not configured.
+///
+/// # Safety
+/// - `data_dir` must be a valid NUL-terminated UTF-8 string.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_sync_status(
+    data_dir: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out_json.is_null() {
+            set_last_error("out_json pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        let data_dir = match unsafe { cstr_to_str(data_dir) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        match toku_sync_client::status(Path::new(data_dir)) {
+            Ok(outcome) => write_sync_json(&outcome, out_json),
+            Err(e) => {
+                set_last_error(&format!("sync status failed: {e}"));
+                TokuStatus::ErrorSync
+            }
+        }
+    }))
+}
+
+/// List the devices registered to this library on the sync server, as a JSON array.
+///
+/// On success, writes the array to `*out_json`, which the caller must free with
+/// `toku_free_string`.
+///
+/// # Safety
+/// - `data_dir` must be a valid NUL-terminated UTF-8 string.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_sync_devices(
+    data_dir: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out_json.is_null() {
+            set_last_error("out_json pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        let data_dir = match unsafe { cstr_to_str(data_dir) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        match toku_sync_client::devices(Path::new(data_dir)) {
+            Ok(devices) => write_sync_json(&devices, out_json),
+            Err(e) => {
+                set_last_error(&format!("sync devices failed: {e}"));
+                TokuStatus::ErrorSync
+            }
+        }
     }))
 }
 

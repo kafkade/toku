@@ -35,6 +35,10 @@ typedef enum TokuStatus {
    * A Rust panic was caught at the FFI boundary.
    */
   TOKU_STATUS_ERROR_PANIC = 5,
+  /**
+   * A sync operation failed (network, auth, configuration, or merge error).
+   */
+  TOKU_STATUS_ERROR_SYNC = 6,
 } TokuStatus;
 
 /**
@@ -202,6 +206,78 @@ enum TokuStatus toku_import_goodreads(struct TokuDb *db,
                                       const char *csv_path,
                                       bool dry_run,
                                       char **out_json);
+
+/**
+ * Initialize sync: register this device with the server, persist the auth token and
+ * sync configuration under `data_dir`, and (optionally) enable client-side encryption.
+ *
+ * - `data_dir`: directory holding `toku.db` and `config.toml` (the app's data dir).
+ * - `server`: sync server base URL (e.g. `https://sync.example.com`).
+ * - `device_name`: human-readable device name, or null to derive one from the host name.
+ * - `passphrase`: encryption passphrase, or null to disable encryption.
+ *
+ * On success, writes a JSON object describing the initialized sync state to `*out_json`.
+ * The caller must free `*out_json` with `toku_free_string`.
+ *
+ * # Safety
+ * - `data_dir` and `server` must be valid NUL-terminated UTF-8 strings.
+ * - `device_name` and `passphrase` must each be null or a valid NUL-terminated UTF-8 string.
+ * - `out_json` must be a valid pointer to a `*mut c_char`.
+ */
+enum TokuStatus toku_sync_init(const char *data_dir,
+                               const char *server,
+                               const char *device_name,
+                               const char *passphrase,
+                               char **out_json);
+
+/**
+ * Push all locally pending ops to the configured sync server.
+ *
+ * On success, writes a JSON object (`pushed`, `accepted`, `duplicates`, `cursor`,
+ * `up_to_date`) to `*out_json`, which the caller must free with `toku_free_string`.
+ *
+ * # Safety
+ * - `data_dir` must be a valid NUL-terminated UTF-8 string.
+ * - `out_json` must be a valid pointer to a `*mut c_char`.
+ */
+enum TokuStatus toku_sync_push(const char *data_dir, char **out_json);
+
+/**
+ * Pull remote ops from the configured sync server and apply them locally.
+ *
+ * On success, writes a JSON object (`pulled`, `cursor`) to `*out_json`, which the
+ * caller must free with `toku_free_string`.
+ *
+ * # Safety
+ * - `data_dir` must be a valid NUL-terminated UTF-8 string.
+ * - `out_json` must be a valid pointer to a `*mut c_char`.
+ */
+enum TokuStatus toku_sync_pull(const char *data_dir, char **out_json);
+
+/**
+ * Report the current sync status: configuration, pending op count, cursors, and the
+ * number of registered devices.
+ *
+ * On success, writes a JSON object to `*out_json`, which the caller must free with
+ * `toku_free_string`. Fails with `ErrorSync` if sync is not configured.
+ *
+ * # Safety
+ * - `data_dir` must be a valid NUL-terminated UTF-8 string.
+ * - `out_json` must be a valid pointer to a `*mut c_char`.
+ */
+enum TokuStatus toku_sync_status(const char *data_dir, char **out_json);
+
+/**
+ * List the devices registered to this library on the sync server, as a JSON array.
+ *
+ * On success, writes the array to `*out_json`, which the caller must free with
+ * `toku_free_string`.
+ *
+ * # Safety
+ * - `data_dir` must be a valid NUL-terminated UTF-8 string.
+ * - `out_json` must be a valid pointer to a `*mut c_char`.
+ */
+enum TokuStatus toku_sync_devices(const char *data_dir, char **out_json);
 
 /**
  * Free a string that was allocated by a `toku_*` function. Passing null is a safe no-op.

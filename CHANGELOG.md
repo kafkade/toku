@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Native client sync (FFI + Swift): the iOS and macOS apps can now configure sync, push, pull, and view sync status/devices directly. New `toku_sync_init/push/pull/status/devices` C FFI functions expose the sync client to Swift, backed by a shared `toku-sync-client` crate extracted from the CLI so both surfaces reuse one implementation
+- `SyncSettingsView` in the Apple apps (shared via `TokuKitUI`): set up sync against a server, enable optional end-to-end encryption, run "Sync Now"/push/pull, and view pending changes and registered devices — reachable from macOS Settings and the iOS Sync screen
+- Automatic sync-on-launch in the Apple apps: when sync is configured, the iOS and macOS apps run a best-effort push/pull once on launch and refresh the library and stats if remote changes were applied; failures are silent (non-blocking)
 - Snapshot compaction: `toku sync compact` creates a point-in-time snapshot of the entire library and uploads it to the server, pruning old ops to prevent unbounded op-log growth
 - New-device bootstrap via snapshot: `GET /api/v1/snapshot` downloads the latest snapshot, `POST /api/v1/snapshot` uploads one with automatic op pruning
 - `toku sync init` command for one-step sync setup: registers device, stores credentials, saves sync config to `config.toml`, with optional `--passphrase` for enabling encryption

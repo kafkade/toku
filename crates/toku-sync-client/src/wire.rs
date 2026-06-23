@@ -3,7 +3,7 @@
 use toku_core::sync::{EntityType, HlcTimestamp, OpType, SyncOp};
 use uuid::Uuid;
 
-use super::client::WireOp;
+use crate::client::WireOp;
 
 /// Convert a domain `SyncOp` to wire format for pushing to the server.
 pub fn to_wire(op: &SyncOp) -> WireOp {

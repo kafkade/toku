@@ -1,5 +1,6 @@
 import SwiftUI
 import TokuKit
+import TokuKitUI
 
 /// Main entry point for the Toku macOS app.
 @main
@@ -20,6 +21,7 @@ struct TokuApp: App {
         #if os(macOS)
         Settings {
             SettingsView()
+                .environmentObject(appState)
         }
         #endif
     }
@@ -32,6 +34,7 @@ final class AppState: ObservableObject {
     @Published var libraryVM: LibraryViewModel?
     @Published var statsVM: StatsViewModel?
     @Published var importVM: ImportViewModel?
+    @Published var syncVM: SyncViewModel?
     @Published var errorMessage: String?
 
     init() {
@@ -43,9 +46,20 @@ final class AppState: ObservableObject {
             self.libraryVM = LibraryViewModel(ffi: ffi)
             self.statsVM = StatsViewModel(ffi: ffi)
             self.importVM = ImportViewModel(ffi: ffi)
+            self.syncVM = SyncViewModel(ffi: ffi)
         } catch {
             self.ffi = nil
             self.errorMessage = "Failed to open database: \(error.localizedDescription)"
+        }
+    }
+
+    /// Run a best-effort sync at launch and refresh the library and stats if
+    /// remote changes were applied. Safe to call when sync is not configured.
+    func performLaunchSync() {
+        syncVM?.syncOnLaunch { [weak self] pulledChanges in
+            guard pulledChanges else { return }
+            self?.libraryVM?.loadBooks()
+            self?.statsVM?.loadStats()
         }
     }
 
@@ -66,11 +80,20 @@ final class AppState: ObservableObject {
 }
 
 struct SettingsView: View {
+    @EnvironmentObject var appState: AppState
+
     var body: some View {
-        Form {
-            Text("Toku settings will appear here.")
-                .padding()
+        Group {
+            if let syncVM = appState.syncVM {
+                SyncSettingsView(viewModel: syncVM)
+            } else {
+                Form {
+                    Text("Sync is unavailable because the database failed to open.")
+                        .foregroundStyle(.secondary)
+                        .padding()
+                }
+            }
         }
-        .frame(width: 400, height: 200)
+        .frame(width: 460, height: 420)
     }
 }

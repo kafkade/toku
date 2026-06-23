@@ -2,6 +2,12 @@
 /target/
 **/*.rs.bk
 
+# Swift / SwiftPM build artifacts
+.build/
+.swiftpm/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
 # IDE
 .idea/
 .vscode/

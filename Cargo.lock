@@ -5686,6 +5686,7 @@ dependencies = [
  "toku-export",
  "toku-import",
  "toku-meta",
+ "toku-sync-client",
  "toku-web",
  "toml 1.1.2+spec-1.1.0",
  "uuid",
@@ -5766,6 +5767,7 @@ dependencies = [
  "toku-core",
  "toku-db",
  "toku-import",
+ "toku-sync-client",
  "uuid",
 ]
 
@@ -5818,6 +5820,27 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "toku-sync-client"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "apple-native-keyring-store",
+ "base64 0.22.1",
+ "chrono",
+ "hostname",
+ "keyring-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toku-core",
+ "toku-db",
+ "uuid",
+ "windows-native-keyring-store",
+ "zbus-secret-service-keyring-store",
 ]
 
 [[package]]

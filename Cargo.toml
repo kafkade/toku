@@ -11,6 +11,7 @@ members = [
     "crates/toku-web",
     "crates/toku-desktop",
     "crates/toku-sync",
+    "crates/toku-sync-client",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ toku-meta = { path = "crates/toku-meta", version = "0.2.1" }
 toku-import = { path = "crates/toku-import", version = "0.2.1" }
 toku-export = { path = "crates/toku-export", version = "0.2.1" }
 toku-web = { path = "crates/toku-web", version = "0.2.1" }
+toku-sync-client = { path = "crates/toku-sync-client", version = "0.2.1" }
 thiserror = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }

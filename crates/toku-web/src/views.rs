@@ -2,6 +2,7 @@
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use toku_core::ReadingStats;
+use toku_db::SyncConflict;
 
 use crate::charts;
 
@@ -28,12 +29,86 @@ fn base(title: &str, content: Markup) -> Markup {
                             a.nav-link href="/stats" { "Dashboard" }
                             " "
                             a.nav-link href="/import" { "Import" }
+                            (crate::sync_status::header_badge())
                         }
                     }
                 }
                 main { (content) }
                 footer.site-footer {
                     p { "Toku — your private reading tracker" }
+                }
+            }
+        }
+    }
+}
+
+/// Render the sync conflicts page.
+pub fn conflicts_page(conflicts: &[SyncConflict]) -> Markup {
+    let content = html! {
+        div.dashboard-header {
+            h1 { "Sync Conflicts" }
+        }
+
+        @if conflicts.is_empty() {
+            div.conflict-empty {
+                p { "🎉 No unresolved conflicts." }
+                p.muted { "When two devices edit the same note or review, the earlier version is kept here for review." }
+            }
+        } @else {
+            div.conflict-toolbar {
+                p { (conflicts.len()) " unresolved conflict" @if conflicts.len() != 1 { "s" } "." }
+                div.conflict-bulk {
+                    form method="post" action="/conflicts/resolve-all" {
+                        input type="hidden" name="keep" value="local";
+                        button.btn.btn-secondary type="submit" { "Keep all local" }
+                    }
+                    form method="post" action="/conflicts/resolve-all" {
+                        input type="hidden" name="keep" value="remote";
+                        button.btn.btn-secondary type="submit" { "Keep all remote" }
+                    }
+                }
+            }
+
+            @for c in conflicts {
+                (conflict_card(c))
+            }
+        }
+    };
+    base("Sync Conflicts", content)
+}
+
+fn conflict_card(c: &SyncConflict) -> Markup {
+    let field = c.field_name.as_deref().unwrap_or("value");
+    let local = c.local_value.as_deref().unwrap_or("(empty)");
+    let remote = c.remote_value.as_deref().unwrap_or("(empty)");
+    let resolve_action = format!("/conflicts/resolve/{}", c.id);
+
+    html! {
+        div.conflict-card {
+            div.conflict-card-head {
+                span.conflict-entity { (c.entity_type) " · " (field) }
+                span.conflict-id { (c.entity_id) }
+            }
+            div.conflict-sides {
+                div.conflict-side {
+                    div.conflict-side-head { "Local" }
+                    div.conflict-hlc { (c.local_hlc) }
+                    pre.conflict-value { (local) }
+                }
+                div.conflict-side {
+                    div.conflict-side-head { "Remote" }
+                    div.conflict-hlc { (c.remote_hlc) }
+                    pre.conflict-value { (remote) }
+                }
+            }
+            div.conflict-actions {
+                form method="post" action=(resolve_action) {
+                    input type="hidden" name="keep" value="local";
+                    button.btn.btn-primary type="submit" { "Keep local" }
+                }
+                form method="post" action=(resolve_action) {
+                    input type="hidden" name="keep" value="remote";
+                    button.btn.btn-primary type="submit" { "Keep remote" }
                 }
             }
         }
@@ -691,11 +766,76 @@ main {
 }
 .wrap-footer a:hover { text-decoration: underline; }
 
+/* Sync indicator (header badge) */
+.sync-indicator {
+    margin-left: 0.75rem;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-decoration: none;
+    border: 1px solid var(--border);
+}
+.sync-indicator-ok { color: var(--text-secondary); }
+.sync-indicator-alert {
+    color: #fff;
+    background: #dc2626;
+    border-color: #dc2626;
+}
+.sync-indicator:hover { text-decoration: none; opacity: 0.9; }
+
+/* Buttons */
+.btn {
+    display: inline-block; padding: 0.5rem 1.25rem; border-radius: 6px;
+    font-size: 0.9rem; font-weight: 500; cursor: pointer; text-decoration: none;
+    border: 1px solid var(--border); background: var(--bg-card); color: var(--text);
+    transition: background 0.15s, border-color 0.15s;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-secondary { margin-left: 0.5rem; }
+
+/* Conflicts page */
+.conflict-empty {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 2rem; text-align: center; margin-top: 1.5rem;
+}
+.conflict-empty .muted { color: var(--text-secondary); font-size: 0.9rem; margin-top: 0.5rem; }
+.conflict-toolbar {
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 0.75rem; margin: 1.5rem 0;
+}
+.conflict-bulk { display: flex; }
+.conflict-bulk form { display: inline; }
+.conflict-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1.25rem; margin-bottom: 1.25rem;
+}
+.conflict-card-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem;
+}
+.conflict-entity { font-weight: 600; }
+.conflict-id { color: var(--text-secondary); font-size: 0.8rem; font-family: monospace; }
+.conflict-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.conflict-side {
+    border: 1px solid var(--border); border-radius: 8px; padding: 0.75rem;
+    background: var(--bg);
+}
+.conflict-side-head { font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.conflict-hlc { color: var(--text-secondary); font-size: 0.75rem; font-family: monospace; margin: 0.25rem 0 0.5rem; }
+.conflict-value { white-space: pre-wrap; word-break: break-word; font-family: inherit; font-size: 0.9rem; margin: 0; }
+.conflict-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+.conflict-actions form { display: inline; }
+.conflict-actions .btn-primary { margin-left: 0; }
+
 /* Responsive */
 @media (max-width: 640px) {
     .dashboard-header { flex-direction: column; }
     .metrics { grid-template-columns: repeat(2, 1fr); }
     .charts-row { grid-template-columns: 1fr; }
     .streak-cards { flex-direction: column; }
+    .conflict-sides { grid-template-columns: 1fr; }
 }
 "#;

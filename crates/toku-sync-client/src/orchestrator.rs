@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use serde::Serialize;
-use toku_db::{Database, SyncRepository};
+use toku_db::{ConflictKeep, Database, SyncConflict, SyncRepository};
 
 use crate::client::{DeviceInfo, SyncClient, WireOp};
 use crate::token_store::TokenStore;
@@ -57,6 +57,7 @@ pub struct StatusOutcome {
     pub push_cursor: Option<String>,
     pub pull_cursor: Option<String>,
     pub device_count: usize,
+    pub unresolved_conflicts: usize,
 }
 
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
@@ -258,6 +259,7 @@ pub fn status(data_dir: &Path) -> anyhow::Result<StatusOutcome> {
     let pending = sync_repo.count_unpushed_ops()?;
     let push_cursor = sync_repo.get_cursor("push_cursor")?;
     let pull_cursor = sync_repo.get_cursor("pull_cursor")?;
+    let unresolved_conflicts = sync_repo.count_unresolved_conflicts()? as usize;
 
     let device_count = token_store
         .load(&server)?
@@ -280,6 +282,7 @@ pub fn status(data_dir: &Path) -> anyhow::Result<StatusOutcome> {
         push_cursor,
         pull_cursor,
         device_count,
+        unresolved_conflicts,
     })
 }
 
@@ -295,6 +298,35 @@ pub fn devices(data_dir: &Path) -> anyhow::Result<Vec<DeviceInfo>> {
     let client = SyncClient::new(server)?;
     let devices = rt.block_on(client.list_devices(&token))?;
     Ok(devices)
+}
+
+/// List all unresolved sync conflicts awaiting user review.
+pub fn conflicts(data_dir: &Path) -> anyhow::Result<Vec<SyncConflict>> {
+    let db = open_db(data_dir)?;
+    let sync_repo = SyncRepository::new(&db);
+    Ok(sync_repo.list_unresolved_conflicts()?)
+}
+
+/// Fetch a single conflict by id.
+pub fn conflict(data_dir: &Path, id: &str) -> anyhow::Result<Option<SyncConflict>> {
+    let db = open_db(data_dir)?;
+    let sync_repo = SyncRepository::new(&db);
+    Ok(sync_repo.get_conflict(id)?)
+}
+
+/// Resolve a single conflict, keeping the local or remote value.
+/// Returns `false` if the conflict is missing or already resolved.
+pub fn resolve_conflict(data_dir: &Path, id: &str, keep: ConflictKeep) -> anyhow::Result<bool> {
+    let db = open_db(data_dir)?;
+    let sync_repo = SyncRepository::new(&db);
+    Ok(sync_repo.resolve_conflict(id, keep)?)
+}
+
+/// Resolve every unresolved conflict with the same choice. Returns the count resolved.
+pub fn resolve_all_conflicts(data_dir: &Path, keep: ConflictKeep) -> anyhow::Result<usize> {
+    let db = open_db(data_dir)?;
+    let sync_repo = SyncRepository::new(&db);
+    Ok(sync_repo.resolve_all_conflicts(keep)?)
 }
 
 /// The default device name, derived from the host name.

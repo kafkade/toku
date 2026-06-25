@@ -1,7 +1,7 @@
 import SwiftUI
 import TokuKit
 
-/// Main entry point for the Toku iOS app.
+/// Main entry point for the toku iOS app.
 @main
 struct TokuiOSApp: App {
     @StateObject private var appState = AppState()

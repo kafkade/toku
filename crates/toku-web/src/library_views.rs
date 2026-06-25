@@ -29,6 +29,7 @@ fn base(title: &str, content: Markup) -> Markup {
                             a.nav-link href="/stats" { "Dashboard" }
                             " "
                             a.nav-link href="/import" { "Import" }
+                            (crate::sync_status::header_badge())
                         }
                     }
                 }
@@ -713,6 +714,13 @@ a:hover { text-decoration: underline; }
 .logo { font-size: 1.25rem; font-weight: 700; color: var(--text); text-decoration: none; }
 .nav-link { color: var(--accent); text-decoration: none; font-weight: 500; }
 .nav-link:hover { text-decoration: underline; }
+.sync-indicator {
+    margin-left: 0.75rem; padding: 0.2rem 0.6rem; border-radius: 999px;
+    font-size: 0.8rem; font-weight: 600; text-decoration: none; border: 1px solid var(--border);
+}
+.sync-indicator-ok { color: var(--text-secondary); }
+.sync-indicator-alert { color: #fff; background: #dc2626; border-color: #dc2626; }
+.sync-indicator:hover { text-decoration: none; opacity: 0.9; }
 
 /* Footer */
 .site-footer { text-align: center; padding: 2rem 1rem; color: var(--text-secondary); font-size: 0.85rem; }

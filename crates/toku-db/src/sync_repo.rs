@@ -1,8 +1,49 @@
+use std::str::FromStr;
+
 use rusqlite::{OptionalExtension, params};
-use toku_core::{DeviceIdentity, EntityType, HlcTimestamp, OpType, SyncOp};
+use toku_core::{DeviceIdentity, EntityType, HlcTimestamp, HybridClock, OpType, SyncOp};
 use uuid::Uuid;
 
 use crate::{Database, DbError};
+
+/// Which side of a sync conflict to keep when resolving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictKeep {
+    /// Keep this device's local value.
+    Local,
+    /// Keep the incoming remote value.
+    Remote,
+}
+
+/// A stored sync conflict awaiting user review.
+///
+/// Mirrors a row of the `sync_conflicts` table. Conflicts are only produced for
+/// note and review edits that collide across devices (all other entity types
+/// merge silently).
+#[derive(Debug, Clone)]
+pub struct SyncConflict {
+    pub id: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub field_name: Option<String>,
+    pub local_value: Option<String>,
+    pub remote_value: Option<String>,
+    pub local_hlc: String,
+    pub remote_hlc: String,
+    pub resolved: bool,
+    pub resolved_at: Option<String>,
+    pub created_at: String,
+}
+
+impl SyncConflict {
+    /// The value that would remain if the given side is kept.
+    pub fn kept_value(&self, keep: ConflictKeep) -> Option<&str> {
+        match keep {
+            ConflictKeep::Local => self.local_value.as_deref(),
+            ConflictKeep::Remote => self.remote_value.as_deref(),
+        }
+    }
+}
 
 /// Sync persistence operations: ops, cursors, and device identity.
 pub struct SyncRepository<'a> {
@@ -211,6 +252,205 @@ impl<'a> SyncRepository<'a> {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
+    // Conflicts
+    // -----------------------------------------------------------------------
+
+    /// List all unresolved sync conflicts, oldest first.
+    pub fn list_unresolved_conflicts(&self) -> Result<Vec<SyncConflict>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, entity_type, entity_id, field_name, local_value, remote_value,
+                    local_hlc, remote_hlc, resolved, resolved_at, created_at
+             FROM sync_conflicts
+             WHERE resolved = 0
+             ORDER BY created_at ASC",
+        )?;
+        let conflicts = stmt
+            .query_map([], Self::map_conflict_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(conflicts)
+    }
+
+    /// Fetch a single conflict by id.
+    pub fn get_conflict(&self, id: &str) -> Result<Option<SyncConflict>, DbError> {
+        let conflict = self
+            .db
+            .conn
+            .query_row(
+                "SELECT id, entity_type, entity_id, field_name, local_value, remote_value,
+                        local_hlc, remote_hlc, resolved, resolved_at, created_at
+                 FROM sync_conflicts WHERE id = ?1",
+                params![id],
+                Self::map_conflict_row,
+            )
+            .optional()?;
+        Ok(conflict)
+    }
+
+    /// Count unresolved conflicts.
+    pub fn count_unresolved_conflicts(&self) -> Result<i64, DbError> {
+        let count: i64 = self.db.conn.query_row(
+            "SELECT COUNT(*) FROM sync_conflicts WHERE resolved = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Resolve a single conflict by keeping the local or remote value.
+    ///
+    /// Applies the chosen value to the underlying note/review entity, bumps the
+    /// per-field HLC, emits a new sync op so the resolution propagates to other
+    /// devices, and marks the conflict resolved. A no-op (returns `false`) if the
+    /// conflict is missing or already resolved.
+    pub fn resolve_conflict(&self, id: &str, keep: ConflictKeep) -> Result<bool, DbError> {
+        let Some(conflict) = self.get_conflict(id)? else {
+            return Ok(false);
+        };
+        if conflict.resolved {
+            return Ok(false);
+        }
+
+        self.apply_resolution(&conflict, keep)?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db.conn.execute(
+            "UPDATE sync_conflicts SET resolved = 1, resolved_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(true)
+    }
+
+    /// Resolve every unresolved conflict with the same choice. Returns the count resolved.
+    pub fn resolve_all_conflicts(&self, keep: ConflictKeep) -> Result<usize, DbError> {
+        let conflicts = self.list_unresolved_conflicts()?;
+        let mut resolved = 0;
+        for conflict in &conflicts {
+            self.apply_resolution(conflict, keep)?;
+            resolved += 1;
+        }
+        if resolved > 0 {
+            let now = chrono::Utc::now().to_rfc3339();
+            self.db.conn.execute(
+                "UPDATE sync_conflicts SET resolved = 1, resolved_at = ?1 WHERE resolved = 0",
+                params![now],
+            )?;
+        }
+        Ok(resolved)
+    }
+
+    /// Write the chosen value into the live entity, bump its HLC, and emit a
+    /// propagating sync op. Best-effort: if no device identity exists yet, the
+    /// entity value is still updated but no op is generated.
+    fn apply_resolution(&self, conflict: &SyncConflict, keep: ConflictKeep) -> Result<(), DbError> {
+        let field = conflict.field_name.as_deref().ok_or_else(|| {
+            DbError::InvalidOperation("conflict has no field to resolve".to_string())
+        })?;
+        let value = conflict.kept_value(keep);
+
+        let entity_type = EntityType::from_str(&conflict.entity_type)
+            .map_err(|_| DbError::InvalidOperation("unknown conflict entity type".to_string()))?;
+        let entity_uuid = Uuid::parse_str(&conflict.entity_id)
+            .map_err(|e| DbError::InvalidOperation(e.to_string()))?;
+
+        let device = self.get_device()?;
+        let (hlc_canonical, device_id_str) = match &device {
+            Some(identity) => {
+                let mut clock = HybridClock::new(&identity.device_id);
+                (clock.now().to_canonical(), identity.device_id.to_string())
+            }
+            None => (String::new(), String::new()),
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Build the fields payload for the propagating op (typed per field).
+        let field_value = match (entity_type, field) {
+            (EntityType::Review, "rating") => match value {
+                Some(v) => serde_json::json!(v.parse::<i64>().ok()),
+                None => serde_json::Value::Null,
+            },
+            _ => match value {
+                Some(v) => serde_json::json!(v),
+                None => serde_json::Value::Null,
+            },
+        };
+
+        match (entity_type, field) {
+            (EntityType::Note, "content") => {
+                self.db.conn.execute(
+                    "UPDATE notes SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![value.unwrap_or(""), now, conflict.entity_id],
+                )?;
+            }
+            (EntityType::Review, "content") => {
+                self.db.conn.execute(
+                    "UPDATE reviews SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![value, now, conflict.entity_id],
+                )?;
+            }
+            (EntityType::Review, "rating") => {
+                let rating: Option<i64> = value.and_then(|v| v.parse().ok());
+                self.db.conn.execute(
+                    "UPDATE reviews SET rating = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![rating, now, conflict.entity_id],
+                )?;
+            }
+            _ => {
+                return Err(DbError::InvalidOperation(format!(
+                    "cannot resolve conflict for {}.{field}",
+                    conflict.entity_type
+                )));
+            }
+        }
+
+        if let Some(identity) = device {
+            self.db.conn.execute(
+                "INSERT INTO sync_entity_hlc (entity_type, entity_id, field_name, sync_hlc, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (entity_type, entity_id, field_name)
+                 DO UPDATE SET sync_hlc = ?4, device_id = ?5",
+                params![
+                    conflict.entity_type,
+                    conflict.entity_id,
+                    field,
+                    hlc_canonical,
+                    device_id_str
+                ],
+            )?;
+
+            let hlc = HlcTimestamp::from_str(&hlc_canonical)
+                .map_err(|e| DbError::InvalidOperation(e.to_string()))?;
+            let op = SyncOp::new(
+                identity.device_id,
+                hlc,
+                entity_type,
+                entity_uuid,
+                OpType::Update,
+                Some(serde_json::json!({ field: field_value })),
+            );
+            self.insert_op(&op)?;
+        }
+
+        Ok(())
+    }
+
+    fn map_conflict_row(row: &rusqlite::Row) -> rusqlite::Result<SyncConflict> {
+        Ok(SyncConflict {
+            id: row.get(0)?,
+            entity_type: row.get(1)?,
+            entity_id: row.get(2)?,
+            field_name: row.get(3)?,
+            local_value: row.get(4)?,
+            remote_value: row.get(5)?,
+            local_hlc: row.get(6)?,
+            remote_hlc: row.get(7)?,
+            resolved: row.get::<_, i64>(8)? != 0,
+            resolved_at: row.get(9)?,
+            created_at: row.get(10)?,
+        })
     }
 }
 
@@ -449,5 +689,167 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sync_device", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // ── Conflict tests ──────────────────────────────────────────────
+
+    fn seed_book_and_note(db: &Database, note_id: &str, content: &str) {
+        let now = "2026-06-15T10:00:00Z";
+        db.conn
+            .execute(
+                "INSERT INTO books (id, title, created_at, updated_at)
+                 VALUES (?1, 'Dune', ?2, ?2)",
+                params!["01972123-aaaa-7000-8000-000000000abc", now],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO notes (id, book_id, content, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![
+                    note_id,
+                    "01972123-aaaa-7000-8000-000000000abc",
+                    content,
+                    now
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_conflict(
+        db: &Database,
+        id: &str,
+        entity_id: &str,
+        local: &str,
+        remote: &str,
+        resolved: bool,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO sync_conflicts
+                 (id, entity_type, entity_id, field_name, local_value, remote_value,
+                  local_hlc, remote_hlc, resolved, created_at)
+                 VALUES (?1, 'note', ?2, 'content', ?3, ?4, ?5, ?6, ?7,
+                         '2026-06-15T10:30:00Z')",
+                params![
+                    id,
+                    entity_id,
+                    local,
+                    remote,
+                    format!("hlc-a-{id}"),
+                    format!("hlc-b-{id}"),
+                    resolved as i64
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn list_and_count_unresolved_conflicts() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+        let note_id = Uuid::now_v7().to_string();
+        seed_book_and_note(&db, &note_id, "remote text");
+
+        insert_conflict(&db, "c1", &note_id, "local text", "remote text", false);
+        insert_conflict(&db, "c2", &note_id, "old local", "old remote", true);
+
+        let unresolved = repo.list_unresolved_conflicts().unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].id, "c1");
+        assert_eq!(repo.count_unresolved_conflicts().unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_conflict_keep_local_updates_note_and_emits_op() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+        repo.get_or_create_device("test-device").unwrap();
+
+        let note_id = Uuid::now_v7().to_string();
+        seed_book_and_note(&db, &note_id, "remote text");
+        insert_conflict(&db, "c1", &note_id, "local text", "remote text", false);
+
+        let resolved = repo.resolve_conflict("c1", ConflictKeep::Local).unwrap();
+        assert!(resolved);
+
+        // Note content reverted to the kept local value.
+        let content: String = db
+            .conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "local text");
+
+        // Conflict marked resolved and excluded from listings.
+        assert_eq!(repo.count_unresolved_conflicts().unwrap(), 0);
+        let conflict = repo.get_conflict("c1").unwrap().unwrap();
+        assert!(conflict.resolved);
+        assert!(conflict.resolved_at.is_some());
+
+        // A propagating op was emitted.
+        let ops = repo.get_unpushed_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].entity_type, EntityType::Note);
+        assert_eq!(ops[0].op_type, OpType::Update);
+    }
+
+    #[test]
+    fn resolve_conflict_keep_remote_keeps_remote_value() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+        repo.get_or_create_device("test-device").unwrap();
+
+        let note_id = Uuid::now_v7().to_string();
+        seed_book_and_note(&db, &note_id, "remote text");
+        insert_conflict(&db, "c1", &note_id, "local text", "remote text", false);
+
+        assert!(repo.resolve_conflict("c1", ConflictKeep::Remote).unwrap());
+
+        let content: String = db
+            .conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "remote text");
+    }
+
+    #[test]
+    fn resolve_all_conflicts_resolves_every_unresolved() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+        repo.get_or_create_device("test-device").unwrap();
+
+        let note_id = Uuid::now_v7().to_string();
+        seed_book_and_note(&db, &note_id, "remote text");
+        insert_conflict(&db, "c1", &note_id, "local 1", "remote 1", false);
+        insert_conflict(&db, "c2", &note_id, "local 2", "remote 2", false);
+
+        let count = repo.resolve_all_conflicts(ConflictKeep::Local).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(repo.count_unresolved_conflicts().unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_missing_or_resolved_conflict_is_noop() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+
+        assert!(
+            !repo
+                .resolve_conflict("missing", ConflictKeep::Local)
+                .unwrap()
+        );
+
+        let note_id = Uuid::now_v7().to_string();
+        seed_book_and_note(&db, &note_id, "x");
+        insert_conflict(&db, "c1", &note_id, "a", "b", true);
+        assert!(!repo.resolve_conflict("c1", ConflictKeep::Local).unwrap());
     }
 }

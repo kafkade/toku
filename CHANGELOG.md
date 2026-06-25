@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sync conflict resolution UI (CLI + web): `toku sync conflicts` lists unresolved note/review conflicts, `toku sync conflicts show <id>` shows the local/remote diff, and `resolve <id> --keep local|remote` / `resolve-all --keep local|remote` resolve them. Resolving writes the chosen value to the entity, marks the conflict resolved, and emits a propagating sync op. `toku sync status` now reports the unresolved conflict count
+- Web conflicts page (`/conflicts`): side-by-side local/remote diff cards with one-click keep-local / keep-remote buttons and bulk resolve actions, plus a sync status indicator in the dashboard header (shown only when sync is configured) that links to the conflicts page and highlights when conflicts are pending
 - Native client sync (FFI + Swift): the iOS and macOS apps can now configure sync, push, pull, and view sync status/devices directly. New `toku_sync_init/push/pull/status/devices` C FFI functions expose the sync client to Swift, backed by a shared `toku-sync-client` crate extracted from the CLI so both surfaces reuse one implementation
 - `SyncSettingsView` in the Apple apps (shared via `TokuKitUI`): set up sync against a server, enable optional end-to-end encryption, run "Sync Now"/push/pull, and view pending changes and registered devices — reachable from macOS Settings and the iOS Sync screen
 - Automatic sync-on-launch in the Apple apps: when sync is configured, the iOS and macOS apps run a best-effort push/pull once on launch and refresh the library and stats if remote changes were applied; failures are silent (non-blocking)

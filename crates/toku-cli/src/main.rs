@@ -611,6 +611,58 @@ enum SyncAction {
 
     /// Compact the op log by creating a snapshot and pruning old ops
     Compact,
+
+    /// Review and resolve sync conflicts (note/review edits that collided across devices)
+    Conflicts {
+        #[command(subcommand)]
+        action: Option<ConflictAction>,
+    },
+}
+
+#[derive(Clone, Subcommand)]
+enum ConflictAction {
+    /// List unresolved conflicts (default when no subcommand is given)
+    List,
+
+    /// Show the local/remote diff for a single conflict
+    Show {
+        /// Conflict ID
+        id: String,
+    },
+
+    /// Resolve a single conflict by keeping the local or remote value
+    Resolve {
+        /// Conflict ID
+        id: String,
+
+        /// Which side to keep
+        #[arg(long, value_enum)]
+        keep: KeepArg,
+    },
+
+    /// Resolve every unresolved conflict the same way
+    ResolveAll {
+        /// Which side to keep
+        #[arg(long, value_enum)]
+        keep: KeepArg,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KeepArg {
+    /// Keep this device's local value
+    Local,
+    /// Keep the incoming remote value
+    Remote,
+}
+
+impl From<KeepArg> for toku_db::ConflictKeep {
+    fn from(value: KeepArg) -> Self {
+        match value {
+            KeepArg::Local => toku_db::ConflictKeep::Local,
+            KeepArg::Remote => toku_db::ConflictKeep::Remote,
+        }
+    }
 }
 
 #[derive(Clone, ValueEnum)]
@@ -3066,6 +3118,7 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                             "push_cursor": status.push_cursor,
                             "pull_cursor": status.pull_cursor,
                             "device_count": status.device_count,
+                            "unresolved_conflicts": status.unresolved_conflicts,
                         }))?
                     );
                 }
@@ -3076,6 +3129,7 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                     println!("device,{}", status.device_name);
                     println!("pending_ops,{}", status.pending_ops);
                     println!("device_count,{}", status.device_count);
+                    println!("unresolved_conflicts,{}", status.unresolved_conflicts);
                 }
                 OutputFormat::Table => {
                     eprintln!("Sync: enabled");
@@ -3101,6 +3155,14 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                     );
                     if status.device_count > 0 {
                         eprintln!("Devices: {} registered", status.device_count);
+                    }
+                    if status.unresolved_conflicts > 0 {
+                        eprintln!(
+                            "Conflicts: {} unresolved (run `toku sync conflicts`)",
+                            status.unresolved_conflicts
+                        );
+                    } else {
+                        eprintln!("Conflicts: none");
                     }
                 }
             }
@@ -3490,6 +3552,169 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 }
                 OutputFormat::Table => {
                     eprintln!("Snapshot uploaded, {} ops pruned", result.ops_pruned);
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Conflicts { action } => {
+            let action = action.unwrap_or(ConflictAction::List);
+            cmd_sync_conflicts(data_dir, action, output_format)
+        }
+    }
+}
+
+fn conflict_to_json(c: &toku_db::SyncConflict) -> serde_json::Value {
+    serde_json::json!({
+        "id": c.id,
+        "entity_type": c.entity_type,
+        "entity_id": c.entity_id,
+        "field_name": c.field_name,
+        "local_value": c.local_value,
+        "remote_value": c.remote_value,
+        "local_hlc": c.local_hlc,
+        "remote_hlc": c.remote_hlc,
+        "created_at": c.created_at,
+    })
+}
+
+fn print_conflict_human(c: &toku_db::SyncConflict) {
+    let field = c.field_name.as_deref().unwrap_or("");
+    let local = c.local_value.as_deref().unwrap_or("(none)");
+    let remote = c.remote_value.as_deref().unwrap_or("(none)");
+    eprintln!("Conflict {}", c.id);
+    eprintln!("  Entity: {} {} ({field})", c.entity_type, c.entity_id);
+    eprintln!("  Local  [{}]: {local}", c.local_hlc);
+    eprintln!("  Remote [{}]: {remote}", c.remote_hlc);
+    eprintln!(
+        "  Resolve: toku sync conflicts resolve {} --keep local|remote",
+        c.id
+    );
+}
+
+fn cmd_sync_conflicts(
+    data_dir: &Path,
+    action: ConflictAction,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    match action {
+        ConflictAction::List => {
+            let conflicts = sync::orchestrator::conflicts(data_dir)?;
+            match output_format {
+                OutputFormat::Json => {
+                    let arr: Vec<_> = conflicts.iter().map(conflict_to_json).collect();
+                    println!("{}", serde_json::to_string_pretty(&arr)?);
+                }
+                OutputFormat::Csv => {
+                    println!("id,entity_type,entity_id,field_name,local_value,remote_value");
+                    for c in &conflicts {
+                        println!(
+                            "{},{},{},{},{},{}",
+                            c.id,
+                            c.entity_type,
+                            c.entity_id,
+                            c.field_name.as_deref().unwrap_or(""),
+                            c.local_value.as_deref().unwrap_or(""),
+                            c.remote_value.as_deref().unwrap_or("")
+                        );
+                    }
+                }
+                OutputFormat::Table => {
+                    if conflicts.is_empty() {
+                        eprintln!("No unresolved conflicts.");
+                    } else {
+                        eprintln!("{} unresolved conflict(s):\n", conflicts.len());
+                        for c in &conflicts {
+                            print_conflict_human(c);
+                            eprintln!();
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        ConflictAction::Show { id } => {
+            let conflict = sync::orchestrator::conflict(data_dir, &id)?
+                .ok_or_else(|| anyhow::anyhow!("no conflict found with id {id}"))?;
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&conflict_to_json(&conflict))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("id,entity_type,entity_id,field_name,local_value,remote_value");
+                    println!(
+                        "{},{},{},{},{},{}",
+                        conflict.id,
+                        conflict.entity_type,
+                        conflict.entity_id,
+                        conflict.field_name.as_deref().unwrap_or(""),
+                        conflict.local_value.as_deref().unwrap_or(""),
+                        conflict.remote_value.as_deref().unwrap_or("")
+                    );
+                }
+                OutputFormat::Table => {
+                    print_conflict_human(&conflict);
+                }
+            }
+            Ok(())
+        }
+
+        ConflictAction::Resolve { id, keep } => {
+            let resolved = sync::orchestrator::resolve_conflict(data_dir, &id, keep.into())?;
+            if !resolved {
+                anyhow::bail!("no unresolved conflict found with id {id}");
+            }
+            let kept = match keep {
+                KeepArg::Local => "local",
+                KeepArg::Remote => "remote",
+            };
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "resolved": id,
+                            "kept": kept,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("resolved,kept");
+                    println!("{id},{kept}");
+                }
+                OutputFormat::Table => {
+                    eprintln!("Resolved conflict {id} (kept {kept}).");
+                }
+            }
+            Ok(())
+        }
+
+        ConflictAction::ResolveAll { keep } => {
+            let count = sync::orchestrator::resolve_all_conflicts(data_dir, keep.into())?;
+            let kept = match keep {
+                KeepArg::Local => "local",
+                KeepArg::Remote => "remote",
+            };
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "resolved_count": count,
+                            "kept": kept,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("resolved_count,kept");
+                    println!("{count},{kept}");
+                }
+                OutputFormat::Table => {
+                    eprintln!("Resolved {count} conflict(s) (kept {kept}).");
                 }
             }
             Ok(())

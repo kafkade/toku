@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import TokuKit
 
 /// Camera-based ISBN barcode scanner using AVFoundation.
 ///

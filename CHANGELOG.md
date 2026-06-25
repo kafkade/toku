@@ -87,12 +87,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `toku sync register` replaced by `toku sync init` with automatic defaults (hostname-based device name, auto-generated library ID)
 - `toku sync push`, `pull`, `devices`, `rekey`, and `compact` no longer require `--server` flag — server URL is read from sync config
 - `toku sync logout` replaced by `toku sync disable` which also clears sync config
+- iOS and iPad app now displays as `toku` (lowercase) on the home screen
 
 ### Removed
 
 - `toku sync register` command (replaced by `toku sync init`)
 - `toku sync logout` command (replaced by `toku sync disable`)
 - `--server` flag from push, pull, devices, rekey, and compact subcommands (now read from config)
+
+### Fixed
+
+- iOS and iPad app now builds and launches (previously authored but never compiled): fixed a missing `TokuKit` import, replaced the iOS 18-only tab API with an iOS 17 compatible tab bar, corrected an FFI status-code type mismatch, and added the `Info.plist` keys (`CFBundleExecutable`, `CFBundlePackageType`, etc.) required for installation
 
 ## [0.2.1] - 2026-05-30
 

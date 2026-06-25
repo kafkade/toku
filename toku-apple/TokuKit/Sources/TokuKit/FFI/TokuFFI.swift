@@ -215,7 +215,7 @@ public final class TokuFFI: @unchecked Sendable {
         case TOKU_STATUS_ERROR_PANIC:
             throw TokuError.panic(lastError())
         default:
-            throw TokuError.unknown(status.rawValue)
+            throw TokuError.unknown(Int32(bitPattern: status.rawValue))
         }
     }
 

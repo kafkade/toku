@@ -20,35 +20,31 @@ struct ContentView: View {
 
     private var iPhoneLayout: some View {
         TabView {
-            Tab("Library", systemImage: "books.vertical") {
-                NavigationStack {
-                    if let vm = appState.libraryVM {
-                        LibraryGridView(viewModel: vm, ffi: appState.ffi)
-                    }
+            NavigationStack {
+                if let vm = appState.libraryVM {
+                    LibraryGridView(viewModel: vm, ffi: appState.ffi)
                 }
             }
+            .tabItem { Label("Library", systemImage: "books.vertical") }
 
-            Tab("Search", systemImage: "magnifyingglass") {
-                NavigationStack {
-                    if let vm = appState.libraryVM {
-                        SearchView(viewModel: vm, ffi: appState.ffi)
-                    }
+            NavigationStack {
+                if let vm = appState.libraryVM {
+                    SearchView(viewModel: vm, ffi: appState.ffi)
                 }
             }
+            .tabItem { Label("Search", systemImage: "magnifyingglass") }
 
-            Tab("Stats", systemImage: "chart.bar") {
-                NavigationStack {
-                    if let vm = appState.statsVM {
-                        StatsGlanceView(viewModel: vm)
-                    }
+            NavigationStack {
+                if let vm = appState.statsVM {
+                    StatsGlanceView(viewModel: vm)
                 }
             }
+            .tabItem { Label("Stats", systemImage: "chart.bar") }
 
-            Tab("More", systemImage: "ellipsis") {
-                NavigationStack {
-                    MoreView()
-                }
+            NavigationStack {
+                MoreView()
             }
+            .tabItem { Label("More", systemImage: "ellipsis") }
         }
     }
 

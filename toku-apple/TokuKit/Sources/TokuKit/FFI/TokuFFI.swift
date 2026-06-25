@@ -8,6 +8,7 @@ public enum TokuError: LocalizedError {
     case notFound
     case database(String)
     case panic(String)
+    case sync(String)
     case unknown(Int32)
 
     public var errorDescription: String? {
@@ -22,6 +23,8 @@ public enum TokuError: LocalizedError {
             return "Database error: \(msg)"
         case .panic(let msg):
             return "Internal error: \(msg)"
+        case .sync(let msg):
+            return "Sync error: \(msg)"
         case .unknown(let code):
             return "Unknown error (code \(code))"
         }
@@ -35,6 +38,10 @@ public enum TokuError: LocalizedError {
 public final class TokuFFI: @unchecked Sendable {
     private let db: OpaquePointer
 
+    /// Directory containing `toku.db` and `config.toml`. Sync operations read and write
+    /// configuration and credentials here, independent of the open database handle.
+    public let dataDir: String
+
     /// Open (or create) a Toku database at the given path.
     public init(path: String) throws {
         var handle: OpaquePointer?
@@ -46,6 +53,7 @@ public final class TokuFFI: @unchecked Sendable {
             throw TokuError.nullPointer
         }
         self.db = h
+        self.dataDir = (path as NSString).deletingLastPathComponent
     }
 
     deinit {
@@ -172,6 +180,66 @@ public final class TokuFFI: @unchecked Sendable {
         return try JSONDecoder.toku.decode(ImportReport.self, from: data)
     }
 
+    // MARK: - Sync
+
+    /// Initialize sync: register this device with the server and persist sync config.
+    ///
+    /// - Parameters:
+    ///   - server: sync server base URL.
+    ///   - deviceName: human-readable device name, or nil to derive from the host name.
+    ///   - passphrase: encryption passphrase, or nil to disable client-side encryption.
+    @discardableResult
+    public func syncInit(
+        server: String,
+        deviceName: String? = nil,
+        passphrase: String? = nil
+    ) throws -> SyncInitOutcome {
+        let json = try dataDir.withCString { dir -> Data in
+            try server.withCString { srv in
+                try withOptionalCString(deviceName) { dev in
+                    try withOptionalCString(passphrase) { pass in
+                        try callJson { toku_sync_init(dir, srv, dev, pass, &$0) }
+                    }
+                }
+            }
+        }
+        return try JSONDecoder.toku.decode(SyncInitOutcome.self, from: json)
+    }
+
+    /// Push all locally pending ops to the configured sync server.
+    @discardableResult
+    public func syncPush() throws -> SyncPushOutcome {
+        let json = try dataDir.withCString { dir in
+            try callJson { toku_sync_push(dir, &$0) }
+        }
+        return try JSONDecoder.toku.decode(SyncPushOutcome.self, from: json)
+    }
+
+    /// Pull remote ops from the configured sync server and apply them locally.
+    @discardableResult
+    public func syncPull() throws -> SyncPullOutcome {
+        let json = try dataDir.withCString { dir in
+            try callJson { toku_sync_pull(dir, &$0) }
+        }
+        return try JSONDecoder.toku.decode(SyncPullOutcome.self, from: json)
+    }
+
+    /// Report the current sync status. Throws if sync is not configured.
+    public func syncStatus() throws -> SyncStatus {
+        let json = try dataDir.withCString { dir in
+            try callJson { toku_sync_status(dir, &$0) }
+        }
+        return try JSONDecoder.toku.decode(SyncStatus.self, from: json)
+    }
+
+    /// List the devices registered to this library on the sync server.
+    public func syncDevices() throws -> [SyncDevice] {
+        let json = try dataDir.withCString { dir in
+            try callJson { toku_sync_devices(dir, &$0) }
+        }
+        return try JSONDecoder.toku.decode([SyncDevice].self, from: json)
+    }
+
     // MARK: - Internal helpers
 
     /// Call an FFI function that writes JSON to an out-pointer.
@@ -184,6 +252,18 @@ public final class TokuFFI: @unchecked Sendable {
         defer { toku_free_string(outJson) }
         guard let ptr = outJson else { throw TokuError.nullPointer }
         return Data(String(cString: ptr).utf8)
+    }
+
+    /// Invoke `body` with a C string for `s`, or with nil when `s` is nil.
+    private func withOptionalCString<R>(
+        _ s: String?,
+        _ body: (UnsafePointer<CChar>?) throws -> R
+    ) rethrows -> R {
+        if let s {
+            return try s.withCString { try body($0) }
+        } else {
+            return try body(nil)
+        }
     }
 
     /// Call an FFI function that takes an ID and writes JSON.
@@ -214,8 +294,10 @@ public final class TokuFFI: @unchecked Sendable {
             throw TokuError.database(lastError())
         case TOKU_STATUS_ERROR_PANIC:
             throw TokuError.panic(lastError())
+        case TOKU_STATUS_ERROR_SYNC:
+            throw TokuError.sync(lastError())
         default:
-            throw TokuError.unknown(Int32(bitPattern: status.rawValue))
+            throw TokuError.unknown(Int32(status.rawValue))
         }
     }
 

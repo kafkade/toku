@@ -67,6 +67,9 @@ struct ContentView: View {
                 placement: .toolbar,
                 prompt: "Search books..."
             )
+            .task {
+                appState.performLaunchSync()
+            }
         }
     }
 }

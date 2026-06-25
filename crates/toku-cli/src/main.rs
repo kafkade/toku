@@ -2979,22 +2979,7 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
             device_name,
             passphrase,
         } => {
-            let library_id = library_id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-            let device_name = device_name.unwrap_or_else(|| {
-                hostname::get()
-                    .ok()
-                    .and_then(|h| h.into_string().ok())
-                    .unwrap_or_else(|| "unknown-device".to_string())
-            });
-
-            let client = sync::client::SyncClient::new(&server)?;
-            let resp = rt.block_on(client.register(&library_id, &device_name))?;
-
-            token_store
-                .store(&server, &resp.auth_token)
-                .context("failed to store auth token")?;
-
-            let encryption_enabled = if passphrase {
+            let passphrase_value = if passphrase {
                 eprint!("Encryption passphrase: ");
                 let pass = rpassword::read_password().context("failed to read passphrase")?;
                 if pass.is_empty() {
@@ -3005,62 +2990,54 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 if pass != confirm {
                     anyhow::bail!("passphrases do not match");
                 }
-                let salt = toku_core::SyncKey::generate_salt();
-                let key = toku_core::SyncKey::derive(&pass, &salt)
-                    .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
-                token_store
-                    .store_sync_key(&server, key.as_exported_bytes())
-                    .context("failed to store sync key")?;
-                true
+                Some(pass)
             } else {
-                false
+                None
             };
 
-            let db_path = data_dir.join("toku.db");
-            let db = Database::open(&db_path).context("failed to open database")?;
-            let sync_repo = toku_db::SyncRepository::new(&db);
-            sync_repo.get_or_create_device(&device_name)?;
-
-            let mut config = config;
-            config.sync = Some(toku_core::SyncConfig {
-                server: server.clone(),
-                library_id: resp.library_id.clone(),
-                device_id: resp.device_id.clone(),
-                device_name: device_name.clone(),
-                encryption: encryption_enabled,
-            });
-            config
-                .save(data_dir)
-                .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
+            let outcome = sync::orchestrator::init(
+                data_dir,
+                &server,
+                library_id,
+                device_name,
+                passphrase_value.as_deref(),
+            )?;
 
             match output_format {
                 OutputFormat::Json => {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "device_id": resp.device_id,
-                            "library_id": resp.library_id,
-                            "device_name": device_name,
-                            "server": server,
-                            "encryption": encryption_enabled,
+                            "device_id": outcome.device_id,
+                            "library_id": outcome.library_id,
+                            "device_name": outcome.device_name,
+                            "server": outcome.server,
+                            "encryption": outcome.encryption,
                         }))?
                     );
                 }
                 OutputFormat::Csv => {
                     println!("device_id,library_id,device_name,server,encryption");
                     println!(
-                        "{},{},{device_name},{server},{encryption_enabled}",
-                        resp.device_id, resp.library_id
+                        "{},{},{},{},{}",
+                        outcome.device_id,
+                        outcome.library_id,
+                        outcome.device_name,
+                        outcome.server,
+                        outcome.encryption
                     );
                 }
                 OutputFormat::Table => {
                     eprintln!("Sync initialized");
-                    eprintln!("  Server:     {server}");
-                    eprintln!("  Device:     {device_name} ({})", resp.device_id);
-                    eprintln!("  Library:    {}", resp.library_id);
+                    eprintln!("  Server:     {}", outcome.server);
+                    eprintln!(
+                        "  Device:     {} ({})",
+                        outcome.device_name, outcome.device_id
+                    );
+                    eprintln!("  Library:    {}", outcome.library_id);
                     eprintln!(
                         "  Encryption: {}",
-                        if encryption_enabled {
+                        if outcome.encryption {
                             "enabled"
                         } else {
                             "disabled"
@@ -3072,85 +3049,58 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
         }
 
         SyncAction::Status => {
-            let sync_config = require_sync(&config)?;
-            let server = &sync_config.server;
-
-            let db_path = data_dir.join("toku.db");
-            let db = Database::open(&db_path).context("failed to open database")?;
-            let sync_repo = toku_db::SyncRepository::new(&db);
-
-            let pending = sync_repo.count_unpushed_ops()?;
-            let push_cursor = sync_repo.get_cursor("push_cursor")?;
-            let pull_cursor = sync_repo.get_cursor("pull_cursor")?;
-            let device = sync_repo.get_device()?;
-
-            let device_count = token_store
-                .load(server)?
-                .and_then(|token| {
-                    let client = sync::client::SyncClient::new(server).ok()?;
-                    rt.block_on(client.list_devices(&token))
-                        .ok()
-                        .map(|d| d.len())
-                })
-                .unwrap_or(0);
+            let status = sync::orchestrator::status(data_dir)?;
 
             match output_format {
                 OutputFormat::Json => {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "enabled": true,
-                            "server": server,
-                            "device_id": sync_config.device_id,
-                            "device_name": sync_config.device_name,
-                            "library_id": sync_config.library_id,
-                            "encryption": sync_config.encryption,
-                            "pending_ops": pending,
-                            "push_cursor": push_cursor,
-                            "pull_cursor": pull_cursor,
-                            "device_count": device_count,
+                            "enabled": status.enabled,
+                            "server": status.server,
+                            "device_id": status.device_id,
+                            "device_name": status.device_name,
+                            "library_id": status.library_id,
+                            "encryption": status.encryption,
+                            "pending_ops": status.pending_ops,
+                            "push_cursor": status.push_cursor,
+                            "pull_cursor": status.pull_cursor,
+                            "device_count": status.device_count,
                         }))?
                     );
                 }
                 OutputFormat::Csv => {
                     println!("key,value");
-                    println!("enabled,true");
-                    println!("server,{server}");
-                    println!("device,{}", sync_config.device_name);
-                    println!("pending_ops,{pending}");
-                    println!("device_count,{device_count}");
+                    println!("enabled,{}", status.enabled);
+                    println!("server,{}", status.server);
+                    println!("device,{}", status.device_name);
+                    println!("pending_ops,{}", status.pending_ops);
+                    println!("device_count,{}", status.device_count);
                 }
                 OutputFormat::Table => {
                     eprintln!("Sync: enabled");
-                    eprintln!("Server: {server}");
-                    if let Some(dev) = &device {
-                        eprintln!("Device: {} ({})", dev.device_name, dev.device_id);
-                    } else {
-                        eprintln!(
-                            "Device: {} ({})",
-                            sync_config.device_name, sync_config.device_id
-                        );
-                    }
-                    eprintln!("Library: {}", sync_config.library_id);
-                    eprintln!("Pending ops: {pending}");
+                    eprintln!("Server: {}", status.server);
+                    eprintln!("Device: {} ({})", status.device_name, status.device_id);
+                    eprintln!("Library: {}", status.library_id);
+                    eprintln!("Pending ops: {}", status.pending_ops);
                     eprintln!(
                         "Last push cursor: {}",
-                        push_cursor.as_deref().unwrap_or("none")
+                        status.push_cursor.as_deref().unwrap_or("none")
                     );
                     eprintln!(
                         "Last pull cursor: {}",
-                        pull_cursor.as_deref().unwrap_or("none")
+                        status.pull_cursor.as_deref().unwrap_or("none")
                     );
                     eprintln!(
                         "Encryption: {}",
-                        if sync_config.encryption {
+                        if status.encryption {
                             "enabled"
                         } else {
                             "disabled"
                         }
                     );
-                    if device_count > 0 {
-                        eprintln!("Devices: {device_count} registered");
+                    if status.device_count > 0 {
+                        eprintln!("Devices: {} registered", status.device_count);
                     }
                 }
             }
@@ -3158,17 +3108,9 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
         }
 
         SyncAction::Push => {
-            let sync_config = require_sync(&config)?;
-            let server = &sync_config.server;
-            let token = require_token(&token_store, server)?;
+            let outcome = sync::orchestrator::push(data_dir)?;
 
-            let db_path = data_dir.join("toku.db");
-            let db = Database::open(&db_path).context("failed to open database")?;
-            let sync_repo = toku_db::SyncRepository::new(&db);
-            let client = sync::client::SyncClient::new(server)?;
-
-            let unpushed = sync_repo.get_unpushed_ops()?;
-            if unpushed.is_empty() {
+            if outcome.up_to_date {
                 match output_format {
                     OutputFormat::Json => {
                         println!(
@@ -3184,105 +3126,61 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 return Ok(());
             }
 
-            let total = unpushed.len();
-            let wire_ops: Vec<sync::client::WireOp> =
-                unpushed.iter().map(sync::wire::to_wire).collect();
-
-            let mut total_accepted = 0usize;
-            let mut total_duplicates = 0usize;
-            let mut last_cursor = None;
-
-            for chunk in wire_ops.chunks(1000) {
-                let result = rt.block_on(client.push_ops(&token, chunk))?;
-                total_accepted += result.accepted;
-                total_duplicates += result.duplicates;
-                if result.new_cursor.is_some() {
-                    last_cursor = result.new_cursor;
-                }
-            }
-
-            let op_ids: Vec<uuid::Uuid> = unpushed.iter().map(|op| op.op_id).collect();
-            sync_repo.mark_ops_pushed(&op_ids)?;
-
-            if let Some(ref cursor) = last_cursor {
-                sync_repo.set_cursor("push_cursor", cursor)?;
-            }
-
             match output_format {
                 OutputFormat::Json => {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "pushed": total,
-                            "accepted": total_accepted,
-                            "duplicates": total_duplicates,
-                            "cursor": last_cursor,
+                            "pushed": outcome.pushed,
+                            "accepted": outcome.accepted,
+                            "duplicates": outcome.duplicates,
+                            "cursor": outcome.cursor,
                         }))?
                     );
                 }
                 OutputFormat::Csv => {
                     println!("pushed,accepted,duplicates");
-                    println!("{total},{total_accepted},{total_duplicates}");
+                    println!(
+                        "{},{},{}",
+                        outcome.pushed, outcome.accepted, outcome.duplicates
+                    );
                 }
                 OutputFormat::Table => {
-                    eprintln!("Pushed {total_accepted} ops ({total_duplicates} duplicates)");
+                    eprintln!(
+                        "Pushed {} ops ({} duplicates)",
+                        outcome.accepted, outcome.duplicates
+                    );
                 }
             }
             Ok(())
         }
 
         SyncAction::Pull => {
-            let sync_config = require_sync(&config)?;
-            let server = &sync_config.server;
-            let token = require_token(&token_store, server)?;
-
-            let db_path = data_dir.join("toku.db");
-            let db = Database::open(&db_path).context("failed to open database")?;
-            let sync_repo = toku_db::SyncRepository::new(&db);
-            let client = sync::client::SyncClient::new(server)?;
-
-            let mut cursor = sync_repo.get_cursor("pull_cursor")?;
-            let mut total_pulled = 0usize;
-
-            loop {
-                let result = rt.block_on(client.pull_ops(&token, cursor.as_deref()))?;
-                if result.ops.is_empty() {
-                    break;
-                }
-                for wire_op in &result.ops {
-                    let sync_op =
-                        sync::wire::from_wire(wire_op).context("failed to parse remote op")?;
-                    sync_repo.insert_remote_op(&sync_op)?;
-                }
-                total_pulled += result.ops.len();
-                if let Some(new_cursor) = result.cursor {
-                    sync_repo.set_cursor("pull_cursor", &new_cursor)?;
-                    cursor = Some(new_cursor);
-                }
-                if !result.has_more {
-                    break;
-                }
-            }
+            let outcome = sync::orchestrator::pull(data_dir)?;
 
             match output_format {
                 OutputFormat::Json => {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "pulled": total_pulled,
-                            "cursor": cursor,
+                            "pulled": outcome.pulled,
+                            "cursor": outcome.cursor,
                         }))?
                     );
                 }
                 OutputFormat::Csv => {
                     println!("pulled,cursor");
-                    println!("{total_pulled},{}", cursor.as_deref().unwrap_or(""));
+                    println!(
+                        "{},{}",
+                        outcome.pulled,
+                        outcome.cursor.as_deref().unwrap_or("")
+                    );
                 }
                 OutputFormat::Table => {
-                    if total_pulled == 0 {
+                    if outcome.pulled == 0 {
                         eprintln!("Nothing to pull already up to date");
                     } else {
-                        eprintln!("Pulled {total_pulled} ops");
+                        eprintln!("Pulled {} ops", outcome.pulled);
                     }
                 }
             }
@@ -3290,12 +3188,7 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
         }
 
         SyncAction::Devices => {
-            let sync_config = require_sync(&config)?;
-            let server = &sync_config.server;
-            let token = require_token(&token_store, server)?;
-
-            let client = sync::client::SyncClient::new(server)?;
-            let devices = rt.block_on(client.list_devices(&token))?;
+            let devices = sync::orchestrator::devices(data_dir)?;
 
             match output_format {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&devices)?),

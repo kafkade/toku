@@ -21,6 +21,7 @@ final class AppState: ObservableObject {
     @Published var libraryVM: LibraryViewModel?
     @Published var statsVM: StatsViewModel?
     @Published var importVM: ImportViewModel?
+    @Published var syncVM: SyncViewModel?
     @Published var errorMessage: String?
 
     init() {
@@ -32,9 +33,20 @@ final class AppState: ObservableObject {
             self.libraryVM = LibraryViewModel(ffi: ffi)
             self.statsVM = StatsViewModel(ffi: ffi)
             self.importVM = ImportViewModel(ffi: ffi)
+            self.syncVM = SyncViewModel(ffi: ffi)
         } catch {
             self.ffi = nil
             self.errorMessage = "Failed to open database: \(error.localizedDescription)"
+        }
+    }
+
+    /// Run a best-effort sync at launch and refresh the library and stats if
+    /// remote changes were applied. Safe to call when sync is not configured.
+    func performLaunchSync() {
+        syncVM?.syncOnLaunch { [weak self] pulledChanges in
+            guard pulledChanges else { return }
+            self?.libraryVM?.loadBooks()
+            self?.statsVM?.loadStats()
         }
     }
 

@@ -39,7 +39,7 @@ jobs:
             os: windows-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -80,7 +80,7 @@ jobs:
           "$hash  toku-${{ github.ref_name }}-${{ matrix.target }}.zip" | Out-File -Encoding ascii "toku-${{ github.ref_name }}-${{ matrix.target }}.zip.sha256"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: toku-${{ matrix.target }}
           path: |
@@ -93,10 +93,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -136,7 +136,7 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && inputs.publish_crates)
     environment: crates-io
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:

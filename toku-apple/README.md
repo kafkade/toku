@@ -21,7 +21,7 @@ SwiftUI Views → Swift ViewModels → TokuFFI wrapper → toku-ffi (C ABI) → 
 |---|---|
 | `TokuKit/` | Swift Package with FFI wrapper, models, ViewModels, and shared UI components |
 | `Toku/` | macOS SwiftUI app target |
-| `Toku iOS/` | iOS SwiftUI app target (iPhone + iPad) |
+| `TokuiOS/` | iOS SwiftUI app target (iPhone + iPad) |
 | `TokuKit/Sources/CTokuFFI/` | C module map pointing to the `toku.h` header |
 | `TokuKit/Sources/TokuKitUI/` | Shared SwiftUI components (StarRatingView, FlowLayout, etc.) |
 
@@ -102,18 +102,18 @@ project in Xcode:
 
 1. **File → New Target → iOS → App** (SwiftUI, Swift) — or add to the existing
    project
-2. Product name: `Toku iOS`, bundle ID: `dev.toku.ios`
+2. Product name: `TokuiOS`, bundle ID: `dev.toku.ios`
 3. Set deployment target to **iOS 17.0**
 4. Supported destinations: **iPhone** and **iPad**
 5. Add `TokuKit` and `TokuKitUI` as dependencies of the iOS target:
    **Target → General → Frameworks, Libraries, and Embedded Content**
-6. Add the existing Swift source files from `Toku iOS/` to the iOS target
+6. Add the existing Swift source files from `TokuiOS/` to the iOS target
 7. In **Build Settings**:
    - **Library Search Paths**:
      - Device: `$(PROJECT_DIR)/../target/aarch64-apple-ios/release`
      - Simulator: `$(PROJECT_DIR)/../target/aarch64-apple-ios-sim/release`
    - **Other Linker Flags**: add `-ltoku_ffi -lsqlite3 -framework Security`
-8. Copy `Toku iOS/Info.plist` to the target's info plist
+8. Copy `TokuiOS/Info.plist` to the target's info plist
 9. Build and run on device or simulator (⌘R)
 
 ## Features

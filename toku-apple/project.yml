@@ -10,12 +10,12 @@ packages:
     path: TokuKit
 
 targets:
-  Toku iOS:
+  TokuiOS:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
     sources:
-      - path: "Toku iOS"
+      - path: TokuiOS
         excludes:
           - "Info.plist"
     dependencies:
@@ -27,7 +27,7 @@ targets:
       base:
         # Use the hand-authored Info.plist (camera usage string, orientations,
         # etc.) rather than letting Xcode generate one.
-        INFOPLIST_FILE: "Toku iOS/Info.plist"
+        INFOPLIST_FILE: TokuiOS/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: com.kafkade.toku.ios
         PRODUCT_NAME: Toku
         MARKETING_VERSION: "0.2.1"

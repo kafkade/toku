@@ -17,6 +17,10 @@ updates:
       github-actions:
         patterns:
           - "*"
+    ignore:
+      # The ref on dtolnay/rust-toolchain is the pinned Rust toolchain version
+      # (intentionally our MSRV), not an action version to keep current.
+      - dependency-name: "dtolnay/rust-toolchain"
 
   # Rust (Cargo)
   - package-ecosystem: "cargo"

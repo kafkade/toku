@@ -1,9 +1,15 @@
 # ADR-006: Sync Strategy — Changeset-Based REST with Optional Encryption
 
-**Status**: Accepted (implementation deferred to Phase 7)
+**Status**: Superseded by ADR-010
 **Date**: 2026-04-26
-**Decision**: Multi-device sync via a lightweight changeset-based REST API with optional
-client-side symmetric encryption. Lighter than Pildora's zero-knowledge model.
+**Superseded by**: [ADR-010](010-self-host-auth.md) (2026-06-26) — the unauthenticated
+relay model and optional encryption were replaced with a self-hosted server using mandatory
+zero-knowledge E2E encryption and 1Password-style SRP authentication. See ADR-010 for the
+rationale and the revised threat model.
+
+**Original decision** (archived): Multi-device sync via a lightweight changeset-based REST
+API with optional client-side symmetric encryption. Lighter than Pildora's zero-knowledge
+model.
 
 ## Context
 

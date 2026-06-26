@@ -302,63 +302,39 @@ client:
 - No concept of "revoking" a device's data — if a device is lost, the user changes
   their sync passphrase, which re-encrypts all server-side data with a new key.
 
-#### Encryption: lighter than Pildora, still private
+#### Encryption and authentication — superseded by ADR-010
 
-Book data is personal but not health-critical. Toku does **not** need Pildora's
+> **⚠️ This section reflects the original ADR-006 design (optional encryption,
+> unauthenticated relay) and has been superseded.** See
+> [ADR-010](adr/010-self-host-auth.md) for the current model: self-hosted server with
+> mandatory zero-knowledge E2E encryption and 1Password-style two-secret SRP
+> authentication.
+
+~~Book data is personal but not health-critical. Toku does **not** need Pildora's
 zero-knowledge architecture (SRP, vault hierarchy, per-item keys, asymmetric key
-exchange). Instead:
+exchange). Instead:~~
 
-**Optional symmetric encryption with a user passphrase.**
+**Current model (ADR-010)**: mandatory zero-knowledge E2E with 1Password-style SRP auth.
 
-- The user sets a sync passphrase during setup: `toku sync init --passphrase`.
-- A key is derived from the passphrase using **Argon2id** (memory-hard KDF).
-- All ops are encrypted client-side with **AES-256-GCM** before upload.
-- The server stores only opaque encrypted blobs + unencrypted metadata (op ID, device ID, timestamp, entity type — not entity content).
-- The server **cannot** read book titles, ratings, notes, or any content.
+- **Two secrets**: account password + high-entropy Secret Key generated on the device
+  at sign-up. Neither is ever sent to the server.
+- **SRP authentication**: server stores only an SRP verifier; it cannot derive the
+  password, Secret Key, or any encryption key.
+- **Key hierarchy**: (Secret Key + password) → Argon2id → Account Unlock Key → wraps
+  Account Key Pair → wraps Library Encryption Key. The server stores only encrypted blobs.
+- **Mandatory encryption for hosted mode**: there is no plaintext fallback.
+- **Emergency Kit**: Secret Key is surfaced once at registration. Losing it with no local
+  device means server data is unrecoverable. Local SQLite is the recovery path.
 
-**What the server CAN see** (metadata leakage — accepted trade-off):
-
-- How many books are in the library (op count)
-- When sync happens (timestamps)
-- Which devices sync (device IDs)
-- Entity types being synced (book, session, shelf — but not content)
-
-**What the server CANNOT see**:
-
-- Book titles, authors, ISBNs
-- Ratings, reviews, notes
-- Reading progress
-- Shelf names, tag names
-- Any content field
-
-**This is NOT zero-knowledge** — the server knows *that* you have books, but not *which* books. For a personal book manager, this is a reasonable trade-off. Users who want stronger privacy can self-host the server.
-
-**Key lifecycle** (kept simple):
-
-- **Setup**: User picks a passphrase → Argon2id → encryption key stored in OS keychain.
-- **New device**: User enters their passphrase on the new device. No key exchange protocol — the passphrase IS the shared secret.
-- **Passphrase change**: Client pulls all ops, re-encrypts with new key, pushes a re-encrypted snapshot. Old ops are purged.
-- **Forgotten passphrase**: **Data on the server is unrecoverable.** The local SQLite on any device is the recovery path. This is documented clearly: "Your passphrase is your key. We cannot recover it."
-- **No passphrase (opt-out)**: If the user skips encryption, ops are stored as plaintext
-  JSON on the server. Self-hosters may prefer this for simplicity.
-
-**Comparison to Pildora**:
-
-| Concern | Pildora (health data) | Toku (book data) |
-|---------|----------------------|------------------|
-| Threat model | Server compromise exposes medications | Server compromise exposes reading list |
-| Encryption | Mandatory E2E, zero-knowledge, per-vault keys | Optional symmetric, single passphrase |
-| Key exchange | SRP + asymmetric wrapping | Passphrase-based (symmetric only) |
-| Key hierarchy | Master → Vault → Item | Single derived key |
-| Sharing | Encrypted vault sharing with roles | No sharing (personal tool) |
-| Recovery | Recovery key + emergency access | Local SQLite is the recovery |
-| Server knowledge | Nothing — can't even see metadata structure | Knows op count, timestamps, entity types |
-| Complexity | ~3 months of crypto engineering | ~2–3 weeks for a working sync |
+**What the server can and cannot see** remains the same as before: op count, timestamps,
+device IDs, entity types — but never content. ADR-010 makes this a hard guarantee rather
+than a user-configurable option.
 
 #### Deployment options
 
-- **Self-hosted (recommended)**: Docker image, single binary, SQLite backend. Run on a
-  VPS, NAS, or Raspberry Pi. `docker run -p 8080:8080 kafkade/toku-sync`.
+- **Self-hosted (recommended)**: Docker image + docker-compose, single binary, SQLite
+  backend. First-run admin onboarding. Run on a VPS, NAS, or Raspberry Pi.
+  `docker compose up kafkade/toku-sync`.
 - **Managed (future, maybe)**: A hosted instance at `sync.toku.dev` for users who don't
   want to self-host. Free tier for small libraries. This is optional and deferred — the
   self-hosted path must work first.
@@ -368,7 +344,7 @@ Rejected sync alternatives:
 - **cr-sqlite**: Elegant but experimental. iOS/WASM support is unproven. Kept as a research branch — if it matures, it could replace the op-log approach for native clients. Not the roadmap bet.
 - **File-based sync (iCloud/Dropbox)**: SQLite files + cloud sync = corruption risk. Documented as a manual backup workflow, not a sync strategy.
 - **Turso/libSQL**: Adds a mandatory cloud dependency. Conflicts with local-first.
-- **Full zero-knowledge (Pildora model)**: Overkill for book data. 3x the engineering effort for marginal privacy gain.
+- **Optional-only encryption (original ADR-006 model)**: Replaced by ADR-010 — unauthenticated relay is not viable for a self-hosted server facing the public internet.
 
 #### Sync protocol — technical summary
 
@@ -789,9 +765,11 @@ File management lives in a new `toku-files` crate that depends on `toku-core` an
 
 ### 7.5 — Self-Hosted Sync Server 🔴
 
-- Deferred to Phase 7. Changeset-based REST sync is the chosen approach (see ADR-006).
-- Axum server with REST API + Docker deployment.
-- All data optionally encrypted at rest on server (client-side encryption).
+- Deferred to Phase 7. See ADR-010 for the current architecture decision.
+- Immich-style self-hostable Docker image with first-run admin onboarding, real user
+  accounts, and 1Password-style two-secret SRP authentication.
+- Mandatory zero-knowledge E2E encryption — no plaintext mode for hosted sync.
+- Axum server with REST API (op-log wire protocol from ADR-008 retained).
 - cr-sqlite kept as a research alternative if it matures for iOS/WASM.
 
 ---
@@ -1398,14 +1376,14 @@ Before committing to the architecture, validate:
 **Theme**: "My library everywhere."
 **Goal**: Opt-in multi-device sync via a lightweight changeset-based REST API. Users can sync between CLI, iOS, macOS, web, and Windows — without sacrificing the local-first guarantee. Sync is additive: a user who never enables sync loses nothing.
 
-**Architecture**: See Section 2.5 (Sync Strategy) and ADR-006 for the full design. Summary: append-only op-log synced over REST with optional client-side symmetric encryption (Argon2id + AES-256-GCM).
+**Architecture**: See Section 2.5 (Sync Strategy) and ADR-010 for the current design. Summary: append-only op-log synced over REST with mandatory zero-knowledge E2E encryption (AES-256-GCM), 1Password-style SRP authentication, and Immich-style self-hosted Docker deployment.
 
 **Deliverables** (5):
 
 1. **Sync data model + op-log**: Local `sync_ops` table with Hybrid Logical Clock (HLC) timestamps, op IDs (UUID v7), entity type/ID, and encrypted-or-plaintext payload. Every mutation writes to both the domain table and the op-log in a single transaction.
 2. **Sync server (`toku-sync` crate)**: Axum REST API for push/pull/snapshot/device management. Thin relay — stores ops and cursors, does not interpret content. Deployable as a Docker image (`kafkade/toku-sync`).
 3. **Push/pull protocol with entity-specific merge rules**: Push sends new ops since last cursor. Pull receives ops and applies entity-specific merge: LWW per field for books, append-only for reading sessions, monotonic for progress, LWW with conflict detection for notes/reviews. Soft deletes with 30-day tombstone retention.
-4. **Optional client-side encryption**: Passphrase → Argon2id → AES-256-GCM. Key stored in OS keychain. Server stores opaque blobs. Passphrase change triggers re-keying (pull, re-encrypt, push snapshot, purge old ops).
+4. **Mandatory client-side E2E encryption + SRP auth**: Mandatory for hosted mode — no plaintext fallback. 1Password-style two-secret SRP (password + Secret Key). Key hierarchy: (Secret Key + password) → Argon2id → unlock key → wraps key pair → wraps library key. Emergency Kit generated at account creation.
 5. **CLI sync commands + device management**: `toku sync init`, `toku sync push`, `toku sync pull`, `toku sync status`, `toku sync devices`. Device registration with UUID + human-readable name.
 
 **Acceptance criteria**:
@@ -1526,7 +1504,7 @@ Phase 3: Analytics & Polish (1.0)
         │       └─── Phase 6: File Management (independent of web)
         │
         └─── Phase 7: Sync (depends on stable schema)
-                │     Changeset REST API, see ADR-006
+                │     Self-hosted server, see ADR-010
                 └─── Phase 8: Moonshots
 ```
 
@@ -1688,7 +1666,7 @@ The name must satisfy:
 | 5 | Metadata source | Open Library / Google Books / ISBNdb / Multi-source | **Open Library primary + Google Books fallback** — both free | Decided |
 | 6 | Work vs edition model | Full FRBR / Book=Edition / Deferred | **Book=Edition for MVP, Work grouping Phase 3** — pragmatic | Decided |
 | 7 | Rating scale | 5-star / 10-point / 5-star with halves | **0–10 integer (displayed as 5★ with halves)** — Goodreads-compatible | Decided |
-| 8 | Sync strategy | File copy / REST server / CRDTs / SQLite replication | **Changeset-based REST sync with optional symmetric encryption** — lighter than Pildora's ZK, privacy-respecting | Deferred (Phase 7) |
+| 8 | Sync strategy | File copy / REST server / CRDTs / SQLite replication | **Self-hosted server (Immich-style) with mandatory zero-knowledge E2E encryption and 1Password-style two-secret SRP auth** — see ADR-010 (supersedes ADR-006/008) | Deferred (Phase 7) |
 | 9 | License | MIT / Apache 2.0 / GPL / Dual | **MIT** — maximum contributor friendliness | Decided |
 | 10 | Web framework | Axum+HTMX / Leptos / SvelteKit / Next.js | **Axum + maud** — server-rendered HTML, inline SVG charts, no client-side framework (see ADR-007) | Decided |
 | 11 | Cover storage | Filesystem / Database blobs / Content-addressed | **Filesystem, content-addressed (SHA-256)** — keeps DB small | Decided |

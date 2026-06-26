@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Docker deployment for the self-hosted `toku-sync` server: a multi-stage, multi-arch
+  (`linux/amd64` + `linux/arm64`, incl. Raspberry Pi) image published to
+  `ghcr.io/kafkade/toku-sync`, plus a root `docker-compose.yml`, a built-in container health check
+  (`toku-sync healthcheck`), and a `docs/sync-server.md` deployment guide covering Docker Compose
+  and Caddy/nginx HTTPS reverse-proxy setup
+- Structured logging for `toku-sync` via `tracing`/`tracing-subscriber` with per-request tracing;
+  configurable through `--log-level` / `TOKU_SYNC_LOG_LEVEL` (and `RUST_LOG`)
 - Sync conflict resolution UI (CLI + web): `toku sync conflicts` lists unresolved note/review conflicts, `toku sync conflicts show <id>` shows the local/remote diff, and `resolve <id> --keep local|remote` / `resolve-all --keep local|remote` resolve them. Resolving writes the chosen value to the entity, marks the conflict resolved, and emits a propagating sync op. `toku sync status` now reports the unresolved conflict count
 - Web conflicts page (`/conflicts`): side-by-side local/remote diff cards with one-click keep-local / keep-remote buttons and bulk resolve actions, plus a sync status indicator in the dashboard header (shown only when sync is configured) that links to the conflicts page and highlights when conflicts are pending
 - Native client sync (FFI + Swift): the iOS and macOS apps can now configure sync, push, pull, and view sync status/devices directly. New `toku_sync_init/push/pull/status/devices` C FFI functions expose the sync client to Swift, backed by a shared `toku-sync-client` crate extracted from the CLI so both surfaces reuse one implementation

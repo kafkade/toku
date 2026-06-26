@@ -71,6 +71,8 @@ their ever-growing libraries.
 - 🍎 macOS app (SwiftUI) with sidebar navigation, sortable table/grid views, and Swift Charts
 - 📱 iOS app (iPhone + iPad) with cover grid, barcode scanner, and reading progress updates
 - 🪟 Windows desktop app (Tauri v2) wrapping the web UI in a native window with system tray
+- 🔄 Optional multi-device sync via a self-hostable relay server
+  ([deployment guide](docs/sync-server.md)) with end-to-end encryption
 
 ## Tech Stack
 

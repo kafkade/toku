@@ -15,6 +15,10 @@ pub struct Config {
     /// Directory for server data (SQLite database)
     #[arg(long, default_value = "./toku-sync-data", env = "TOKU_SYNC_DATA_DIR")]
     pub data_dir: String,
+
+    /// Log verbosity (error, warn, info, debug, trace). Overridden by `RUST_LOG` if set.
+    #[arg(long, default_value = "info", env = "TOKU_SYNC_LOG_LEVEL")]
+    pub log_level: String,
 }
 
 impl Config {

@@ -1,6 +1,7 @@
 mod book;
 mod config;
 pub mod crypto;
+mod emergency_kit;
 mod error;
 pub mod filter;
 mod isbn;
@@ -11,6 +12,7 @@ pub mod sync;
 pub use book::*;
 pub use config::*;
 pub use crypto::*;
+pub use emergency_kit::*;
 pub use error::*;
 pub use filter::*;
 pub use isbn::*;

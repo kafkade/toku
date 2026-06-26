@@ -51,9 +51,10 @@ trust model of the server, and the encryption posture.
 Users authenticate with two secrets that are never transmitted to the server:
 
 1. **Account password** — chosen by the user, memorable.
-2. **Secret Key** — a high-entropy random value (128-bit, base32-encoded,
-   formatted as `TK-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX` for readability) generated
-   on the user's device at sign-up.
+2. **Secret Key** — a high-entropy random value (128-bit, base32-encoded with a `TK`
+   version prefix, grouped for readability and ending in a 2-character checksum, e.g.
+   `TK-XXXXXX-XXXXX-XXXXX-XXXXX-XXXXX-CC`) generated on the user's device at sign-up.
+   The checksum lets typos be caught before the key is used. See `docs/recovery.md`.
 
 Authentication uses **SRP (Secure Remote Password, RFC 5054)**. The SRP verifier stored on
 the server is derived from both the password and the Secret Key:
@@ -104,7 +105,9 @@ ciphertext. It **cannot** derive any plaintext data from these.
 ### Emergency Kit and Recovery
 
 - The Secret Key is surfaced **once** during account creation and presented as an
-  **Emergency Kit** — a printable/downloadable document the user keeps offline.
+  **Emergency Kit** — a printable/downloadable document the user keeps offline. Toku
+  renders it as plain text, self-contained printable HTML, or PDF
+  (`toku account emergency-kit`). See `docs/recovery.md`.
 - Losing the Secret Key with no local device means the server data is **unrecoverable**.
   This is documented clearly and intentionally: there is no server-side recovery path.
 - **Recovery path**: any local SQLite copy of the library is the recovery. `toku export backup`

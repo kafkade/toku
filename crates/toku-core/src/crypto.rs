@@ -28,6 +28,9 @@ use crate::sync::{EntityType, OpType};
 mod key_hierarchy;
 pub use key_hierarchy::*;
 
+mod secret_key;
+pub use secret_key::*;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------

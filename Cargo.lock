@@ -3608,6 +3608,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf-writer"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ea27c5015ab81753fc61e49f8cde74999346605ee148bb20008ef3d3150e0dc"
+dependencies = [
+ "bitflags 2.13.0",
+ "itoa",
+ "memchr",
+ "ryu",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5856,6 +5868,7 @@ dependencies = [
  "csv",
  "hostname",
  "keyring-core",
+ "pdf-writer",
  "ratatui",
  "reqwest 0.12.28",
  "rpassword",

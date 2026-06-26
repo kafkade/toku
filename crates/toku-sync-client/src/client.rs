@@ -102,22 +102,24 @@ impl SyncClient {
         })
     }
 
-    /// Register a new device with the sync server.
+    /// Register a new device with the sync server. When `salt` is provided
+    /// (base64-encoded), it is offered as the library's key-derivation salt;
+    /// the server keeps it only if the library has no salt yet.
     pub async fn register(
         &self,
         library_id: &str,
         device_name: &str,
+        salt: Option<&str>,
     ) -> anyhow::Result<RegisterResponse> {
         let url = format!("{}/api/v1/register", self.base_url);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&serde_json::json!({
-                "library_id": library_id,
-                "device_name": device_name,
-            }))
-            .send()
-            .await?;
+        let mut body = serde_json::json!({
+            "library_id": library_id,
+            "device_name": device_name,
+        });
+        if let Some(salt) = salt {
+            body["salt"] = serde_json::Value::String(salt.to_string());
+        }
+        let resp = self.http.post(&url).json(&body).send().await?;
 
         if !resp.status().is_success() {
             return Err(extract_error(resp).await);

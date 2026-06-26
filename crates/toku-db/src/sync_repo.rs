@@ -192,6 +192,37 @@ impl<'a> SyncRepository<'a> {
         Ok(device)
     }
 
+    /// Get or create the device identity using an explicit `device_id`.
+    ///
+    /// Used during sync init so the local device identity matches the
+    /// server-assigned device id. This keeps emitted ops (which carry this
+    /// id) consistent with the server's "exclude own device" pull filter,
+    /// preventing a device from pulling back its own ops.
+    pub fn get_or_create_device_with_id(
+        &self,
+        device_id: Uuid,
+        name: &str,
+    ) -> Result<DeviceIdentity, DbError> {
+        if let Some(existing) = self.get_device()? {
+            return Ok(existing);
+        }
+
+        let device = DeviceIdentity {
+            device_id,
+            device_name: name.to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        self.db.conn.execute(
+            "INSERT INTO sync_device (device_id, device_name, created_at) VALUES (?1, ?2, ?3)",
+            params![
+                device.device_id.to_string(),
+                device.device_name,
+                device.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(device)
+    }
+
     /// Get a sync cursor value by key ("push_cursor" or "pull_cursor").
     pub fn get_cursor(&self, key: &str) -> Result<Option<String>, DbError> {
         let result = self

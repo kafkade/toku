@@ -12,9 +12,14 @@ toku-core.workspace = true
 toku-db.workspace = true
 anyhow = "1"
 chrono.workspace = true
+hex = "0.4"
+rand = "0.10"
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+# SRP-6a (RFC 5054) authentication — flagged for dependency review (RC)
+srp = { version = "0.7.0-rc.3", features = ["getrandom"] }
 tokio.workspace = true
 uuid.workspace = true
 keyring-core = "1"

@@ -23,6 +23,12 @@ pub enum SyncError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("too many failed authentication attempts; retry after {retry_after}")]
+    RateLimited { retry_after: String },
+
+    #[error("account locked until {until}")]
+    AccountLocked { until: String },
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -36,6 +42,8 @@ impl IntoResponse for SyncError {
             SyncError::Unauthorized => StatusCode::UNAUTHORIZED,
             SyncError::Forbidden(_) => StatusCode::FORBIDDEN,
             SyncError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            SyncError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            SyncError::AccountLocked { .. } => StatusCode::from_u16(423).unwrap(),
             SyncError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = ErrorBody {

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- SRP-6a authentication for sync libraries: the sync server never sees the user's
+  password or Secret Key. Libraries protected with a passphrase use SRP (RFC 5054,
+  Group 2048 + SHA-256) so the server stores only a verifier (`v = g^x mod N`).
+  First device enrolls via `POST /api/v1/auth/enroll`; any subsequent device logs in
+  with `POST /api/v1/auth/challenge` + `POST /api/v1/auth/verify` and then calls
+  `POST /api/v1/register` with the resulting session token. Session tokens are
+  256-bit random values with a 24-hour TTL, SHA-256 hashed at rest
+- Account rate-limiting for SRP libraries: 5 consecutive failed login attempts lock
+  the account for 15 minutes (HTTP 423); successful login resets the counter
+- Passwordless libraries continue to use the existing static bearer-token path
+  unchanged — full backward compatibility
+
 - Multi-device sync integration test harness (`toku-sync/tests/`): a reusable
   `TestServer` (real in-process Axum relay on a random port) and `SimulatedDevice`
   (real client + database + merge engine + deterministic HLC), plus 10 end-to-end

@@ -14,7 +14,9 @@ pub mod orchestrator;
 pub mod token_store;
 pub mod wire;
 
-pub use client::{DeviceInfo, SyncClient, WireOp};
+pub use client::{
+    DeviceInfo, EnrollResponse, SrpChallengeResponse, SrpVerifyResponse, SyncClient, WireOp,
+};
 pub use orchestrator::{
     BootstrapOutcome, InitOutcome, PullOutcome, PushOutcome, StatusOutcome, bootstrap, conflict,
     conflicts, default_device_name, devices, init, pull, push, resolve_all_conflicts,

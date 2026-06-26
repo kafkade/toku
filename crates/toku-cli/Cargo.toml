@@ -37,7 +37,7 @@ uuid.workspace = true
 rpassword = "7"
 base64 = "0.22"
 hostname = "0.4"
-printpdf = { version = "0.7", default-features = false }
+pdf-writer = "0.13"
 
 # Platform-native credential stores for the keyring-core ecosystem (keyring 4.x).
 # The umbrella `keyring` crate is intentionally not used: on desktop it pulls in

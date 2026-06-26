@@ -44,6 +44,37 @@ toku config [--edit]
 > for all user-defined book groupings. `ReadingStatus` remains a separate
 > per-book state machine.
 
+### Sync subcommands (Phase 7)
+
+Sync is opt-in and additive — every command above works fully offline. The
+`toku sync` namespace manages multi-device synchronization. See ADR-006
+(sync strategy) and ADR-008 (wire protocol) for the underlying design.
+
+```sh
+toku sync init [--server <url>] [--library-id <uuid>] [--device-name <name>] [--passphrase]
+toku sync status                                   # Show sync state, pending ops, devices, conflicts
+toku sync push                                     # Push local changes to the sync server
+toku sync pull                                     # Pull remote changes from the sync server
+toku sync devices                                  # List devices registered to this library
+toku sync deregister <device-id>                   # Deregister another device from the server
+toku sync disable                                  # Disable sync (local data preserved)
+toku sync purge [--days <n>]                        # Purge tombstoned books past the retention period (default 30)
+toku sync rekey                                    # Change the encryption passphrase and re-encrypt server ops
+toku sync compact                                  # Snapshot + prune the op log
+toku sync conflicts                                # List unresolved conflicts (notes/reviews)
+toku sync conflicts show <id>                      # Show the local/remote diff for a conflict
+toku sync conflicts resolve <id> --keep local|remote
+toku sync conflicts resolve-all --keep local|remote
+```
+
+> **Note**: `toku sync init` defaults the server to `http://localhost:8080`.
+> The `--library-id` must match across all devices for a single library; omit it
+> on the first device to generate one. `--passphrase` enables client-side
+> encryption (interactive, hidden input). Only note and review edits can produce
+> user-visible conflicts; all other entities merge silently per ADR-006's
+> entity-specific rules. Like every other command, sync subcommands respect
+> `--format table|json|csv` and `NO_COLOR`.
+
 ## Rationale
 
 - clap v4 is the Rust CLI standard — well-documented, actively maintained, generates

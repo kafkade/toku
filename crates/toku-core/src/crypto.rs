@@ -25,6 +25,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::TokuError;
 use crate::sync::{EntityType, OpType};
 
+mod key_hierarchy;
+pub use key_hierarchy::*;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------

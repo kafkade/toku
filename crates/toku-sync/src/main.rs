@@ -12,6 +12,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use clap::Parser;
+use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
 use crate::db::SyncDatabase;
@@ -39,12 +40,21 @@ fn build_router(db_path: PathBuf) -> Router {
         .route("/api/v1/register", post(handlers::register))
         .merge(authenticated)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB (rekey may be large)
+        .layer(TraceLayer::new_for_http())
         .with_state(db_path)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Lightweight health-check mode for container orchestration. Runs before the
+    // full config is parsed so it works on shell-less images (distroless/scratch):
+    //   `toku-sync healthcheck` exits 0 if GET /health returns 200, else 1.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        std::process::exit(run_healthcheck());
+    }
+
     let config = Config::parse();
+    init_tracing(&config.log_level);
     let db_path = config.db_path();
 
     // Run migrations once at startup
@@ -55,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = config.bind_addr();
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("toku-sync listening on http://{addr}");
+    tracing::info!("toku-sync listening on http://{addr}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -64,11 +74,59 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Initialise the tracing subscriber. `RUST_LOG` takes precedence; otherwise the
+/// configured log level (from `--log-level` / `TOKU_SYNC_LOG_LEVEL`) is used.
+fn init_tracing(log_level: &str) {
+    use tracing_subscriber::EnvFilter;
+
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(log_level))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+/// Perform a minimal HTTP `GET /health` against the local server using only the
+/// standard library (no extra runtime deps), so it runs on a `scratch` image.
+/// Returns a process exit code: 0 = healthy, 1 = unhealthy.
+fn run_healthcheck() -> i32 {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let port = std::env::var("TOKU_SYNC_PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr = format!("127.0.0.1:{port}");
+
+    let result = (|| -> std::io::Result<bool> {
+        let mut stream = TcpStream::connect(&addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream
+            .write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response.starts_with("HTTP/1.0 200") || response.starts_with("HTTP/1.1 200"))
+    })();
+
+    match result {
+        Ok(true) => 0,
+        Ok(false) => {
+            eprintln!("healthcheck: server at {addr} did not return 200");
+            1
+        }
+        Err(e) => {
+            eprintln!("healthcheck: failed to reach {addr}: {e}");
+            1
+        }
+    }
+}
+
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to listen for ctrl+c");
-    eprintln!("\nshutting down...");
+    tracing::info!("shutting down");
 }
 
 #[cfg(test)]

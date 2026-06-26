@@ -127,8 +127,12 @@ fn load_encryption_key(
 /// Initialize sync: register the device with the server, persist the auth token and
 /// sync config, optionally enabling client-side encryption with the given passphrase.
 ///
-/// Unlike the CLI command, this function does not prompt: when `passphrase` is `Some`,
-/// encryption is enabled using that passphrase; when `None`, encryption is disabled.
+/// **When `passphrase` is `Some`**: Uses SRP-6a enrollment + login so the server
+/// never sees the password. The passphrase also derives the client-side AES
+/// encryption key.
+///
+/// **When `passphrase` is `None`**: Falls back to the legacy unauthenticated
+/// registration path (passwordless library, static bearer token).
 pub fn init(
     data_dir: &Path,
     server: &str,
@@ -144,77 +148,192 @@ pub fn init(
 
     let client = SyncClient::new(server)?;
 
-    // When enabling encryption, offer a candidate key-derivation salt during
-    // registration. The server keeps it only if the library has no salt yet,
-    // so all devices in a library converge on a single salt (and thus key).
-    let candidate_salt_b64 = match passphrase {
+    match passphrase {
         Some(pass) if !pass.is_empty() => {
-            let salt = toku_core::SyncKey::generate_salt();
-            Some(base64::engine::general_purpose::STANDARD.encode(salt))
-        }
-        _ => None,
-    };
+            // ── SRP-6a path ──────────────────────────────────────────────
+            //
+            // First device:  enroll (creates SRP account) → challenge/verify
+            // Second device: skip enroll → challenge/verify → register (bearer)
+            //
+            // In both cases, the passphrase never leaves this machine.
 
-    let resp =
-        rt.block_on(client.register(&library_id, &device_name, candidate_salt_b64.as_deref()))?;
+            use rand::RngExt;
+            use sha2::Sha256;
+            use srp::ClientG2048;
 
-    token_store
-        .store(server, &resp.auth_token)
-        .context("failed to store auth token")?;
+            let srp_client = ClientG2048::<Sha256>::new();
 
-    let encryption_enabled = match passphrase {
-        Some(pass) if !pass.is_empty() => {
-            // Adopt the authoritative library salt: ours if we registered
-            // first, otherwise the one a previous device established.
-            let salt_b64 = rt
-                .block_on(client.get_salt(&resp.auth_token))?
+            // ── Try enrollment (first device only) ───────────────────────
+            // Compute verifier locally; upload only v and salt.
+            // Also generate the encryption salt and submit it at enrollment so the
+            // server stores it — device B will retrieve it via `get_salt`.
+            let first_device_resp: Option<crate::client::EnrollResponse> = {
+                let mut srp_salt = [0u8; 16];
+                rand::rng().fill(&mut srp_salt);
+                let srp_salt_hex = hex::encode(srp_salt);
+                let verifier_bytes =
+                    srp_client.compute_verifier(library_id.as_bytes(), pass.as_bytes(), &srp_salt);
+                let srp_verifier_hex = hex::encode(&verifier_bytes);
+
+                let enc_salt_raw = toku_core::SyncKey::generate_salt();
+                let enc_salt_b64 = base64::engine::general_purpose::STANDARD.encode(enc_salt_raw);
+
+                match rt.block_on(client.enroll(
+                    &library_id,
+                    &device_name,
+                    &srp_salt_hex,
+                    &srp_verifier_hex,
+                    Some(&enc_salt_b64),
+                )) {
+                    Ok(resp) => Some(resp),
+                    Err(e) if e.to_string().contains("already has SRP credentials") => None,
+                    Err(e) => return Err(e),
+                }
+            };
+
+            // ── SRP login — works for both first and subsequent devices ──
+            let mut a = [0u8; 48];
+            rand::rng().fill(&mut a);
+            let a_pub_bytes = srp_client.compute_public_ephemeral(&a);
+            let a_pub_hex = hex::encode(&a_pub_bytes);
+
+            let challenge_resp = rt.block_on(client.srp_challenge(&library_id, &a_pub_hex))?;
+
+            let b_pub_bytes = hex::decode(&challenge_resp.server_public_b)
+                .context("server returned invalid hex for server_public_b")?;
+            let server_srp_salt_bytes = hex::decode(&challenge_resp.srp_salt)
+                .context("server returned invalid hex for srp_salt")?;
+
+            let client_verifier = srp_client
+                .process_reply(
+                    &a,
+                    library_id.as_bytes(),
+                    pass.as_bytes(),
+                    &server_srp_salt_bytes,
+                    &b_pub_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("SRP client processing failed: {e:?}"))?;
+
+            let m1_hex = hex::encode(client_verifier.proof());
+            let verify_resp =
+                rt.block_on(client.srp_verify(&challenge_resp.challenge_id, &m1_hex))?;
+
+            // Verify server proof M2 — confirms server knows the verifier.
+            let m2_bytes = hex::decode(&verify_resp.server_proof_m2)
+                .context("server returned invalid hex for server_proof_m2")?;
+            client_verifier
+                .verify_server(&m2_bytes)
+                .map_err(|e| anyhow::anyhow!("SRP server proof verification failed: {e:?}"))?;
+
+            token_store
+                .store_session(server, &verify_resp.session_token, &verify_resp.expires_at)
+                .context("failed to store SRP session token")?;
+
+            // ── Device ID + library ID ───────────────────────────────────
+            let (device_id, library_id_out) = if let Some(ref er) = first_device_resp {
+                // First device: library + device already created by enroll.
+                (er.device_id.clone(), er.library_id.clone())
+            } else {
+                // Second device: register this device using the fresh session token.
+                let reg_resp = rt.block_on(client.register(
+                    &library_id,
+                    &device_name,
+                    None,
+                    Some(&verify_resp.session_token),
+                ))?;
+                (reg_resp.device_id, reg_resp.library_id)
+            };
+
+            // ── Encryption key ───────────────────────────────────────────
+            // Fetch the authoritative encryption salt from the server; fall back
+            // to the candidate we submitted during enroll (first-writer-wins).
+            let enc_salt_b64 = rt
+                .block_on(client.get_salt(&verify_resp.session_token))?
                 .salt
-                .or(candidate_salt_b64)
-                .ok_or_else(|| anyhow::anyhow!("server did not return a library salt"))?;
-            let salt_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&salt_b64)
-                .context("invalid base64 salt from server")?;
-            let salt: [u8; 16] = salt_bytes
+                .unwrap_or_else(|| {
+                    // Should only happen if server lost the salt — regenerate safely.
+                    let raw = toku_core::SyncKey::generate_salt();
+                    base64::engine::general_purpose::STANDARD.encode(raw)
+                });
+            let enc_salt_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&enc_salt_b64)
+                .context("invalid base64 encryption salt from server")?;
+            let enc_salt: [u8; 16] = enc_salt_bytes
                 .as_slice()
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("library salt must be 16 bytes"))?;
-            let key = toku_core::SyncKey::derive(pass, &salt)
+                .map_err(|_| anyhow::anyhow!("encryption salt must be 16 bytes"))?;
+            let key = toku_core::SyncKey::derive(pass, &enc_salt)
                 .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
             token_store
                 .store_sync_key(server, key.as_exported_bytes())
                 .context("failed to store sync key")?;
-            true
+
+            // Record the device in the local DB.
+            let db = open_db(data_dir)?;
+            let sync_repo = SyncRepository::new(&db);
+            let server_device_id = device_id
+                .parse::<uuid::Uuid>()
+                .context("server returned an invalid device_id")?;
+            sync_repo.get_or_create_device_with_id(server_device_id, &device_name)?;
+
+            let mut config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
+            config.sync = Some(toku_core::SyncConfig {
+                server: server.to_string(),
+                library_id: library_id_out.clone(),
+                device_id: device_id.clone(),
+                device_name: device_name.clone(),
+                encryption: true,
+            });
+            config
+                .save(data_dir)
+                .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
+
+            Ok(InitOutcome {
+                device_id,
+                library_id: library_id_out,
+                device_name,
+                server: server.to_string(),
+                encryption: true,
+            })
         }
-        _ => false,
-    };
 
-    let db = open_db(data_dir)?;
-    let sync_repo = SyncRepository::new(&db);
-    let server_device_id = resp
-        .device_id
-        .parse::<uuid::Uuid>()
-        .context("server returned an invalid device_id")?;
-    sync_repo.get_or_create_device_with_id(server_device_id, &device_name)?;
+        _ => {
+            // ── Legacy passwordless path ─────────────────────────────────
+            let resp = rt.block_on(client.register(&library_id, &device_name, None, None))?;
 
-    let mut config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
-    config.sync = Some(toku_core::SyncConfig {
-        server: server.to_string(),
-        library_id: resp.library_id.clone(),
-        device_id: resp.device_id.clone(),
-        device_name: device_name.clone(),
-        encryption: encryption_enabled,
-    });
-    config
-        .save(data_dir)
-        .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
+            token_store
+                .store(server, &resp.auth_token)
+                .context("failed to store auth token")?;
 
-    Ok(InitOutcome {
-        device_id: resp.device_id,
-        library_id: resp.library_id,
-        device_name,
-        server: server.to_string(),
-        encryption: encryption_enabled,
-    })
+            let db = open_db(data_dir)?;
+            let sync_repo = SyncRepository::new(&db);
+            let server_device_id = resp
+                .device_id
+                .parse::<uuid::Uuid>()
+                .context("server returned an invalid device_id")?;
+            sync_repo.get_or_create_device_with_id(server_device_id, &device_name)?;
+
+            let mut config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
+            config.sync = Some(toku_core::SyncConfig {
+                server: server.to_string(),
+                library_id: resp.library_id.clone(),
+                device_id: resp.device_id.clone(),
+                device_name: device_name.clone(),
+                encryption: false,
+            });
+            config
+                .save(data_dir)
+                .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
+
+            Ok(InitOutcome {
+                device_id: resp.device_id,
+                library_id: resp.library_id,
+                device_name,
+                server: server.to_string(),
+                encryption: false,
+            })
+        }
+    }
 }
 
 /// Push all locally pending ops to the configured sync server.

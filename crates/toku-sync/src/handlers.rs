@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 
-use crate::auth::{AuthDevice, sha256_hex};
+use crate::auth::{AuthDevice, generate_token, sha256_hex};
 use crate::db::SyncDatabase;
 use crate::error::SyncError;
 use crate::models::{
@@ -28,6 +28,7 @@ pub async fn health() -> Json<HealthResponse> {
 
 pub async fn register(
     State(db_path): State<PathBuf>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, SyncError> {
     if req.device_name.is_empty() {
@@ -37,8 +38,16 @@ pub async fn register(
         return Err(SyncError::BadRequest("library_id is required".into()));
     }
 
-    let token = generate_token();
-    let token_hash = sha256_hex(&token);
+    // Extract optional Bearer token (present when adding a device to an SRP library).
+    let bearer_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.to_string());
+
+    // Only generate a static token for passwordless libraries; SRP libraries use sessions.
+    let static_token = generate_token();
+    let static_token_hash = sha256_hex(&static_token);
     let device_id = uuid::Uuid::now_v7().to_string();
 
     let resp = tokio::task::spawn_blocking({
@@ -46,19 +55,54 @@ pub async fn register(
         let library_id = req.library_id.clone();
         let device_name = req.device_name.clone();
         let device_id = device_id.clone();
-        let token_hash = token_hash.clone();
+        let static_token_hash = static_token_hash.clone();
         let salt = req.salt.clone();
+        let bearer_token = bearer_token.clone();
         move || -> Result<RegisterResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
-            // Auto-create library if it doesn't exist
+            // If this library has SRP credentials, only accept authenticated device additions.
+            let is_srp_library: bool = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM accounts WHERE library_id = ?1",
+                    [&library_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+
+            // For SRP libraries: validate the session token (must match the library).
+            // Keep the session hash so we can rebind it after the device row is created.
+            let srp_session_hash: Option<String> = if is_srp_library {
+                let session_token = bearer_token.ok_or(SyncError::Unauthorized)?;
+                let session_hash = sha256_hex(&session_token);
+                let auth_library_id: String = db
+                    .conn
+                    .query_row(
+                        "SELECT library_id FROM sessions
+                         WHERE session_token_hash = ?1 AND expires_at > datetime('now')",
+                        [&session_hash],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| SyncError::Unauthorized)?;
+                if auth_library_id != library_id {
+                    return Err(SyncError::Forbidden(
+                        "session token belongs to a different library".into(),
+                    ));
+                }
+                Some(session_hash)
+            } else {
+                None
+            };
+
+            // Auto-create library if it doesn't exist.
             db.conn.execute(
                 "INSERT OR IGNORE INTO libraries (id, created_at) VALUES (?1, datetime('now'))",
                 [&library_id],
             )?;
 
             // Establish the library salt on first encrypted registration.
-            // First writer wins: later devices keep the existing salt.
             if let Some(ref salt) = salt {
                 db.conn.execute(
                     "UPDATE libraries SET salt = ?1 WHERE id = ?2 AND salt IS NULL",
@@ -66,26 +110,48 @@ pub async fn register(
                 )?;
             }
 
+            // SRP libraries don't use static auth tokens; store empty string.
+            let token_hash_to_store = if is_srp_library {
+                String::new()
+            } else {
+                static_token_hash
+            };
+
             db.conn.execute(
                 "INSERT INTO devices (device_id, library_id, device_name, auth_token_hash, created_at)
                  VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-                rusqlite::params![device_id, library_id, device_name, token_hash],
+                rusqlite::params![device_id, library_id, device_name, token_hash_to_store],
             )?;
 
+            // Rebind the session to the newly-created device. The FK constraint on
+            // sessions.device_id requires the device row to exist first.
+            if let Some(ref session_hash) = srp_session_hash {
+                let _ = db.conn.execute(
+                    "UPDATE sessions SET device_id = ?1 WHERE session_token_hash = ?2",
+                    rusqlite::params![device_id, session_hash],
+                );
+            }
+
+            // Return the appropriate token: static for passwordless, empty for SRP.
             Ok(RegisterResponse {
                 device_id,
                 library_id,
-                auth_token: String::new(), // filled in below
+                auth_token: String::new(), // filled in below for passwordless
             })
         }
     })
     .await
     .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
 
-    Ok(Json(RegisterResponse {
-        auth_token: token,
-        ..resp
-    }))
+    // For passwordless libraries, return the static bearer token.
+    // For SRP libraries, return empty string (session token was issued by /auth/verify).
+    let auth_token = if bearer_token.is_none() {
+        static_token
+    } else {
+        String::new()
+    };
+
+    Ok(Json(RegisterResponse { auth_token, ..resp }))
 }
 
 // ── Devices ─────────────────────────────────────────────────────────────────
@@ -634,13 +700,4 @@ fn row_to_op(row: &rusqlite::Row) -> rusqlite::Result<OpPayload> {
         op_type: row.get(5)?,
         payload,
     })
-}
-
-/// Generate a cryptographically random auth token (256-bit, base64url no-pad).
-fn generate_token() -> String {
-    use base64::Engine;
-    use rand::RngExt;
-    let mut bytes = [0u8; 32];
-    rand::rng().fill(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }

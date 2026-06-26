@@ -40,10 +40,15 @@ pub fn build_router(db_path: PathBuf) -> Router {
             auth::require_auth,
         ));
 
-    // Public routes
+    // Public routes (unauthenticated)
     Router::new()
         .route("/health", get(handlers::health))
+        // Legacy passwordless registration
         .route("/api/v1/register", post(handlers::register))
+        // SRP-6a authentication endpoints
+        .route("/api/v1/auth/enroll", post(auth::srp_enroll))
+        .route("/api/v1/auth/challenge", post(auth::srp_challenge))
+        .route("/api/v1/auth/verify", post(auth::srp_verify))
         .merge(authenticated)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB (rekey may be large)
         .layer(TraceLayer::new_for_http())

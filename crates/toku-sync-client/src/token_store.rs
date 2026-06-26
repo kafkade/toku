@@ -103,6 +103,28 @@ impl TokenStore {
         self.store_file(&key, token)
     }
 
+    /// Store an SRP session token along with its expiry timestamp.
+    /// Uses the same storage path as `store` so `load` returns the session token.
+    pub fn store_session(
+        &self,
+        server_url: &str,
+        session_token: &str,
+        expires_at: &str,
+    ) -> anyhow::Result<()> {
+        // Store the token itself using the standard path (OS keychain / file).
+        self.store(server_url, session_token)?;
+        // Store the expiry separately in the file fallback (informational only).
+        let key = normalize_url(server_url);
+        self.store_file(&format!("{key}:session_expires"), expires_at)
+    }
+
+    /// Load the stored session token expiry, if present.
+    #[allow(dead_code)]
+    pub fn load_session_expiry(&self, server_url: &str) -> anyhow::Result<Option<String>> {
+        let key = normalize_url(server_url);
+        self.load_file(&format!("{key}:session_expires"))
+    }
+
     /// Load a token for the given server URL.
     pub fn load(&self, server_url: &str) -> anyhow::Result<Option<String>> {
         let key = normalize_url(server_url);

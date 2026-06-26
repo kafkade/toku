@@ -1,6 +1,6 @@
 # ADR-008: Sync Wire Protocol — Op-Log Format, HLC, and Encryption Envelope
 
-**Status**: Proposed (implementation in Phase 7)
+**Status**: Accepted (implementation in Phase 7)
 **Date**: 2026-05-31
 **Decision**: Define the sync wire protocol using UUID v7 op IDs, Hybrid Logical Clocks
 for ordering, a versioned JSON op envelope, and an optional AES-256-GCM encryption layer.
@@ -70,6 +70,48 @@ that wall clocks cannot.
 - Pull is idempotent: requesting the same cursor returns the same ops.
 - The server stores one cursor pair per device per library.
 
+### Batch limits
+
+- A single push or pull request carries at most **1000 ops**. Requests exceeding this
+  limit are rejected with `400`; clients must split the work across multiple requests.
+- Clients page through large backlogs using the cursor contract: pull returns up to 1000
+  ops plus a `next_cursor`; the client repeats until `next_cursor` equals its current
+  pull cursor (no more ops).
+- 1000 is a balance between request overhead and memory/latency per request. It bounds the
+  server's per-request decode and storage work and keeps mobile clients within reasonable
+  memory limits even with the ~33% base64 overhead of encrypted ops.
+
+### Snapshots
+
+A snapshot is a **compacted op sequence**, not a separate document format. Periodically the
+server (or a client) compacts the op log by discarding superseded ops:
+
+- For LWW entities (e.g. book fields), keep only the latest surviving op per
+  `(entity_id, field)`.
+- For append-only entities (reading sessions), all ops are retained — nothing to compact.
+- Honored tombstones collapse to a single delete op until their 30-day retention expires.
+
+The result is serialized in the **exact same op-envelope format** as the live op log
+(`v`, `op_id`, `hlc`, `entity_type`, …). This means:
+
+- Snapshots reuse the same parsing, validation, and checksum path as ordinary ops.
+- When encryption is enabled, each op in the snapshot remains individually encrypted with
+  its original envelope — the server never needs the key to produce or serve a snapshot.
+
+**New-device bootstrap**: a fresh device pulls the latest snapshot, then pulls ops created
+after the snapshot's high-water cursor. This avoids replaying the entire history while
+remaining a single uniform op stream from the client's perspective.
+
+### Rate limiting
+
+- The server applies a **per-device token bucket** (default: ~60 sync requests/min, with
+  the 1000-ops-per-request limit above bounding total throughput).
+- Over-limit requests receive `429 Too Many Requests` with a `Retry-After` header.
+- Clients honor `Retry-After` and otherwise back off exponentially (with jitter) before
+  retrying. Because push and pull are idempotent, retries are always safe.
+- Limits are configurable by self-hosters; the defaults target a single user's handful of
+  devices, not a multi-tenant service.
+
 ### Encryption envelope
 
 When encryption is enabled, the `fields` value is replaced with an encrypted blob:
@@ -126,6 +168,8 @@ per-library (generated at `toku sync init`), stored on the server alongside the 
 |-------|----------------|
 | Push conflict (duplicate op_id) | Ignore — op already stored. |
 | Pull cursor not found | Full re-sync from latest snapshot. |
+| Batch too large (400) | Split the request into ≤1000-op batches and retry. |
+| Rate limited (429) | Honor `Retry-After`; otherwise back off exponentially with jitter. Retries are safe (idempotent). |
 | Auth failure (401) | Prompt for device re-authentication. |
 | Envelope version too high | Log warning, skip op, prompt user to update app. |
 | Checksum mismatch | Reject op, log error, do not apply. |
@@ -148,6 +192,8 @@ per-library (generated at `toku sync init`), stored on the server alongside the 
 
 - The `sync_ops` table grows linearly with mutations. Snapshot compaction (periodic
   full-state snapshots that allow op-log truncation) is required for long-lived libraries.
+  The snapshot format is now fixed as a compacted op sequence (see Decision → Snapshots),
+  resolving ADR-006's open "snapshot compaction strategy" question.
 - Field-level ops mean the op payload varies by entity type. Clients must validate
   field names against the current schema.
 - The encryption envelope adds ~33% size overhead (base64) and CPU cost (AES-GCM per op).
@@ -155,8 +201,16 @@ per-library (generated at `toku sync init`), stored on the server alongside the 
 - Changing the passphrase requires re-encrypting all ops — this is a client-side batch
   operation that can take minutes for large libraries.
 
-## Open Questions
+## Resolved Questions
 
-- [ ] Maximum op batch size for push/pull requests (start with 1000 ops per request)
-- [ ] Snapshot format (full library JSON vs. compacted op sequence)
-- [ ] Rate limiting strategy for the sync server
+The open questions from the draft were resolved during review and acceptance (issue #79):
+
+- **Maximum op batch size** — Fixed at **1000 ops per push/pull request**. Larger backlogs
+  are paged via the cursor contract; over-limit requests are rejected with `400`.
+  See Decision → Batch limits.
+- **Snapshot format** — A snapshot is a **compacted op sequence** in the same op-envelope
+  format as the live op log, rather than a separate full-library JSON document. This reuses
+  the op pipeline and keeps snapshots encryption-compatible. See Decision → Snapshots.
+- **Rate limiting strategy** — A **per-device token bucket** on the server (default
+  ~60 requests/min) returning `429` + `Retry-After`, with exponential client backoff.
+  See Decision → Rate limiting.

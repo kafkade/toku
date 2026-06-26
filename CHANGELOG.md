@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multi-device sync integration test harness (`toku-sync/tests/`): a reusable
+  `TestServer` (real in-process Axum relay on a random port) and `SimulatedDevice`
+  (real client + database + merge engine + deterministic HLC), plus 10 end-to-end
+  scenarios covering basic sync, concurrent edits (same and different fields),
+  delete propagation, delete-vs-edit, offline/reconnect, new-device bootstrap,
+  encryption round-trip, idempotent push, and network-failure recovery. The
+  `toku-sync` server router is now exposed as a library (`build_router`) so it can
+  be driven in-process, and the token store honors `TOKU_TOKEN_STORE=file` /
+  `TOKU_DISABLE_KEYCHAIN` to skip the OS keychain in CI
 - Native conflict resolution (FFI + Apple): new `toku_sync_conflicts`, `toku_sync_resolve_conflict`, and `toku_sync_resolve_all_conflicts` C FFI functions surface the sync conflict log to Swift. The iOS and macOS apps gain a shared `ConflictResolutionView` (in `TokuKitUI`) listing unresolved note/review conflicts with per-conflict "Keep Local"/"Keep Remote" and bulk resolve actions, reachable from the sync settings screen
 - Sync status indicator in the Apple apps: a shared `SyncStatusBadge` shows current sync state and surfaces pending conflicts — in the macOS sidebar, the iPad sidebar, and as a badge on the iOS "More" tab — routing to conflict resolution when conflicts need review
 - Background sync push in the Apple apps: when sync is configured, the apps run a best-effort `push` when moving to the background/inactive (complementing the existing sync-on-launch pull), so local changes propagate without manual action
@@ -111,6 +120,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Sync pull now materializes pulled ops into local state. Previously the client
+  staged remote ops but never applied them through the merge engine, so pulled
+  changes never reached the `books`/library tables
+- Sync now works end-to-end with client-side encryption across multiple devices:
+  encrypted op payloads are carried over the wire (push encrypts, pull decrypts),
+  and the key-derivation salt is coordinated through the server at `init` (first
+  device establishes it, later devices adopt it) so every device derives the same
+  key. Previously each device derived a key from its own random salt and could not
+  decrypt peers' ops
+- Sync init now adopts the server-assigned device id as the local device identity.
+  Previously the local op-emitting device id differed from the id the server used
+  to exclude a device's own ops on pull, so a device could pull back its own ops
 - iOS and iPad app now builds and launches (previously authored but never compiled): fixed a missing `TokuKit` import, replaced the iOS 18-only tab API with an iOS 17 compatible tab bar, corrected an FFI status-code type mismatch, and added the `Info.plist` keys (`CFBundleExecutable`, `CFBundlePackageType`, etc.) required for installation
 
 ## [0.2.1] - 2026-05-30

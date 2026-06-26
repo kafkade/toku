@@ -16,7 +16,8 @@ pub mod wire;
 
 pub use client::{DeviceInfo, SyncClient, WireOp};
 pub use orchestrator::{
-    InitOutcome, PullOutcome, PushOutcome, StatusOutcome, conflict, conflicts, default_device_name,
-    devices, init, pull, push, resolve_all_conflicts, resolve_conflict, status,
+    BootstrapOutcome, InitOutcome, PullOutcome, PushOutcome, StatusOutcome, bootstrap, conflict,
+    conflicts, default_device_name, devices, init, pull, push, resolve_all_conflicts,
+    resolve_conflict, status,
 };
 pub use token_store::TokenStore;

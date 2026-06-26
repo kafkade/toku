@@ -1,48 +1,8 @@
-mod auth;
-mod config;
-mod db;
-mod error;
-mod handlers;
-mod models;
-
-use std::path::PathBuf;
-
-use axum::Router;
-use axum::extract::DefaultBodyLimit;
-use axum::middleware;
-use axum::routing::{delete, get, post};
 use clap::Parser;
-use tower_http::trace::TraceLayer;
 
-use crate::config::Config;
-use crate::db::SyncDatabase;
-
-fn build_router(db_path: PathBuf) -> Router {
-    // Routes that require authentication
-    let authenticated = Router::new()
-        .route("/api/v1/devices", get(handlers::list_devices))
-        .route("/api/v1/devices/{id}", delete(handlers::delete_device))
-        .route("/api/v1/push", post(handlers::push_ops))
-        .route("/api/v1/pull", get(handlers::pull_ops))
-        .route("/api/v1/pull/all", get(handlers::pull_all_ops))
-        .route("/api/v1/salt", get(handlers::get_salt))
-        .route("/api/v1/snapshot", get(handlers::download_snapshot))
-        .route("/api/v1/snapshot", post(handlers::upload_snapshot))
-        .route("/api/v1/rekey", post(handlers::rekey))
-        .layer(middleware::from_fn_with_state(
-            db_path.clone(),
-            auth::require_auth,
-        ));
-
-    // Public routes
-    Router::new()
-        .route("/health", get(handlers::health))
-        .route("/api/v1/register", post(handlers::register))
-        .merge(authenticated)
-        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB (rekey may be large)
-        .layer(TraceLayer::new_for_http())
-        .with_state(db_path)
-}
+use toku_sync::build_router;
+use toku_sync::config::Config;
+use toku_sync::db::SyncDatabase;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -132,6 +92,8 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;

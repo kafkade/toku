@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 pub struct RegisterRequest {
     pub library_id: String,
     pub device_name: String,
+    /// Optional base64-encoded key-derivation salt. The first device to
+    /// register a library with encryption enabled establishes the salt for
+    /// the whole library; later devices fetch it via `GET /salt`.
+    #[serde(default)]
+    pub salt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

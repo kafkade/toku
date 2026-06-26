@@ -6,6 +6,20 @@ use base64::Engine as _;
 
 static KEYRING_INIT: Once = Once::new();
 
+/// Whether the OS keychain should be bypassed in favour of the encrypted-at-rest
+/// file fallback. Controlled by the environment so headless servers and CI (which
+/// have no usable keychain, or must not pollute the developer's keychain) can opt
+/// out: set `TOKU_TOKEN_STORE=file` or `TOKU_DISABLE_KEYCHAIN=1`.
+fn keychain_disabled() -> bool {
+    matches!(
+        std::env::var("TOKU_TOKEN_STORE").as_deref(),
+        Ok("file") | Ok("FILE")
+    ) || matches!(
+        std::env::var("TOKU_DISABLE_KEYCHAIN").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 /// Register the OS-native credential store as the keyring default.
 ///
 /// keyring 4.x decouples the API (`keyring-core`) from the platform stores, so
@@ -68,19 +82,21 @@ impl TokenStore {
     pub fn store(&self, server_url: &str, token: &str) -> anyhow::Result<()> {
         let key = normalize_url(server_url);
 
-        // Try OS keychain first
-        ensure_keyring_store();
-        match keyring_core::Entry::new(KEYRING_SERVICE, &key) {
-            Ok(entry) => match entry.set_password(token) {
-                Ok(()) => return Ok(()),
+        // Try OS keychain first (unless disabled by env)
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            match keyring_core::Entry::new(KEYRING_SERVICE, &key) {
+                Ok(entry) => match entry.set_password(token) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not store token in OS keychain ({e}), using file fallback"
+                        );
+                    }
+                },
                 Err(e) => {
-                    eprintln!(
-                        "warning: could not store token in OS keychain ({e}), using file fallback"
-                    );
+                    eprintln!("warning: keychain unavailable ({e}), using file fallback");
                 }
-            },
-            Err(e) => {
-                eprintln!("warning: keychain unavailable ({e}), using file fallback");
             }
         }
 
@@ -91,13 +107,15 @@ impl TokenStore {
     pub fn load(&self, server_url: &str) -> anyhow::Result<Option<String>> {
         let key = normalize_url(server_url);
 
-        // Try OS keychain first
-        ensure_keyring_store();
-        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE, &key) {
-            match entry.get_password() {
-                Ok(token) => return Ok(Some(token)),
-                Err(keyring_core::Error::NoEntry) => {}
-                Err(_) => {}
+        // Try OS keychain first (unless disabled by env)
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE, &key) {
+                match entry.get_password() {
+                    Ok(token) => return Ok(Some(token)),
+                    Err(keyring_core::Error::NoEntry) => {}
+                    Err(_) => {}
+                }
             }
         }
 
@@ -109,10 +127,12 @@ impl TokenStore {
     pub fn delete(&self, server_url: &str) -> anyhow::Result<()> {
         let key = normalize_url(server_url);
 
-        // Try OS keychain
-        ensure_keyring_store();
-        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE, &key) {
-            let _ = entry.delete_credential();
+        // Try OS keychain (unless disabled by env)
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE, &key) {
+                let _ = entry.delete_credential();
+            }
         }
 
         // Also remove from file fallback
@@ -124,14 +144,16 @@ impl TokenStore {
         let key = normalize_url(server_url);
         let encoded = base64::engine::general_purpose::STANDARD.encode(key_bytes);
 
-        ensure_keyring_store();
-        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
-            match entry.set_password(&encoded) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    eprintln!(
-                        "warning: could not store sync key in OS keychain ({e}), using file fallback"
-                    );
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+                match entry.set_password(&encoded) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: could not store sync key in OS keychain ({e}), using file fallback"
+                        );
+                    }
                 }
             }
         }
@@ -140,20 +162,21 @@ impl TokenStore {
     }
 
     /// Load the derived sync encryption key from the OS keychain.
-    #[allow(dead_code)]
     pub fn load_sync_key(&self, server_url: &str) -> anyhow::Result<Option<Vec<u8>>> {
         use base64::Engine;
         let key = normalize_url(server_url);
 
-        ensure_keyring_store();
-        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
-            match entry.get_password() {
-                Ok(encoded) => {
-                    let bytes = base64::engine::general_purpose::STANDARD.decode(&encoded)?;
-                    return Ok(Some(bytes));
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+                match entry.get_password() {
+                    Ok(encoded) => {
+                        let bytes = base64::engine::general_purpose::STANDARD.decode(&encoded)?;
+                        return Ok(Some(bytes));
+                    }
+                    Err(keyring_core::Error::NoEntry) => {}
+                    Err(_) => {}
                 }
-                Err(keyring_core::Error::NoEntry) => {}
-                Err(_) => {}
             }
         }
 
@@ -172,9 +195,11 @@ impl TokenStore {
     pub fn delete_sync_key(&self, server_url: &str) -> anyhow::Result<()> {
         let key = normalize_url(server_url);
 
-        ensure_keyring_store();
-        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
-            let _ = entry.delete_credential();
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_SYNCKEY, &key) {
+                let _ = entry.delete_credential();
+            }
         }
 
         self.delete_file(&format!("{key}:synckey"))

@@ -8,8 +8,12 @@
 use std::path::Path;
 
 use anyhow::Context;
+use base64::Engine;
 use serde::Serialize;
-use toku_db::{ConflictKeep, Database, SyncConflict, SyncRepository};
+use toku_core::SyncKey;
+use toku_db::{
+    ConflictKeep, Database, MergeEngine, SnapshotRepository, SyncConflict, SyncRepository,
+};
 
 use crate::client::{DeviceInfo, SyncClient, WireOp};
 use crate::token_store::TokenStore;
@@ -40,7 +44,12 @@ pub struct PushOutcome {
 /// Outcome of [`pull`].
 #[derive(Debug, Clone, Serialize)]
 pub struct PullOutcome {
+    /// Number of remote ops fetched from the server.
     pub pulled: usize,
+    /// Number of ops that were successfully applied to local state.
+    pub applied: usize,
+    /// Number of merge conflicts recorded for user review during this pull.
+    pub conflicts: usize,
     pub cursor: Option<String>,
 }
 
@@ -58,6 +67,19 @@ pub struct StatusOutcome {
     pub pull_cursor: Option<String>,
     pub device_count: usize,
     pub unresolved_conflicts: usize,
+}
+
+/// Outcome of [`bootstrap`].
+#[derive(Debug, Clone, Serialize)]
+pub struct BootstrapOutcome {
+    /// Whether a server snapshot was found and applied locally.
+    pub snapshot_applied: bool,
+    /// Number of books loaded from the snapshot.
+    pub snapshot_books: usize,
+    /// Number of ops pulled after the snapshot (post-snapshot history).
+    pub pulled: usize,
+    /// Number of pulled ops applied to local state.
+    pub applied: usize,
 }
 
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
@@ -84,6 +106,24 @@ fn require_token(token_store: &TokenStore, server: &str) -> anyhow::Result<Strin
         .ok_or_else(|| anyhow::anyhow!("no auth token found for {server}. Run sync init first."))
 }
 
+/// Load the client-side encryption key when encryption is enabled for this
+/// library; returns `None` when encryption is disabled.
+fn load_encryption_key(
+    token_store: &TokenStore,
+    server: &str,
+    sync_config: &toku_core::SyncConfig,
+) -> anyhow::Result<Option<SyncKey>> {
+    if !sync_config.encryption {
+        return Ok(None);
+    }
+    let bytes = token_store.load_sync_key(server)?.ok_or_else(|| {
+        anyhow::anyhow!("encryption is enabled but no sync key was found for {server}")
+    })?;
+    let key = SyncKey::from_exported_bytes(&bytes)
+        .map_err(|e| anyhow::anyhow!("stored sync key is invalid: {e}"))?;
+    Ok(Some(key))
+}
+
 /// Initialize sync: register the device with the server, persist the auth token and
 /// sync config, optionally enabling client-side encryption with the given passphrase.
 ///
@@ -103,7 +143,20 @@ pub fn init(
     let device_name = device_name.unwrap_or_else(default_device_name);
 
     let client = SyncClient::new(server)?;
-    let resp = rt.block_on(client.register(&library_id, &device_name))?;
+
+    // When enabling encryption, offer a candidate key-derivation salt during
+    // registration. The server keeps it only if the library has no salt yet,
+    // so all devices in a library converge on a single salt (and thus key).
+    let candidate_salt_b64 = match passphrase {
+        Some(pass) if !pass.is_empty() => {
+            let salt = toku_core::SyncKey::generate_salt();
+            Some(base64::engine::general_purpose::STANDARD.encode(salt))
+        }
+        _ => None,
+    };
+
+    let resp =
+        rt.block_on(client.register(&library_id, &device_name, candidate_salt_b64.as_deref()))?;
 
     token_store
         .store(server, &resp.auth_token)
@@ -111,7 +164,20 @@ pub fn init(
 
     let encryption_enabled = match passphrase {
         Some(pass) if !pass.is_empty() => {
-            let salt = toku_core::SyncKey::generate_salt();
+            // Adopt the authoritative library salt: ours if we registered
+            // first, otherwise the one a previous device established.
+            let salt_b64 = rt
+                .block_on(client.get_salt(&resp.auth_token))?
+                .salt
+                .or(candidate_salt_b64)
+                .ok_or_else(|| anyhow::anyhow!("server did not return a library salt"))?;
+            let salt_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&salt_b64)
+                .context("invalid base64 salt from server")?;
+            let salt: [u8; 16] = salt_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("library salt must be 16 bytes"))?;
             let key = toku_core::SyncKey::derive(pass, &salt)
                 .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
             token_store
@@ -124,7 +190,11 @@ pub fn init(
 
     let db = open_db(data_dir)?;
     let sync_repo = SyncRepository::new(&db);
-    sync_repo.get_or_create_device(&device_name)?;
+    let server_device_id = resp
+        .device_id
+        .parse::<uuid::Uuid>()
+        .context("server returned an invalid device_id")?;
+    sync_repo.get_or_create_device_with_id(server_device_id, &device_name)?;
 
     let mut config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
     config.sync = Some(toku_core::SyncConfig {
@@ -172,7 +242,21 @@ pub fn push(data_dir: &Path) -> anyhow::Result<PushOutcome> {
     }
 
     let total = unpushed.len();
-    let wire_ops: Vec<WireOp> = unpushed.iter().map(wire::to_wire).collect();
+    let key = load_encryption_key(&token_store, server, sync_config)?;
+    let wire_ops: Vec<WireOp> = unpushed
+        .iter()
+        .map(|op| {
+            if let Some(ref key) = key {
+                let mut encrypted = op.clone();
+                encrypted
+                    .encrypt(key)
+                    .map_err(|e| anyhow::anyhow!("failed to encrypt op {}: {e}", op.op_id))?;
+                Ok(wire::to_wire(&encrypted))
+            } else {
+                Ok(wire::to_wire(op))
+            }
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut total_accepted = 0usize;
     let mut total_duplicates = 0usize;
@@ -214,10 +298,14 @@ pub fn pull(data_dir: &Path) -> anyhow::Result<PullOutcome> {
 
     let db = open_db(data_dir)?;
     let sync_repo = SyncRepository::new(&db);
+    let merge_engine = MergeEngine::new(&db);
     let client = SyncClient::new(server)?;
+    let key = load_encryption_key(&token_store, server, sync_config)?;
 
     let mut cursor = sync_repo.get_cursor("pull_cursor")?;
     let mut total_pulled = 0usize;
+    let mut total_applied = 0usize;
+    let mut total_conflicts = 0usize;
 
     loop {
         let result = rt.block_on(client.pull_ops(&token, cursor.as_deref()))?;
@@ -225,8 +313,32 @@ pub fn pull(data_dir: &Path) -> anyhow::Result<PullOutcome> {
             break;
         }
         for wire_op in &result.ops {
-            let sync_op = wire::from_wire(wire_op).context("failed to parse remote op")?;
+            let mut sync_op = wire::from_wire(wire_op).context("failed to parse remote op")?;
+
+            // Decrypt before staging/applying when the op carries an encrypted
+            // envelope. An encrypted op with no local key is a misconfiguration.
+            if sync_op.encrypted.is_some() {
+                let key = key.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "received an encrypted op ({}) but encryption is not configured locally",
+                        sync_op.op_id
+                    )
+                })?;
+                sync_op
+                    .decrypt(key)
+                    .with_context(|| format!("failed to decrypt remote op {}", sync_op.op_id))?;
+            }
+
+            // Stage the op in the local op-log, then materialize it into the
+            // entity tables via the entity-specific merge engine.
             sync_repo.insert_remote_op(&sync_op)?;
+            let outcome = merge_engine
+                .apply_op(&sync_op)
+                .with_context(|| format!("failed to apply remote op {}", sync_op.op_id))?;
+            if outcome.was_applied() {
+                total_applied += 1;
+            }
+            total_conflicts += outcome.conflicts().len();
         }
         total_pulled += result.ops.len();
         if let Some(new_cursor) = result.cursor {
@@ -240,11 +352,54 @@ pub fn pull(data_dir: &Path) -> anyhow::Result<PullOutcome> {
 
     Ok(PullOutcome {
         pulled: total_pulled,
+        applied: total_applied,
+        conflicts: total_conflicts,
         cursor,
     })
 }
 
-/// Report the current sync status: configuration, pending ops, cursors, and the
+/// Bootstrap a freshly-registered device: download the latest server snapshot
+/// (if one exists from op-log compaction), apply it locally, then pull any ops
+/// the server still retains. Used for new-device provisioning.
+///
+/// When no snapshot exists the server still holds the full op log, so this is
+/// equivalent to a plain [`pull`].
+pub fn bootstrap(data_dir: &Path) -> anyhow::Result<BootstrapOutcome> {
+    let rt = build_runtime()?;
+    let token_store = TokenStore::new(data_dir);
+    let config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
+    let sync_config = require_sync(&config)?;
+    let server = &sync_config.server;
+    let token = require_token(&token_store, server)?;
+    let client = SyncClient::new(server)?;
+
+    let mut snapshot_applied = false;
+    let mut snapshot_books = 0usize;
+
+    if let Some(snap) = rt.block_on(client.download_snapshot(&token))? {
+        let snapshot: toku_core::sync::LibrarySnapshot =
+            serde_json::from_str(&snap.snapshot_json).context("invalid snapshot JSON")?;
+        let db = open_db(data_dir)?;
+        let snapshot_repo = SnapshotRepository::new(&db);
+        let result = snapshot_repo
+            .apply_snapshot(&snapshot)
+            .context("failed to apply snapshot")?;
+        snapshot_applied = true;
+        snapshot_books = result.books;
+    }
+
+    // Pull whatever the server still retains (post-snapshot ops, or the full
+    // op log if no snapshot existed) and materialize it on top of the snapshot.
+    let pulled = pull(data_dir)?;
+
+    Ok(BootstrapOutcome {
+        snapshot_applied,
+        snapshot_books,
+        pulled: pulled.pulled,
+        applied: pulled.applied,
+    })
+}
+
 /// number of registered devices (best-effort network call).
 pub fn status(data_dir: &Path) -> anyhow::Result<StatusOutcome> {
     let rt = build_runtime()?;

@@ -33,3 +33,7 @@ uuid.workspace = true
 [dev-dependencies]
 reqwest = { workspace = true, features = ["json"] }
 tower = "0.5"
+toku-core.workspace = true
+toku-db.workspace = true
+toku-sync-client.workspace = true
+tempfile = "3"

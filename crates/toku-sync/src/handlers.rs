@@ -47,6 +47,7 @@ pub async fn register(
         let device_name = req.device_name.clone();
         let device_id = device_id.clone();
         let token_hash = token_hash.clone();
+        let salt = req.salt.clone();
         move || -> Result<RegisterResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
@@ -55,6 +56,15 @@ pub async fn register(
                 "INSERT OR IGNORE INTO libraries (id, created_at) VALUES (?1, datetime('now'))",
                 [&library_id],
             )?;
+
+            // Establish the library salt on first encrypted registration.
+            // First writer wins: later devices keep the existing salt.
+            if let Some(ref salt) = salt {
+                db.conn.execute(
+                    "UPDATE libraries SET salt = ?1 WHERE id = ?2 AND salt IS NULL",
+                    rusqlite::params![salt, library_id],
+                )?;
+            }
 
             db.conn.execute(
                 "INSERT INTO devices (device_id, library_id, device_name, auth_token_hash, created_at)

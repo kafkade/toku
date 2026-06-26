@@ -87,6 +87,15 @@ impl SyncKey {
     pub fn as_exported_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Reconstruct a key from raw exported bytes (e.g. loaded from the keychain
+    /// or file store). Expects exactly 32 bytes.
+    pub fn from_exported_bytes(bytes: &[u8]) -> Result<Self, TokuError> {
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| TokuError::Crypto("sync key must be exactly 32 bytes".to_string()))?;
+        Ok(Self(arr))
+    }
 }
 
 impl std::fmt::Debug for SyncKey {

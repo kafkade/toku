@@ -1,9 +1,16 @@
 # ADR-008: Sync Wire Protocol — Op-Log Format, HLC, and Encryption Envelope
 
-**Status**: Accepted (implementation in Phase 7)
+**Status**: Superseded by ADR-010
 **Date**: 2026-05-31
-**Decision**: Define the sync wire protocol using UUID v7 op IDs, Hybrid Logical Clocks
-for ordering, a versioned JSON op envelope, and an optional AES-256-GCM encryption layer.
+**Superseded by**: [ADR-010](010-self-host-auth.md) (2026-06-26) — the wire protocol
+technical details (op-log format, HLC, cursor contract, batch limits, snapshots, rate
+limiting) are retained, but the authentication model and encryption posture have changed:
+registration is now SRP-authenticated, and op encryption is mandatory for hosted mode.
+See ADR-010 for the revised auth layer and threat model.
+
+**Original decision** (archived): Define the sync wire protocol using UUID v7 op IDs,
+Hybrid Logical Clocks for ordering, a versioned JSON op envelope, and an optional
+AES-256-GCM encryption layer.
 
 ## Context
 

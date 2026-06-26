@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Account **Secret Key** + **Emergency Kit** for zero-knowledge sync (1Password-style
+  two-secret model). A high-entropy 128-bit Secret Key is generated on-device, formatted
+  for transcription with a `TK` version prefix and a checksum that catches typos
+  (`TK-XXXXXX-XXXXX-XXXXX-XXXXX-XXXXX-CC`). New CLI commands:
+  `toku account secret-key generate` and `toku account emergency-kit`, the latter rendering
+  the kit as plain text, self-contained printable HTML, or PDF. The Secret Key is surfaced
+  once and is never sent to the server. Recovery semantics — including that lost secrets with
+  no local copy mean server data is unrecoverable, and that local SQLite is the ultimate
+  recovery — are documented in `docs/recovery.md`
+
 - SRP-6a authentication for sync libraries: the sync server never sees the user's
   password or Secret Key. Libraries protected with a passphrase use SRP (RFC 5054,
   Group 2048 + SHA-256) so the server stores only a verifier (`v = g^x mod N`).

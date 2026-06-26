@@ -73,6 +73,8 @@ their ever-growing libraries.
 - 🪟 Windows desktop app (Tauri v2) wrapping the web UI in a native window with system tray
 - 🔄 Optional multi-device sync via a self-hostable relay server
   ([deployment guide](docs/sync-server.md)) with end-to-end encryption
+- 🔑 Account Secret Key + printable Emergency Kit for zero-knowledge sync
+  ([recovery guide](docs/recovery.md))
 
 ## Tech Stack
 

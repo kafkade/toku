@@ -13,6 +13,7 @@ use toku_core::{
 };
 use toku_db::{BookRepository, Database};
 
+mod account;
 mod import_ui;
 mod sync;
 mod tui;
@@ -254,6 +255,12 @@ enum Commands {
     Sync {
         #[command(subcommand)]
         action: SyncAction,
+    },
+
+    /// Manage account secrets (Secret Key, Emergency Kit)
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
     },
 }
 
@@ -620,6 +627,58 @@ enum SyncAction {
 }
 
 #[derive(Clone, Subcommand)]
+enum AccountAction {
+    /// Manage your account Secret Key
+    SecretKey {
+        #[command(subcommand)]
+        action: SecretKeyAction,
+    },
+
+    /// Generate and render an Emergency Kit (account details + Secret Key)
+    EmergencyKit {
+        /// Account email / identifier
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Sync server URL
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Use an existing Secret Key (otherwise a fresh one is generated)
+        #[arg(long)]
+        secret_key: Option<String>,
+
+        /// Kit output format
+        #[arg(long, value_enum, default_value = "text")]
+        kit_format: KitFormat,
+
+        /// Write the kit to a file instead of stdout (required for PDF)
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Subcommand)]
+enum SecretKeyAction {
+    /// Generate a new Secret Key
+    Generate {
+        /// Write the formatted Secret Key to a file instead of stdout
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum KitFormat {
+    /// Plain text
+    Text,
+    /// Printable, self-contained HTML
+    Html,
+    /// PDF document
+    Pdf,
+}
+
+#[derive(Clone, Subcommand)]
 enum ConflictAction {
     /// List unresolved conflicts (default when no subcommand is given)
     List,
@@ -704,6 +763,9 @@ fn main() -> Result<()> {
         }
         Commands::Sync { action } => {
             return cmd_sync(&data_dir, action.clone(), &cli.format);
+        }
+        Commands::Account { action } => {
+            return cmd_account(action.clone());
         }
         _ => {}
     }
@@ -796,7 +858,8 @@ fn main() -> Result<()> {
         Commands::Config { .. }
         | Commands::Completions { .. }
         | Commands::Serve { .. }
-        | Commands::Sync { .. } => {
+        | Commands::Sync { .. }
+        | Commands::Account { .. } => {
             unreachable!()
         }
     }
@@ -2998,6 +3061,120 @@ fn cmd_shelf(
             Ok(())
         }
     }
+}
+
+/// Generate a Secret Key and/or an Emergency Kit. Standalone for now — full
+/// account signup/login (SRP) lands in a later change.
+fn cmd_account(action: AccountAction) -> Result<()> {
+    match action {
+        AccountAction::SecretKey {
+            action: SecretKeyAction::Generate { out },
+        } => {
+            let key = toku_core::SecretKey::generate()
+                .map_err(|e| anyhow::anyhow!("failed to generate secret key: {e}"))?;
+            let formatted = key.format();
+
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, format!("{formatted}\n"))
+                        .with_context(|| format!("failed to write {}", path.display()))?;
+                    eprintln!("Secret Key written to {}", path.display());
+                }
+                None => {
+                    println!("{formatted}");
+                }
+            }
+
+            eprintln!();
+            eprintln!("⚠  This is your account Secret Key. It is shown once.");
+            eprintln!("   Store it offline (an Emergency Kit is the easiest way).");
+            eprintln!("   It cannot be recovered — there is no server-side copy.");
+            Ok(())
+        }
+
+        AccountAction::EmergencyKit {
+            email,
+            server,
+            secret_key,
+            kit_format,
+            out,
+        } => {
+            // Resolve the Secret Key: validate a provided one, or generate fresh.
+            let (formatted_key, generated) = match secret_key {
+                Some(raw) => {
+                    let parsed = toku_core::SecretKey::parse(&raw)
+                        .map_err(|e| anyhow::anyhow!("invalid secret key: {e}"))?;
+                    (parsed.format(), false)
+                }
+                None => {
+                    let key = toku_core::SecretKey::generate()
+                        .map_err(|e| anyhow::anyhow!("failed to generate secret key: {e}"))?;
+                    (key.format(), true)
+                }
+            };
+
+            // Resolve account email (prompt if missing).
+            let email = match email {
+                Some(e) => e,
+                None => prompt_line("Account email: ")?,
+            };
+            let server = server.filter(|s| !s.trim().is_empty());
+
+            let kit = toku_core::EmergencyKit::new(email, server, formatted_key.clone());
+
+            match kit_format {
+                KitFormat::Text => write_kit_bytes(out.as_deref(), kit.to_text().as_bytes())?,
+                KitFormat::Html => write_kit_bytes(out.as_deref(), kit.to_html().as_bytes())?,
+                KitFormat::Pdf => {
+                    let path = out.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("--out <FILE> is required for PDF output")
+                    })?;
+                    let bytes = account::render_pdf(&kit)?;
+                    std::fs::write(path, &bytes)
+                        .with_context(|| format!("failed to write {}", path.display()))?;
+                    eprintln!("Emergency Kit (PDF) written to {}", path.display());
+                }
+            }
+
+            if generated {
+                eprintln!();
+                eprintln!("⚠  A new Secret Key was generated and embedded in this kit.");
+                eprintln!("   Print or store the kit offline now — the key is shown once");
+                eprintln!("   and cannot be recovered from the server.");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Write kit bytes to a file, or to stdout when no path is given.
+fn write_kit_bytes(out: Option<&Path>, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    match out {
+        Some(path) => {
+            std::fs::write(path, bytes)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            eprintln!("Emergency Kit written to {}", path.display());
+        }
+        None => {
+            std::io::stdout()
+                .write_all(bytes)
+                .context("failed to write to stdout")?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a single line of input from the terminal, trimming the trailing newline.
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::Write as _;
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_line(&mut buf)
+        .context("failed to read input")?;
+    Ok(buf.trim().to_string())
 }
 
 fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -> Result<()> {

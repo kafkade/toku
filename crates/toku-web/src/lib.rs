@@ -11,12 +11,14 @@ use axum::Router;
 use axum::routing::{get, post};
 
 mod charts;
+mod conflicts_handlers;
 mod error;
 mod handlers;
 pub mod import_handlers;
 mod import_views;
 pub mod library_handlers;
 mod library_views;
+mod sync_status;
 mod views;
 
 pub use error::WebError;
@@ -37,6 +39,11 @@ pub fn build_router(db_path: PathBuf, temp_dir: PathBuf) -> Router {
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("covers");
 
+    // Record the data dir so the header sync badge can read sync state.
+    if let Some(data_dir) = db_path.parent() {
+        sync_status::set_data_dir(data_dir.to_path_buf());
+    }
+
     let state = AppState {
         db_path,
         import_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -56,6 +63,16 @@ pub fn build_router(db_path: PathBuf, temp_dir: PathBuf) -> Router {
         .route("/stats", get(handlers::stats_dashboard))
         .route("/stats/wrap/{year}", get(handlers::yearly_wrap))
         .route("/api/stats", get(handlers::stats_json))
+        // Sync conflicts
+        .route("/conflicts", get(conflicts_handlers::conflicts_page))
+        .route(
+            "/conflicts/resolve/{id}",
+            post(conflicts_handlers::resolve_conflict),
+        )
+        .route(
+            "/conflicts/resolve-all",
+            post(conflicts_handlers::resolve_all_conflicts),
+        )
         // Import wizard
         .route("/import", get(import_handlers::import_page))
         .route("/import/upload", post(import_handlers::upload_csv))

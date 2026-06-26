@@ -1,0 +1,42 @@
+# Keep the Docker build context small and the image reproducible.
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Native apps (not a cargo member; not needed to build toku-sync)
+/toku-apple/
+
+# Tauri auto-generated schemas
+/crates/toku-desktop/gen/
+
+# Swift / SwiftPM build artifacts
+.build/
+.swiftpm/
+
+# Git / CI metadata
+.git/
+.github/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data / secrets
+*.db
+*.db-journal
+*.db-wal
+covers/
+.env
+
+# Docs and misc (not needed for the build)
+docs/
+*.md
+docker-compose.yml

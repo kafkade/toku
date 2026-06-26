@@ -1170,6 +1170,188 @@ pub unsafe extern "C" fn toku_sync_devices(
     }))
 }
 
+/// Serializable mirror of [`toku_db::SyncConflict`] for FFI JSON output.
+///
+/// `toku_db::SyncConflict` does not derive `Serialize`, so conflicts are mapped
+/// into this struct (snake_case fields, decoded as camelCase on the Swift side).
+#[derive(Serialize)]
+struct FfiSyncConflict {
+    id: String,
+    entity_type: String,
+    entity_id: String,
+    field_name: Option<String>,
+    local_value: Option<String>,
+    remote_value: Option<String>,
+    local_hlc: String,
+    remote_hlc: String,
+    created_at: String,
+}
+
+impl From<toku_db::SyncConflict> for FfiSyncConflict {
+    fn from(c: toku_db::SyncConflict) -> Self {
+        FfiSyncConflict {
+            id: c.id,
+            entity_type: c.entity_type,
+            entity_id: c.entity_id,
+            field_name: c.field_name,
+            local_value: c.local_value,
+            remote_value: c.remote_value,
+            local_hlc: c.local_hlc,
+            remote_hlc: c.remote_hlc,
+            created_at: c.created_at,
+        }
+    }
+}
+
+/// Map a `"local"` / `"remote"` keep selector to [`toku_db::ConflictKeep`].
+fn parse_conflict_keep(value: &str) -> Result<toku_db::ConflictKeep, TokuStatus> {
+    match value {
+        "local" => Ok(toku_db::ConflictKeep::Local),
+        "remote" => Ok(toku_db::ConflictKeep::Remote),
+        other => {
+            set_last_error(&format!(
+                "invalid keep value: {other:?} (expected \"local\" or \"remote\")"
+            ));
+            Err(TokuStatus::ErrorSync)
+        }
+    }
+}
+
+/// List unresolved sync conflicts awaiting user review, as a JSON array.
+///
+/// On success, writes the array to `*out_json`, which the caller must free with
+/// `toku_free_string`. Returns an empty array when there are no conflicts.
+///
+/// # Safety
+/// - `data_dir` must be a valid NUL-terminated UTF-8 string.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_sync_conflicts(
+    data_dir: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out_json.is_null() {
+            set_last_error("out_json pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        let data_dir = match unsafe { cstr_to_str(data_dir) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        match toku_sync_client::conflicts(Path::new(data_dir)) {
+            Ok(conflicts) => {
+                let mapped: Vec<FfiSyncConflict> =
+                    conflicts.into_iter().map(FfiSyncConflict::from).collect();
+                write_sync_json(&mapped, out_json)
+            }
+            Err(e) => {
+                set_last_error(&format!("sync conflicts failed: {e}"));
+                TokuStatus::ErrorSync
+            }
+        }
+    }))
+}
+
+/// Resolve a single sync conflict, keeping the local or remote value.
+///
+/// `keep` must be `"local"` or `"remote"`. On success, writes a JSON object
+/// (`{ "resolved": bool }`) to `*out_json`, which the caller must free with
+/// `toku_free_string`. `resolved` is `false` if the conflict was missing or
+/// already resolved.
+///
+/// # Safety
+/// - `data_dir`, `id`, and `keep` must be valid NUL-terminated UTF-8 strings.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_sync_resolve_conflict(
+    data_dir: *const c_char,
+    id: *const c_char,
+    keep: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out_json.is_null() {
+            set_last_error("out_json pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        let data_dir = match unsafe { cstr_to_str(data_dir) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let id = match unsafe { cstr_to_str(id) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let keep = match unsafe { cstr_to_str(keep) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let keep = match parse_conflict_keep(keep) {
+            Ok(k) => k,
+            Err(st) => return st,
+        };
+
+        match toku_sync_client::resolve_conflict(Path::new(data_dir), id, keep) {
+            Ok(resolved) => write_sync_json(&serde_json::json!({ "resolved": resolved }), out_json),
+            Err(e) => {
+                set_last_error(&format!("sync resolve conflict failed: {e}"));
+                TokuStatus::ErrorSync
+            }
+        }
+    }))
+}
+
+/// Resolve every unresolved sync conflict with the same choice.
+///
+/// `keep` must be `"local"` or `"remote"`. On success, writes a JSON object
+/// (`{ "resolved": N }`) to `*out_json`, which the caller must free with
+/// `toku_free_string`. `resolved` is the number of conflicts resolved.
+///
+/// # Safety
+/// - `data_dir` and `keep` must be valid NUL-terminated UTF-8 strings.
+/// - `out_json` must be a valid pointer to a `*mut c_char`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_sync_resolve_all_conflicts(
+    data_dir: *const c_char,
+    keep: *const c_char,
+    out_json: *mut *mut c_char,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out_json.is_null() {
+            set_last_error("out_json pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        let data_dir = match unsafe { cstr_to_str(data_dir) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let keep = match unsafe { cstr_to_str(keep) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let keep = match parse_conflict_keep(keep) {
+            Ok(k) => k,
+            Err(st) => return st,
+        };
+
+        match toku_sync_client::resolve_all_conflicts(Path::new(data_dir), keep) {
+            Ok(count) => write_sync_json(&serde_json::json!({ "resolved": count }), out_json),
+            Err(e) => {
+                set_last_error(&format!("sync resolve all conflicts failed: {e}"));
+                TokuStatus::ErrorSync
+            }
+        }
+    }))
+}
+
 // ── Stats helper ────────────────────────────────────────────────────────
 
 /// Gather data and compute reading statistics — mirrors the web dashboard's logic.
@@ -1695,6 +1877,53 @@ mod tests {
 
         // list_shelves with null db
         let status = unsafe { toku_list_shelves(std::ptr::null_mut(), &mut out) };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+    }
+
+    #[test]
+    fn parse_conflict_keep_accepts_local_and_remote() {
+        assert_eq!(
+            parse_conflict_keep("local").ok(),
+            Some(toku_db::ConflictKeep::Local)
+        );
+        assert_eq!(
+            parse_conflict_keep("remote").ok(),
+            Some(toku_db::ConflictKeep::Remote)
+        );
+    }
+
+    #[test]
+    fn parse_conflict_keep_rejects_invalid() {
+        let err = parse_conflict_keep("sideways");
+        assert!(matches!(err, Err(TokuStatus::ErrorSync)));
+        let msg = unsafe { CStr::from_ptr(toku_last_error()) }
+            .to_str()
+            .unwrap();
+        assert!(msg.contains("invalid keep value"));
+    }
+
+    #[test]
+    fn sync_conflict_ffi_null_out_json_is_rejected() {
+        let dir = CString::new("/tmp/toku-nonexistent").unwrap();
+        let keep = CString::new("local").unwrap();
+        let id = CString::new("abc").unwrap();
+
+        let status = unsafe { toku_sync_conflicts(dir.as_ptr(), std::ptr::null_mut()) };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+
+        let status = unsafe {
+            toku_sync_resolve_conflict(
+                dir.as_ptr(),
+                id.as_ptr(),
+                keep.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(matches!(status, TokuStatus::ErrorNullPointer));
+
+        let status = unsafe {
+            toku_sync_resolve_all_conflicts(dir.as_ptr(), keep.as_ptr(), std::ptr::null_mut())
+        };
         assert!(matches!(status, TokuStatus::ErrorNullPointer));
     }
 }

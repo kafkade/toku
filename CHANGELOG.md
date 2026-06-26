@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Native conflict resolution (FFI + Apple): new `toku_sync_conflicts`, `toku_sync_resolve_conflict`, and `toku_sync_resolve_all_conflicts` C FFI functions surface the sync conflict log to Swift. The iOS and macOS apps gain a shared `ConflictResolutionView` (in `TokuKitUI`) listing unresolved note/review conflicts with per-conflict "Keep Local"/"Keep Remote" and bulk resolve actions, reachable from the sync settings screen
+- Sync status indicator in the Apple apps: a shared `SyncStatusBadge` shows current sync state and surfaces pending conflicts — in the macOS sidebar, the iPad sidebar, and as a badge on the iOS "More" tab — routing to conflict resolution when conflicts need review
+- Background sync push in the Apple apps: when sync is configured, the apps run a best-effort `push` when moving to the background/inactive (complementing the existing sync-on-launch pull), so local changes propagate without manual action
+- Web sync status page (`/sync`): a read-only overview of the local sync configuration — server, device name/id, library id, encryption on/off, pending ops, push/pull cursors — with a link to the conflicts page and a "sync not configured" empty state; the dashboard header sync badge now links here
+- Desktop (Windows) sync conflict notifications: the Tauri tray app polls the local database for unresolved conflicts and raises a system notification when new conflicts appear, keeps the tray tooltip updated with the current count, and adds a "Resolve conflicts…" tray menu item that opens the conflicts page
 - Docker deployment for the self-hosted `toku-sync` server: a multi-stage, multi-arch
   (`linux/amd64` + `linux/arm64`, incl. Raspberry Pi) image published to
   `ghcr.io/kafkade/toku-sync`, plus a root `docker-compose.yml`, a built-in container health check

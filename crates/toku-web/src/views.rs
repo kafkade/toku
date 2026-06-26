@@ -5,6 +5,7 @@ use toku_core::ReadingStats;
 use toku_db::SyncConflict;
 
 use crate::charts;
+use crate::sync_handlers::SyncOverview;
 
 /// Wrap content in the base HTML layout.
 fn base(title: &str, content: Markup) -> Markup {
@@ -29,6 +30,8 @@ fn base(title: &str, content: Markup) -> Markup {
                             a.nav-link href="/stats" { "Dashboard" }
                             " "
                             a.nav-link href="/import" { "Import" }
+                            " "
+                            a.nav-link href="/sync" { "Sync" }
                             (crate::sync_status::header_badge())
                         }
                     }
@@ -40,6 +43,72 @@ fn base(title: &str, content: Markup) -> Markup {
             }
         }
     }
+}
+
+/// Render the read-only sync status page.
+pub fn sync_page(o: &SyncOverview) -> Markup {
+    let content = html! {
+        div.dashboard-header {
+            h1 { "Sync" }
+        }
+
+        @if !o.configured {
+            div.conflict-empty {
+                p { "Sync is not configured on this device." }
+                p.muted { "Set up sync from the command line (" code { "toku sync init" } ") or a native app. The web dashboard is a read-only companion." }
+            }
+        } @else {
+            div.sync-card {
+                div.sync-row {
+                    span.sync-label { "Status" }
+                    span.sync-value {
+                        @if o.conflicts > 0 {
+                            a.sync-pill.sync-pill-alert href="/conflicts" {
+                                "⚠ " (o.conflicts) " conflict" @if o.conflicts != 1 { "s" } " to resolve"
+                            }
+                        } @else {
+                            span.sync-pill.sync-pill-ok { "✓ In sync" }
+                        }
+                    }
+                }
+                div.sync-row {
+                    span.sync-label { "Server" }
+                    span.sync-value { (o.server) }
+                }
+                div.sync-row {
+                    span.sync-label { "This device" }
+                    span.sync-value { (o.device_name) }
+                }
+                div.sync-row {
+                    span.sync-label { "Device ID" }
+                    span.sync-value.sync-mono { (o.device_id) }
+                }
+                div.sync-row {
+                    span.sync-label { "Library ID" }
+                    span.sync-value.sync-mono { (o.library_id) }
+                }
+                div.sync-row {
+                    span.sync-label { "Encryption" }
+                    span.sync-value { @if o.encryption { "Enabled" } @else { "Off" } }
+                }
+                div.sync-row {
+                    span.sync-label { "Pending changes" }
+                    span.sync-value { (o.pending_ops) }
+                }
+                div.sync-row {
+                    span.sync-label { "Push cursor" }
+                    span.sync-value.sync-mono { (o.push_cursor.as_deref().unwrap_or("—")) }
+                }
+                div.sync-row {
+                    span.sync-label { "Pull cursor" }
+                    span.sync-value.sync-mono { (o.pull_cursor.as_deref().unwrap_or("—")) }
+                }
+            }
+
+            p.muted { "The registered device list is available from the CLI (" code { "toku sync devices" } ") and the native apps." }
+        }
+    };
+    base("Sync", content)
 }
 
 /// Render the sync conflicts page.
@@ -783,6 +852,37 @@ main {
     border-color: #dc2626;
 }
 .sync-indicator:hover { text-decoration: none; opacity: 0.9; }
+
+/* Sync status page */
+.sync-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    max-width: 640px;
+}
+.sync-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+}
+.sync-row:last-child { border-bottom: none; }
+.sync-label { color: var(--text-secondary); font-weight: 500; }
+.sync-value { text-align: right; word-break: break-word; }
+.sync-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+.sync-pill {
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-decoration: none;
+    border: 1px solid var(--border);
+}
+.sync-pill-ok { color: var(--text-secondary); }
+.sync-pill-alert { color: #fff; background: #dc2626; border-color: #dc2626; }
 
 /* Buttons */
 .btn {

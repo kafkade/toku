@@ -13,6 +13,7 @@ public struct SyncSettingsView: View {
     @State private var server = ""
     @State private var deviceName = ""
     @State private var passphrase = ""
+    @State private var showingConflicts = false
 
     public init(viewModel: SyncViewModel) {
         self.viewModel = viewModel
@@ -49,6 +50,16 @@ public struct SyncSettingsView: View {
             }
         }
         .onAppear { viewModel.refresh() }
+        .sheet(isPresented: $showingConflicts) {
+            NavigationStack {
+                ConflictResolutionView(viewModel: viewModel)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showingConflicts = false }
+                        }
+                    }
+            }
+        }
     }
 
     // MARK: - Setup (not yet configured)
@@ -92,6 +103,28 @@ public struct SyncSettingsView: View {
             LabeledContent("Device", value: status.deviceName)
             LabeledContent("Pending changes", value: "\(status.pendingOps)")
             LabeledContent("Encryption", value: status.encryption ? "Enabled" : "Off")
+        }
+
+        Section {
+            Button {
+                showingConflicts = true
+            } label: {
+                HStack {
+                    Label(
+                        "Conflicts",
+                        systemImage: status.hasConflicts
+                            ? "exclamationmark.triangle.fill" : "checkmark.circle"
+                    )
+                    .foregroundStyle(status.hasConflicts ? .orange : .green)
+                    Spacer()
+                    Text(status.hasConflicts ? "\(status.conflicts) to review" : "None")
+                        .foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .tint(.primary)
         }
 
         Section {

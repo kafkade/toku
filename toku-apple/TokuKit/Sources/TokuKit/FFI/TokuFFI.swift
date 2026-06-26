@@ -240,6 +240,40 @@ public final class TokuFFI: @unchecked Sendable {
         return try JSONDecoder.toku.decode([SyncDevice].self, from: json)
     }
 
+    /// List unresolved sync conflicts awaiting user review.
+    public func syncConflicts() throws -> [SyncConflict] {
+        let json = try dataDir.withCString { dir in
+            try callJson { toku_sync_conflicts(dir, &$0) }
+        }
+        return try JSONDecoder.toku.decode([SyncConflict].self, from: json)
+    }
+
+    /// Resolve a single conflict, keeping the local or remote value.
+    ///
+    /// Returns `false` when the conflict was missing or already resolved.
+    @discardableResult
+    public func syncResolveConflict(id: String, keep: ConflictKeep) throws -> Bool {
+        let json = try dataDir.withCString { dir in
+            try id.withCString { idPtr in
+                try keep.rawValue.withCString { keepPtr in
+                    try callJson { toku_sync_resolve_conflict(dir, idPtr, keepPtr, &$0) }
+                }
+            }
+        }
+        return try JSONDecoder.toku.decode(ConflictResolveOutcome.self, from: json).resolved > 0
+    }
+
+    /// Resolve every unresolved conflict with the same choice. Returns the count resolved.
+    @discardableResult
+    public func syncResolveAllConflicts(keep: ConflictKeep) throws -> Int {
+        let json = try dataDir.withCString { dir in
+            try keep.rawValue.withCString { keepPtr in
+                try callJson { toku_sync_resolve_all_conflicts(dir, keepPtr, &$0) }
+            }
+        }
+        return try JSONDecoder.toku.decode(ConflictResolveOutcome.self, from: json).resolved
+    }
+
     // MARK: - Internal helpers
 
     /// Call an FFI function that writes JSON to an out-pointer.

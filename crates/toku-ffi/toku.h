@@ -280,6 +280,50 @@ enum TokuStatus toku_sync_status(const char *data_dir, char **out_json);
 enum TokuStatus toku_sync_devices(const char *data_dir, char **out_json);
 
 /**
+ * List unresolved sync conflicts awaiting user review, as a JSON array.
+ *
+ * On success, writes the array to `*out_json`, which the caller must free with
+ * `toku_free_string`. Returns an empty array when there are no conflicts.
+ *
+ * # Safety
+ * - `data_dir` must be a valid NUL-terminated UTF-8 string.
+ * - `out_json` must be a valid pointer to a `*mut c_char`.
+ */
+enum TokuStatus toku_sync_conflicts(const char *data_dir, char **out_json);
+
+/**
+ * Resolve a single sync conflict, keeping the local or remote value.
+ *
+ * `keep` must be `"local"` or `"remote"`. On success, writes a JSON object
+ * (`{ "resolved": bool }`) to `*out_json`, which the caller must free with
+ * `toku_free_string`. `resolved` is `false` if the conflict was missing or
+ * already resolved.
+ *
+ * # Safety
+ * - `data_dir`, `id`, and `keep` must be valid NUL-terminated UTF-8 strings.
+ * - `out_json` must be a valid pointer to a `*mut c_char`.
+ */
+enum TokuStatus toku_sync_resolve_conflict(const char *data_dir,
+                                           const char *id,
+                                           const char *keep,
+                                           char **out_json);
+
+/**
+ * Resolve every unresolved sync conflict with the same choice.
+ *
+ * `keep` must be `"local"` or `"remote"`. On success, writes a JSON object
+ * (`{ "resolved": N }`) to `*out_json`, which the caller must free with
+ * `toku_free_string`. `resolved` is the number of conflicts resolved.
+ *
+ * # Safety
+ * - `data_dir` and `keep` must be valid NUL-terminated UTF-8 strings.
+ * - `out_json` must be a valid pointer to a `*mut c_char`.
+ */
+enum TokuStatus toku_sync_resolve_all_conflicts(const char *data_dir,
+                                                const char *keep,
+                                                char **out_json);
+
+/**
  * Free a string that was allocated by a `toku_*` function. Passing null is a safe no-op.
  *
  * # Safety

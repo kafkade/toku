@@ -73,6 +73,6 @@ pub fn header_badge() -> Markup {
     };
 
     html! {
-        a class=(class) href="/conflicts" title="Sync status" { (label) }
+        a class=(class) href="/sync" title="Sync status" { (label) }
     }
 }

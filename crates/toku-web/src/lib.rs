@@ -18,6 +18,7 @@ pub mod import_handlers;
 mod import_views;
 pub mod library_handlers;
 mod library_views;
+mod sync_handlers;
 mod sync_status;
 mod views;
 
@@ -73,6 +74,8 @@ pub fn build_router(db_path: PathBuf, temp_dir: PathBuf) -> Router {
             "/conflicts/resolve-all",
             post(conflicts_handlers::resolve_all_conflicts),
         )
+        // Sync status
+        .route("/sync", get(sync_handlers::sync_page))
         // Import wizard
         .route("/import", get(import_handlers::import_page))
         .route("/import/upload", post(import_handlers::upload_csv))

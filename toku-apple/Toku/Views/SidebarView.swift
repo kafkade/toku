@@ -1,4 +1,6 @@
 import SwiftUI
+import TokuKit
+import TokuKitUI
 
 /// Sidebar navigation items.
 enum SidebarItem: String, Identifiable, CaseIterable {
@@ -22,6 +24,7 @@ enum SidebarItem: String, Identifiable, CaseIterable {
 /// Sidebar view with section-grouped navigation.
 struct SidebarView: View {
     @Binding var selection: SidebarItem?
+    @EnvironmentObject var appState: AppState
 
     var body: some View {
         List(selection: $selection) {
@@ -44,5 +47,16 @@ struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .navigationTitle("Toku")
+        .safeAreaInset(edge: .bottom) {
+            if let syncVM = appState.syncVM {
+                HStack {
+                    SyncStatusBadge(viewModel: syncVM)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+        }
     }
 }
+

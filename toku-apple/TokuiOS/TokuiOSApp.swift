@@ -5,11 +5,17 @@ import TokuKit
 @main
 struct TokuiOSApp: App {
     @StateObject private var appState = AppState()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(appState)
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background || newPhase == .inactive {
+                appState.performBackgroundSync()
+            }
         }
     }
 }
@@ -48,6 +54,12 @@ final class AppState: ObservableObject {
             self?.libraryVM?.loadBooks()
             self?.statsVM?.loadStats()
         }
+    }
+
+    /// Push pending local changes when the app moves to the background. Safe to
+    /// call when sync is not configured (it becomes a no-op).
+    func performBackgroundSync() {
+        syncVM?.syncOnBackground()
     }
 
     /// Default database path in the app's Application Support directory.

@@ -9,12 +9,19 @@ import Foundation
 public final class SyncViewModel: ObservableObject {
     @Published public var status: SyncStatus?
     @Published public var devices: [SyncDevice] = []
+    @Published public var conflicts: [SyncConflict] = []
     @Published public var isBusy = false
     @Published public var lastResult: String?
     @Published public var errorMessage: String?
 
     /// Whether sync has been configured on this device.
     public var isConfigured: Bool { status != nil }
+
+    /// Number of unresolved conflicts reported by the latest status refresh.
+    public var conflictCount: Int { status?.conflicts ?? 0 }
+
+    /// Whether the latest status reports unresolved conflicts needing attention.
+    public var hasConflicts: Bool { conflictCount > 0 }
 
     private let ffi: TokuFFI
     private let queue = DispatchQueue(label: "dev.toku.sync", qos: .userInitiated)
@@ -34,11 +41,35 @@ public final class SyncViewModel: ObservableObject {
             // status() throws when sync is not configured — treat that as "not configured".
             let status = try? self.ffi.syncStatus()
             let devices = (try? self.ffi.syncDevices()) ?? []
+            // Conflicts live in the local DB; load them whenever sync is configured.
+            let conflicts = status == nil ? [] : ((try? self.ffi.syncConflicts()) ?? [])
             Task { @MainActor in
                 self.status = status
                 self.devices = devices
+                self.conflicts = conflicts
                 self.isBusy = false
             }
+        }
+    }
+
+    /// Reload just the unresolved conflict list (and status, so counts stay in sync).
+    public func loadConflicts() {
+        refresh()
+    }
+
+    /// Resolve a single conflict, keeping the local or remote value.
+    public func resolve(_ conflict: SyncConflict, keep: ConflictKeep) {
+        run(label: "Conflict resolved") { ffi in
+            _ = try ffi.syncResolveConflict(id: conflict.id, keep: keep)
+            return "Conflict resolved"
+        }
+    }
+
+    /// Resolve every unresolved conflict with the same choice.
+    public func resolveAll(keep: ConflictKeep) {
+        run { ffi in
+            let count = try ffi.syncResolveAllConflicts(keep: keep)
+            return count == 0 ? "No conflicts to resolve" : "Resolved \(count) conflict(s)"
         }
     }
 
@@ -118,6 +149,43 @@ public final class SyncViewModel: ObservableObject {
     }
 
     // MARK: - Internal
+
+    /// Best-effort push of pending local changes when the app moves to the background.
+    ///
+    /// Fire-and-forget: does nothing when sync is not configured, and failures
+    /// (e.g. the server is unreachable) are recorded in `errorMessage` but never
+    /// surfaced as blocking alerts. Intended to be called from `scenePhase`
+    /// transitions to `.background` / `.inactive`.
+    public func syncOnBackground() {
+        isBusy = true
+        errorMessage = nil
+
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            // Only push when sync is configured.
+            guard (try? self.ffi.syncStatus()) != nil else {
+                Task { @MainActor in self.isBusy = false }
+                return
+            }
+
+            var failure: String?
+            do {
+                _ = try self.ffi.syncPush()
+            } catch {
+                failure = error.localizedDescription
+            }
+
+            Task { @MainActor in
+                self.isBusy = false
+                if let failure {
+                    self.errorMessage = failure
+                } else {
+                    self.lastResult = "Pushed on background"
+                }
+            }
+        }
+    }
 
     /// Run an FFI sync action that produces a human-readable result string, then refresh.
     private func run(label: String? = nil, _ action: @escaping (TokuFFI) throws -> String) {

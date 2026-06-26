@@ -6,6 +6,7 @@ import TokuKitUI
 @main
 struct TokuApp: App {
     @StateObject private var appState = AppState()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -17,6 +18,11 @@ struct TokuApp: App {
             TokuCommands()
         }
         .defaultSize(width: 1100, height: 700)
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background || newPhase == .inactive {
+                appState.performBackgroundSync()
+            }
+        }
 
         #if os(macOS)
         Settings {
@@ -61,6 +67,12 @@ final class AppState: ObservableObject {
             self?.libraryVM?.loadBooks()
             self?.statsVM?.loadStats()
         }
+    }
+
+    /// Push pending local changes when the app moves to the background. Safe to
+    /// call when sync is not configured (it becomes a no-op).
+    func performBackgroundSync() {
+        syncVM?.syncOnBackground()
     }
 
     /// Default database path in Application Support.

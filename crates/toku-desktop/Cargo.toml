@@ -19,6 +19,7 @@ path = "src/main.rs"
 toku-web.workspace = true
 toku-db.workspace = true
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
 tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 
 [target.'cfg(windows)'.build-dependencies]

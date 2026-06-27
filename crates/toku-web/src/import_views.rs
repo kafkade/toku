@@ -38,7 +38,7 @@ fn base(title: &str, content: Markup) -> Markup {
 }
 
 /// Import type selection page.
-pub fn import_page() -> Markup {
+pub fn import_page(csrf: &str) -> Markup {
     base(
         "Import Library",
         html! {
@@ -51,7 +51,7 @@ pub fn import_page() -> Markup {
                     div.import-card {
                         h2 { "📗 Goodreads" }
                         p { "Import from a Goodreads CSV export." }
-                        form action="/import/upload" method="post" enctype="multipart/form-data" {
+                        form action=(crate::auth_views::action_with_csrf("/import/upload", csrf)) method="post" enctype="multipart/form-data" {
                             input type="hidden" name="source" value="goodreads";
                             div.form-field {
                                 label for="gr-file" { "CSV file" }
@@ -65,7 +65,7 @@ pub fn import_page() -> Markup {
                     div.import-card {
                         h2 { "📘 StoryGraph" }
                         p { "Import from a StoryGraph CSV export." }
-                        form action="/import/upload" method="post" enctype="multipart/form-data" {
+                        form action=(crate::auth_views::action_with_csrf("/import/upload", csrf)) method="post" enctype="multipart/form-data" {
                             input type="hidden" name="source" value="storygraph";
                             div.form-field {
                                 label for="sg-file" { "CSV file" }
@@ -80,6 +80,7 @@ pub fn import_page() -> Markup {
                         h2 { "📙 Calibre" }
                         p { "Import from a Calibre library directory." }
                         form action="/import/calibre" method="post" {
+                            (crate::auth_views::csrf_field(csrf))
                             div.form-field {
                                 label for="cal-path" { "Library path" }
                                 input id="cal-path" type="text" name="path"
@@ -99,7 +100,12 @@ pub fn import_page() -> Markup {
 }
 
 /// Dry-run preview page.
-pub fn preview_page(session_id: &str, source: &ImportSourceKind, report: &ImportReport) -> Markup {
+pub fn preview_page(
+    session_id: &str,
+    source: &ImportSourceKind,
+    report: &ImportReport,
+    csrf: &str,
+) -> Markup {
     let source_name = match source {
         ImportSourceKind::Goodreads => "Goodreads",
         ImportSourceKind::Calibre { .. } => "Calibre",
@@ -229,6 +235,7 @@ pub fn preview_page(session_id: &str, source: &ImportSourceKind, report: &Import
                 // Actions
                 div.preview-actions {
                     form action={ "/import/execute/" (session_id) } method="post" {
+                        (crate::auth_views::csrf_field(csrf))
                         button.btn.btn-primary type="submit" { "Confirm Import" }
                     }
                     a.btn.btn-secondary href="/import" { "Cancel" }

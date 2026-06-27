@@ -37,8 +37,9 @@ use srp::ServerG2048;
 use crate::db::SyncDatabase;
 use crate::error::SyncError;
 use crate::models::{
-    EnrollRequest, EnrollResponse, SrpChallengeRequest, SrpChallengeResponse, SrpVerifyRequest,
-    SrpVerifyResponse,
+    AccountChallengeRequest, AccountChallengeResponse, AccountVerifyRequest, AccountVerifyResponse,
+    EnrollRequest, EnrollResponse, SignupRequest, SignupResponse, SrpChallengeRequest,
+    SrpChallengeResponse, SrpVerifyRequest, SrpVerifyResponse,
 };
 
 /// Maximum failed login attempts before account lockout.
@@ -64,6 +65,33 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthDevice {
         parts
             .extensions
             .get::<AuthDevice>()
+            .cloned()
+            .ok_or(SyncError::Unauthorized)
+    }
+}
+
+/// Authenticated user identity, injected by [`require_user_auth`].
+#[derive(Debug, Clone)]
+pub struct AuthUser {
+    pub user_id: String,
+    pub email: String,
+    pub role: String,
+}
+
+impl AuthUser {
+    /// True when the user holds the `admin` role.
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
+    type Rejection = SyncError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<AuthUser>()
             .cloned()
             .ok_or(SyncError::Unauthorized)
     }
@@ -171,6 +199,86 @@ pub async fn require_auth(
     Ok(next.run(req).await)
 }
 
+/// Resolve an optional user-session token to an active user id.
+///
+/// `token` is the raw bearer value (already stripped of the `Bearer ` prefix).
+/// Returns `None` when absent, expired, or the user is not active. Used to
+/// *opt-in* stamp ownership on library/device creation without breaking the
+/// legacy unauthenticated relay paths.
+pub fn resolve_user_owner(db: &SyncDatabase, token: Option<&str>) -> Option<String> {
+    let token = token?;
+    let token_hash = sha256_hex(token);
+    db.conn
+        .query_row(
+            "SELECT u.id FROM user_sessions s
+             JOIN users u ON u.id = s.user_id
+             WHERE s.session_token_hash = ?1
+               AND s.expires_at > datetime('now')
+               AND u.status = 'active'",
+            [&token_hash],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+}
+
+// ── User-session auth middleware ─────────────────────────────────────────────
+
+/// Middleware that validates a user-session Bearer token and injects [`AuthUser`].
+///
+/// Resolves the token against `user_sessions`, loads the owning user, and
+/// rejects disabled accounts. Used to gate account/admin endpoints.
+pub async fn require_user_auth(
+    State(db_path): State<PathBuf>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, SyncError> {
+    let header = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(SyncError::Unauthorized)?;
+
+    let token = header
+        .strip_prefix("Bearer ")
+        .ok_or(SyncError::Unauthorized)?;
+
+    let token_hash = sha256_hex(token);
+
+    let user = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || -> Result<AuthUser, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let (user_id, email, role, status): (String, String, String, String) = db
+                .conn
+                .query_row(
+                    "SELECT u.id, u.email, u.role, u.status
+                     FROM user_sessions s
+                     JOIN users u ON u.id = s.user_id
+                     WHERE s.session_token_hash = ?1
+                       AND s.expires_at > datetime('now')",
+                    [&token_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|_| SyncError::Unauthorized)?;
+
+            if status != "active" {
+                return Err(SyncError::Forbidden("account is disabled".into()));
+            }
+
+            Ok(AuthUser {
+                user_id,
+                email,
+                role,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    req.extensions_mut().insert(user);
+    Ok(next.run(req).await)
+}
+
 // ── SRP handlers ─────────────────────────────────────────────────────────────
 
 /// `POST /api/v1/auth/enroll`
@@ -183,6 +291,7 @@ pub async fn require_auth(
 /// Fails if the library already has an SRP account to prevent takeover attacks.
 pub async fn srp_enroll(
     State(db_path): State<PathBuf>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, SyncError> {
     if req.library_id.is_empty() {
@@ -199,6 +308,13 @@ pub async fn srp_enroll(
 
     let device_id = uuid::Uuid::now_v7().to_string();
 
+    // Optional user-session bearer for ownership stamping (issue #119).
+    let owner_token = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.to_string());
+
     let resp = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
         let library_id = req.library_id.clone();
@@ -207,6 +323,7 @@ pub async fn srp_enroll(
         let srp_salt = req.srp_salt.clone();
         let srp_verifier = req.srp_verifier.clone();
         let encryption_salt = req.encryption_salt.clone();
+        let owner_token = owner_token.clone();
         move || -> Result<EnrollResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
@@ -257,6 +374,19 @@ pub async fn srp_enroll(
                  VALUES (?1, ?2, ?3, '', datetime('now'))",
                 rusqlite::params![device_id, library_id, device_name],
             )?;
+
+            // Ownership stamping (issue #119): if a valid user-session bearer is
+            // present, mark the new library + device as owned by that user.
+            if let Some(owner_id) = resolve_user_owner(&db, owner_token.as_deref()) {
+                db.conn.execute(
+                    "UPDATE libraries SET user_id = ?1 WHERE id = ?2 AND user_id IS NULL",
+                    rusqlite::params![owner_id, library_id],
+                )?;
+                db.conn.execute(
+                    "UPDATE devices SET user_id = ?1 WHERE device_id = ?2",
+                    rusqlite::params![owner_id, device_id],
+                )?;
+            }
 
             Ok(EnrollResponse {
                 device_id,
@@ -631,6 +761,468 @@ fn record_failure_and_err(
             .execute(
                 "UPDATE accounts SET failed_attempts = ?1 WHERE library_id = ?2",
                 rusqlite::params![new_count, library_id],
+            )
+            .ok();
+        Err(SyncError::Unauthorized)
+    }
+}
+
+// ── User account handlers (issue #119) ───────────────────────────────────────
+
+/// Validate an email handle: non-empty, contains `@`, no surrounding whitespace.
+fn validate_email(email: &str) -> Result<(), SyncError> {
+    let trimmed = email.trim();
+    if trimmed.is_empty() || trimmed != email {
+        return Err(SyncError::BadRequest("email is required".into()));
+    }
+    if !email.contains('@') || email.len() > 320 {
+        return Err(SyncError::BadRequest("email is invalid".into()));
+    }
+    Ok(())
+}
+
+/// `POST /api/v1/account/signup`
+///
+/// Create a user account using SRP-6a. The first account on a fresh instance
+/// bootstraps as the `admin` (regardless of the registration flag). Subsequent
+/// signups are rejected unless an admin has opened registration. The client
+/// uploads only the SRP verifier + salt and opaque wrapped key material — the
+/// server never sees the password or Secret Key.
+pub async fn account_signup(
+    State(db_path): State<PathBuf>,
+    Json(req): Json<SignupRequest>,
+) -> Result<Json<SignupResponse>, SyncError> {
+    validate_email(&req.email)?;
+    hex::decode(&req.srp_salt)
+        .map_err(|_| SyncError::BadRequest("srp_salt must be hex-encoded".into()))?;
+    hex::decode(&req.srp_verifier)
+        .map_err(|_| SyncError::BadRequest("srp_verifier must be hex-encoded".into()))?;
+
+    let user_id = uuid::Uuid::now_v7().to_string();
+
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let user_id = user_id.clone();
+        let email = req.email.clone();
+        let srp_salt = req.srp_salt.clone();
+        let srp_verifier = req.srp_verifier.clone();
+        let wrapped_private_key = req.wrapped_private_key.clone();
+        let account_public_key = req.account_public_key.clone();
+        let kdf_params = req.kdf_params.clone();
+        move || -> Result<SignupResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // First-run bootstrap: the first account is always allowed and
+            // becomes the admin. Counting + insert run in one transaction so
+            // two concurrent first signups can't both become admin.
+            let tx_guard = db.conn.unchecked_transaction()?;
+
+            let existing_users: i64 =
+                tx_guard.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+
+            let role = if existing_users == 0 {
+                "admin"
+            } else {
+                // Subsequent signups require open registration.
+                let registration_open: i64 = tx_guard
+                    .query_row(
+                        "SELECT registration_open FROM instance_config WHERE id = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                if registration_open == 0 {
+                    return Err(SyncError::Forbidden(
+                        "registration is closed; ask an administrator for an invite".into(),
+                    ));
+                }
+                "user"
+            };
+
+            // Reject duplicate emails with a clear 409.
+            let email_taken: i64 = tx_guard.query_row(
+                "SELECT COUNT(*) FROM users WHERE email = ?1",
+                [&email],
+                |row| row.get(0),
+            )?;
+            if email_taken > 0 {
+                return Err(SyncError::Conflict("email is already registered".into()));
+            }
+
+            tx_guard.execute(
+                "INSERT INTO users
+                 (id, email, srp_salt, srp_verifier, wrapped_private_key,
+                  account_public_key, kdf_params, role, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', datetime('now'))",
+                rusqlite::params![
+                    user_id,
+                    email,
+                    srp_salt,
+                    srp_verifier,
+                    wrapped_private_key,
+                    account_public_key,
+                    kdf_params,
+                    role,
+                ],
+            )?;
+
+            tx_guard.commit()?;
+
+            Ok(SignupResponse {
+                user_id,
+                email,
+                role: role.to_string(),
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
+}
+
+/// `POST /api/v1/account/challenge`
+///
+/// Start a user SRP-6a login. Mirrors [`srp_challenge`] but keyed to the user's
+/// email and backed by the `user_srp_challenges` table.
+pub async fn account_challenge(
+    State(db_path): State<PathBuf>,
+    Json(req): Json<AccountChallengeRequest>,
+) -> Result<Json<AccountChallengeResponse>, SyncError> {
+    if req.email.is_empty() {
+        return Err(SyncError::BadRequest("email is required".into()));
+    }
+    let a_pub_bytes = hex::decode(&req.client_public_a)
+        .map_err(|_| SyncError::BadRequest("client_public_a must be hex-encoded".into()))?;
+    if a_pub_bytes.is_empty() || a_pub_bytes.iter().all(|&b| b == 0) {
+        return Err(SyncError::BadRequest(
+            "client_public_a must be a non-zero group element".into(),
+        ));
+    }
+
+    let challenge_id = uuid::Uuid::now_v7().to_string();
+    let client_public_a_hex = req.client_public_a.clone();
+
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let email = req.email.clone();
+        let challenge_id = challenge_id.clone();
+        move || -> Result<AccountChallengeResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // SRP identity is the account email. Load credentials by email.
+            let (user_id, srp_salt_hex, srp_verifier_hex, status, locked_until): (
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+            ) = db
+                .conn
+                .query_row(
+                    "SELECT id, srp_salt, srp_verifier, status, locked_until
+                     FROM users WHERE email = ?1",
+                    [&email],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(|_| SyncError::Unauthorized)?;
+
+            if status != "active" {
+                return Err(SyncError::Forbidden("account is disabled".into()));
+            }
+
+            if let Some(until) = locked_until {
+                let still_locked: bool = db
+                    .conn
+                    .query_row("SELECT ?1 > datetime('now')", [&until], |row| row.get(0))
+                    .unwrap_or(false);
+                if still_locked {
+                    return Err(SyncError::AccountLocked { until });
+                }
+            }
+
+            let verifier_bytes = hex::decode(&srp_verifier_hex)
+                .map_err(|_| SyncError::Internal("stored verifier is corrupt".into()))?;
+
+            let mut b = [0u8; 48];
+            rand::RngExt::fill(&mut rand::rng(), &mut b);
+
+            let server = ServerG2048::<Sha256>::new();
+            let b_pub_bytes = server.compute_public_ephemeral(&b, &verifier_bytes);
+
+            let server_ephemeral_hex = hex::encode(b);
+            let b_pub_hex = hex::encode(&b_pub_bytes);
+
+            db.conn.execute(
+                "INSERT INTO user_srp_challenges
+                 (challenge_id, user_id, server_ephemeral_secret, client_public_a, created_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                rusqlite::params![
+                    challenge_id,
+                    user_id,
+                    server_ephemeral_hex,
+                    client_public_a_hex
+                ],
+            )?;
+
+            let _ = db.conn.execute(
+                "DELETE FROM user_srp_challenges
+                 WHERE created_at < datetime('now', ?1)",
+                [format!("-{CHALLENGE_TTL_SECS} seconds")],
+            );
+
+            Ok(AccountChallengeResponse {
+                challenge_id,
+                server_public_b: b_pub_hex,
+                srp_salt: srp_salt_hex,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
+}
+
+/// `POST /api/v1/account/verify`
+///
+/// Complete a user SRP-6a login and issue a user-session token. Mirrors
+/// [`srp_verify`] but operates on `users` / `user_sessions`.
+pub async fn account_verify(
+    State(db_path): State<PathBuf>,
+    Json(req): Json<AccountVerifyRequest>,
+) -> Result<Json<AccountVerifyResponse>, SyncError> {
+    if req.challenge_id.is_empty() {
+        return Err(SyncError::BadRequest("challenge_id is required".into()));
+    }
+    let m1_bytes = hex::decode(&req.client_proof_m1)
+        .map_err(|_| SyncError::BadRequest("client_proof_m1 must be hex-encoded".into()))?;
+    if m1_bytes.is_empty() {
+        return Err(SyncError::BadRequest("client_proof_m1 is empty".into()));
+    }
+
+    let session_token = generate_token();
+    let token_hash = sha256_hex(&session_token);
+
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let challenge_id = req.challenge_id.clone();
+        let session_token = session_token.clone();
+        let token_hash = token_hash.clone();
+        move || -> Result<AccountVerifyResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            let (user_id, server_ephemeral_hex, client_public_a_hex, created_at): (
+                String,
+                String,
+                String,
+                String,
+            ) = db
+                .conn
+                .query_row(
+                    "SELECT user_id, server_ephemeral_secret, client_public_a, created_at
+                     FROM user_srp_challenges WHERE challenge_id = ?1",
+                    [&challenge_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|_| SyncError::BadRequest("challenge not found or already used".into()))?;
+
+            let expired: bool = db
+                .conn
+                .query_row(
+                    "SELECT ?1 < datetime('now', ?2)",
+                    rusqlite::params![created_at, format!("-{CHALLENGE_TTL_SECS} seconds")],
+                    |row| row.get(0),
+                )
+                .unwrap_or(true);
+            if expired {
+                let _ = db.conn.execute(
+                    "DELETE FROM user_srp_challenges WHERE challenge_id = ?1",
+                    [&challenge_id],
+                );
+                return Err(SyncError::BadRequest(
+                    "challenge has expired; request a new one".into(),
+                ));
+            }
+
+            let (email, srp_salt_hex, srp_verifier_hex, role, status, failed_attempts, locked_until): (
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                Option<String>,
+            ) = db
+                .conn
+                .query_row(
+                    "SELECT email, srp_salt, srp_verifier, role, status, failed_attempts, locked_until
+                     FROM users WHERE id = ?1",
+                    [&user_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .map_err(|_| SyncError::Internal("user disappeared".into()))?;
+
+            if status != "active" {
+                return Err(SyncError::Forbidden("account is disabled".into()));
+            }
+
+            if let Some(ref until) = locked_until {
+                let still_locked: bool = db
+                    .conn
+                    .query_row("SELECT ?1 > datetime('now')", [until], |row| row.get(0))
+                    .unwrap_or(false);
+                if still_locked {
+                    return Err(SyncError::AccountLocked {
+                        until: until.clone(),
+                    });
+                }
+            }
+
+            let salt_bytes = hex::decode(&srp_salt_hex)
+                .map_err(|_| SyncError::Internal("stored salt is corrupt".into()))?;
+            let verifier_bytes = hex::decode(&srp_verifier_hex)
+                .map_err(|_| SyncError::Internal("stored verifier is corrupt".into()))?;
+            let b_bytes = hex::decode(&server_ephemeral_hex)
+                .map_err(|_| SyncError::Internal("stored server ephemeral is corrupt".into()))?;
+            let a_pub_bytes = hex::decode(&client_public_a_hex)
+                .map_err(|_| SyncError::Internal("stored client_public_a is corrupt".into()))?;
+
+            // Single-use: always delete the challenge.
+            let _ = db.conn.execute(
+                "DELETE FROM user_srp_challenges WHERE challenge_id = ?1",
+                [&challenge_id],
+            );
+
+            // SRP identity is the account email (stable input the client knows
+            // at signup and login time).
+            let server = ServerG2048::<Sha256>::new();
+            let server_verifier = match server.process_reply(
+                email.as_bytes(),
+                &salt_bytes,
+                &b_bytes,
+                &verifier_bytes,
+                &a_pub_bytes,
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    record_user_failure(&db, &user_id, failed_attempts)?;
+                    return Err(SyncError::Unauthorized);
+                }
+            };
+
+            if server_verifier.verify_client(&m1_bytes).is_err() {
+                return record_user_failure_and_err(&db, &user_id, failed_attempts);
+            }
+
+            let m2_hex = hex::encode(server_verifier.proof());
+
+            let _ = db.conn.execute(
+                "UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?1",
+                [&user_id],
+            );
+
+            let expires_at: String = db
+                .conn
+                .query_row(
+                    "SELECT datetime('now', ?1)",
+                    [format!("+{SESSION_TTL_HOURS} hours")],
+                    |row| row.get(0),
+                )
+                .map_err(|e| SyncError::Internal(format!("datetime query failed: {e}")))?;
+
+            db.conn.execute(
+                "INSERT INTO user_sessions
+                 (session_token_hash, user_id, expires_at, created_at)
+                 VALUES (?1, ?2, ?3, datetime('now'))",
+                rusqlite::params![token_hash, user_id, expires_at],
+            )?;
+
+            let _ = email; // email reserved for future audit logging
+            Ok(AccountVerifyResponse {
+                session_token,
+                server_proof_m2: m2_hex,
+                expires_at,
+                user_id,
+                role,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
+}
+
+/// Increment a user's failed-attempt counter; lock the account at the threshold.
+fn record_user_failure(
+    db: &SyncDatabase,
+    user_id: &str,
+    current_attempts: i64,
+) -> Result<(), SyncError> {
+    let new_count = current_attempts + 1;
+    if new_count >= MAX_FAILED_ATTEMPTS {
+        db.conn.execute(
+            "UPDATE users SET failed_attempts = ?1, locked_until = datetime('now', ?2)
+             WHERE id = ?3",
+            rusqlite::params![new_count, format!("+{LOCKOUT_MINUTES} minutes"), user_id],
+        )?;
+    } else {
+        db.conn.execute(
+            "UPDATE users SET failed_attempts = ?1 WHERE id = ?2",
+            rusqlite::params![new_count, user_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Increment the counter and return the appropriate error for a failed login.
+fn record_user_failure_and_err(
+    db: &SyncDatabase,
+    user_id: &str,
+    current_attempts: i64,
+) -> Result<AccountVerifyResponse, SyncError> {
+    let new_count = current_attempts + 1;
+    if new_count >= MAX_FAILED_ATTEMPTS {
+        db.conn
+            .execute(
+                "UPDATE users SET failed_attempts = ?1, locked_until = datetime('now', ?2)
+                 WHERE id = ?3",
+                rusqlite::params![new_count, format!("+{LOCKOUT_MINUTES} minutes"), user_id],
+            )
+            .ok();
+        let until: String = db
+            .conn
+            .query_row(
+                "SELECT locked_until FROM users WHERE id = ?1",
+                [user_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "unknown".into());
+        Err(SyncError::AccountLocked { until })
+    } else {
+        db.conn
+            .execute(
+                "UPDATE users SET failed_attempts = ?1 WHERE id = ?2",
+                rusqlite::params![new_count, user_id],
             )
             .ok();
         Err(SyncError::Unauthorized)

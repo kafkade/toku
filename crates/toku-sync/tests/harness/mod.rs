@@ -93,6 +93,11 @@ impl TestServer {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// Path to the server's SQLite database (for white-box assertions).
+    pub fn db_path(&self) -> std::path::PathBuf {
+        self._tempdir.path().join("server.db")
+    }
 }
 
 /// A simulated Toku device with its own local database, registered against a

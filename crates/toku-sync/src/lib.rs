@@ -40,6 +40,22 @@ pub fn build_router(db_path: PathBuf) -> Router {
             auth::require_auth,
         ));
 
+    // Account/admin routes requiring a *user* session (issue #119).
+    let user_authenticated = Router::new()
+        .route("/api/v1/admin/users", get(handlers::list_users))
+        .route(
+            "/api/v1/admin/users/{id}/status",
+            post(handlers::set_user_status),
+        )
+        .route(
+            "/api/v1/admin/registration",
+            get(handlers::get_registration).put(handlers::set_registration),
+        )
+        .layer(middleware::from_fn_with_state(
+            db_path.clone(),
+            auth::require_user_auth,
+        ));
+
     // Public routes (unauthenticated)
     Router::new()
         .route("/health", get(handlers::health))
@@ -49,7 +65,12 @@ pub fn build_router(db_path: PathBuf) -> Router {
         .route("/api/v1/auth/enroll", post(auth::srp_enroll))
         .route("/api/v1/auth/challenge", post(auth::srp_challenge))
         .route("/api/v1/auth/verify", post(auth::srp_verify))
+        // User account (SRP) endpoints
+        .route("/api/v1/account/signup", post(auth::account_signup))
+        .route("/api/v1/account/challenge", post(auth::account_challenge))
+        .route("/api/v1/account/verify", post(auth::account_verify))
         .merge(authenticated)
+        .merge(user_authenticated)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB (rekey may be large)
         .layer(TraceLayer::new_for_http())
         .with_state(db_path)

@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 
-use crate::auth::{AuthDevice, generate_token, sha256_hex};
+use crate::auth::{AuthDevice, AuthUser, generate_token, sha256_hex};
 use crate::db::SyncDatabase;
 use crate::error::SyncError;
 use crate::models::{
     DeviceResponse, DownloadSnapshotResponse, HealthResponse, OpPayload, PullQuery, PullResponse,
-    PushRequest, PushResponse, RegisterRequest, RegisterResponse, RekeyRequest, RekeyResponse,
-    UploadSnapshotRequest, UploadSnapshotResponse,
+    PushRequest, PushResponse, RegisterRequest, RegisterResponse, RegistrationConfigResponse,
+    RekeyRequest, RekeyResponse, SetRegistrationRequest, SetUserStatusRequest,
+    UploadSnapshotRequest, UploadSnapshotResponse, UserListResponse, UserSummary,
 };
 
 const MAX_BATCH_SIZE: usize = 1000;
@@ -75,7 +76,7 @@ pub async fn register(
             // For SRP libraries: validate the session token (must match the library).
             // Keep the session hash so we can rebind it after the device row is created.
             let srp_session_hash: Option<String> = if is_srp_library {
-                let session_token = bearer_token.ok_or(SyncError::Unauthorized)?;
+                let session_token = bearer_token.clone().ok_or(SyncError::Unauthorized)?;
                 let session_hash = sha256_hex(&session_token);
                 let auth_library_id: String = db
                     .conn
@@ -122,6 +123,20 @@ pub async fn register(
                  VALUES (?1, ?2, ?3, ?4, datetime('now'))",
                 rusqlite::params![device_id, library_id, device_name, token_hash_to_store],
             )?;
+
+            // Ownership stamping (issue #119): if a valid user-session bearer is
+            // present, mark the library + device as owned by that user. Legacy
+            // unauthenticated registrations leave user_id NULL (unowned).
+            if let Some(owner_id) = crate::auth::resolve_user_owner(&db, bearer_token.as_deref()) {
+                db.conn.execute(
+                    "UPDATE libraries SET user_id = ?1 WHERE id = ?2 AND user_id IS NULL",
+                    rusqlite::params![owner_id, library_id],
+                )?;
+                db.conn.execute(
+                    "UPDATE devices SET user_id = ?1 WHERE device_id = ?2",
+                    rusqlite::params![owner_id, device_id],
+                )?;
+            }
 
             // Rebind the session to the newly-created device. The FK constraint on
             // sessions.device_id requires the device row to exist first.
@@ -700,4 +715,200 @@ fn row_to_op(row: &rusqlite::Row) -> rusqlite::Result<OpPayload> {
         op_type: row.get(5)?,
         payload,
     })
+}
+
+// ── Admin (issue #119) ───────────────────────────────────────────────────────
+
+/// Reject non-admin callers. Admin endpoints honor "no social features": the
+/// only multi-user surface is administration, never cross-user data access.
+fn require_admin(user: &AuthUser) -> Result<(), SyncError> {
+    if user.is_admin() {
+        Ok(())
+    } else {
+        Err(SyncError::Forbidden("admin role required".into()))
+    }
+}
+
+/// `GET /api/v1/admin/users` — list all accounts (admin only).
+///
+/// Returns only non-sensitive fields; SRP verifiers and wrapped key material are
+/// never exposed.
+pub async fn list_users(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+) -> Result<Json<UserListResponse>, SyncError> {
+    require_admin(&user)?;
+
+    let users = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || -> Result<Vec<UserSummary>, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let mut stmt = db.conn.prepare(
+                "SELECT id, email, role, status, created_at
+                 FROM users ORDER BY created_at",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(UserSummary {
+                        id: row.get(0)?,
+                        email: row.get(1)?,
+                        role: row.get(2)?,
+                        status: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(UserListResponse { users }))
+}
+
+/// `POST /api/v1/admin/users/{id}/status` — enable/disable a user (admin only).
+///
+/// Guards: an admin cannot disable their own account, and the last remaining
+/// admin cannot be disabled (so the instance always has at least one admin).
+/// Disabling a user invalidates their active sessions.
+pub async fn set_user_status(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Path(target_id): Path<String>,
+    Json(req): Json<SetUserStatusRequest>,
+) -> Result<Json<UserSummary>, SyncError> {
+    require_admin(&user)?;
+
+    let new_status = match req.status.as_str() {
+        "active" | "disabled" => req.status.clone(),
+        _ => {
+            return Err(SyncError::BadRequest(
+                "status must be 'active' or 'disabled'".into(),
+            ));
+        }
+    };
+
+    if new_status == "disabled" && target_id == user.user_id {
+        return Err(SyncError::Forbidden(
+            "you cannot disable your own account".into(),
+        ));
+    }
+
+    let summary = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let target_id = target_id.clone();
+        move || -> Result<UserSummary, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // Load the target (404 if absent).
+            let (email, role, current_status, created_at): (String, String, String, String) = db
+                .conn
+                .query_row(
+                    "SELECT email, role, status, created_at FROM users WHERE id = ?1",
+                    [&target_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|_| SyncError::NotFound(format!("user {target_id} not found")))?;
+
+            // Don't disable the last active admin.
+            if new_status == "disabled" && role == "admin" {
+                let other_active_admins: i64 = db.conn.query_row(
+                    "SELECT COUNT(*) FROM users
+                     WHERE role = 'admin' AND status = 'active' AND id != ?1",
+                    [&target_id],
+                    |row| row.get(0),
+                )?;
+                if other_active_admins == 0 {
+                    return Err(SyncError::Forbidden(
+                        "cannot disable the last remaining admin".into(),
+                    ));
+                }
+            }
+
+            if new_status != current_status {
+                db.conn.execute(
+                    "UPDATE users SET status = ?1 WHERE id = ?2",
+                    rusqlite::params![new_status, target_id],
+                )?;
+                // Revoke active sessions when disabling.
+                if new_status == "disabled" {
+                    db.conn
+                        .execute("DELETE FROM user_sessions WHERE user_id = ?1", [&target_id])?;
+                }
+            }
+
+            Ok(UserSummary {
+                id: target_id,
+                email,
+                role,
+                status: new_status,
+                created_at,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(summary))
+}
+
+/// `GET /api/v1/admin/registration` — read the open-registration flag (admin only).
+pub async fn get_registration(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+) -> Result<Json<RegistrationConfigResponse>, SyncError> {
+    require_admin(&user)?;
+
+    let open = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || -> Result<bool, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let flag: i64 = db
+                .conn
+                .query_row(
+                    "SELECT registration_open FROM instance_config WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            Ok(flag != 0)
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(RegistrationConfigResponse {
+        registration_open: open,
+    }))
+}
+
+/// `PUT /api/v1/admin/registration` — open/close self-registration (admin only).
+pub async fn set_registration(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Json(req): Json<SetRegistrationRequest>,
+) -> Result<Json<RegistrationConfigResponse>, SyncError> {
+    require_admin(&user)?;
+
+    let open = req.open;
+    tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || -> Result<(), SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            db.conn.execute(
+                "UPDATE instance_config
+                 SET registration_open = ?1, updated_at = datetime('now')
+                 WHERE id = 1",
+                [i64::from(open)],
+            )?;
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(RegistrationConfigResponse {
+        registration_open: open,
+    }))
 }

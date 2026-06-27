@@ -169,3 +169,104 @@ pub struct DownloadSnapshotResponse {
     pub created_at: String,
     pub created_by_device: String,
 }
+
+// ── User accounts & admin (issue #119) ───────────────────────────────────────
+
+/// `POST /api/v1/account/signup` — create a user account.
+///
+/// The client computes the SRP verifier locally from `(Secret Key + password)`
+/// and uploads only the verifier + salt (never the secrets). Wrapped key
+/// material from the key hierarchy (#116) is stored opaquely.
+#[derive(Debug, Deserialize)]
+pub struct SignupRequest {
+    pub email: String,
+    /// Hex-encoded SRP salt used to compute the verifier.
+    pub srp_salt: String,
+    /// Hex-encoded SRP verifier `v = g^x mod N`.
+    pub srp_verifier: String,
+    /// Opaque wrapped account private key (AES-256-GCM under the unlock key).
+    #[serde(default)]
+    pub wrapped_private_key: Option<String>,
+    /// Account public key (X25519).
+    #[serde(default)]
+    pub account_public_key: Option<String>,
+    /// Versioned KDF parameter blob.
+    #[serde(default)]
+    pub kdf_params: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SignupResponse {
+    pub user_id: String,
+    pub email: String,
+    pub role: String,
+}
+
+/// `POST /api/v1/account/challenge` — start a user SRP login.
+#[derive(Debug, Deserialize)]
+pub struct AccountChallengeRequest {
+    pub email: String,
+    /// Hex-encoded client public ephemeral A (`g^a mod N`).
+    pub client_public_a: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccountChallengeResponse {
+    pub challenge_id: String,
+    /// Hex-encoded server public ephemeral B.
+    pub server_public_b: String,
+    /// Hex-encoded SRP salt stored at signup.
+    pub srp_salt: String,
+}
+
+/// `POST /api/v1/account/verify` — complete a user SRP login.
+#[derive(Debug, Deserialize)]
+pub struct AccountVerifyRequest {
+    pub challenge_id: String,
+    /// Hex-encoded client proof M1.
+    pub client_proof_m1: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccountVerifyResponse {
+    /// User session bearer token — store securely, use for account/admin calls.
+    pub session_token: String,
+    /// Hex-encoded server proof M2. The client MUST verify this.
+    pub server_proof_m2: String,
+    pub expires_at: String,
+    pub user_id: String,
+    pub role: String,
+}
+
+/// A single user, as exposed to admins. Never includes verifier/key material.
+#[derive(Debug, Serialize)]
+pub struct UserSummary {
+    pub id: String,
+    pub email: String,
+    pub role: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserListResponse {
+    pub users: Vec<UserSummary>,
+}
+
+/// `POST /api/v1/admin/users/{id}/status` — enable/disable a user.
+#[derive(Debug, Deserialize)]
+pub struct SetUserStatusRequest {
+    /// `"active"` or `"disabled"`.
+    pub status: String,
+}
+
+/// `GET/PUT /api/v1/admin/registration` — read/toggle open registration.
+#[derive(Debug, Serialize)]
+pub struct RegistrationConfigResponse {
+    pub registration_open: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetRegistrationRequest {
+    pub open: bool,
+}

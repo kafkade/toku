@@ -31,6 +31,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Passwordless libraries continue to use the existing static bearer-token path
   unchanged — full backward compatibility
 
+- User accounts, admin roles, and multi-user schema in the sync server
+  (Immich-style self-hosting). A new `users` model stores SRP credentials and
+  wrapped key material; accounts sign up via `POST /api/v1/account/signup` and log
+  in with `POST /api/v1/account/challenge` + `POST /api/v1/account/verify`
+  (user-scoped session tokens). The **first account** on a fresh instance becomes
+  the administrator; subsequent self-registration is **closed by default** — the
+  instance is invite/admin-gated. Admin endpoints let an administrator list users
+  (`GET /api/v1/admin/users`), enable/disable accounts
+  (`POST /api/v1/admin/users/{id}/status`, with guards against disabling yourself or
+  the last admin), and toggle open registration (`GET`/`PUT /api/v1/admin/registration`).
+  Libraries and devices gain a nullable owner (`user_id`), stamped when an
+  authenticated user enrolls; legacy unowned rows remain valid. Honors "no social
+  features": the only multi-user surface is administration, never cross-user data
+  access
+
 - Multi-device sync integration test harness (`toku-sync/tests/`): a reusable
   `TestServer` (real in-process Axum relay on a random port) and `SimulatedDevice`
   (real client + database + merge engine + deterministic HLC), plus 10 end-to-end

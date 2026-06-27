@@ -205,7 +205,13 @@ fn push_then_pull_count(server: &TestServer, device_token: &str, op_id: &str) ->
                 "entity_type": "book",
                 "entity_id": "book-1",
                 "op_type": "create",
-                "payload": { "title": "ciphertext" }
+                "payload": {
+                    "ev": 1,
+                    "alg": "aes-256-gcm",
+                    "nonce": "AAAAAAAAAAAAAAAA",
+                    "ciphertext": "ciphertext",
+                    "aad": "v=1,entity_type=book,op_type=create"
+                }
             }]
         }),
     );

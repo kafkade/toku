@@ -125,14 +125,15 @@ fn load_encryption_key(
 }
 
 /// Initialize sync: register the device with the server, persist the auth token and
-/// sync config, optionally enabling client-side encryption with the given passphrase.
+/// sync config, and enable **mandatory** client-side encryption from the passphrase.
 ///
-/// **When `passphrase` is `Some`**: Uses SRP-6a enrollment + login so the server
-/// never sees the password. The passphrase also derives the client-side AES
-/// encryption key.
+/// Hosted/sync mode is zero-knowledge (ADR-010, issue #121): a passphrase is
+/// **required**. It drives SRP-6a enrollment/login (so the server never sees the
+/// password) and derives the client-side AES data key used to encrypt every op.
 ///
-/// **When `passphrase` is `None`**: Falls back to the legacy unauthenticated
-/// registration path (passwordless library, static bearer token).
+/// Calling without a passphrase returns an error — the previous passwordless,
+/// plaintext opt-out has been removed. Local-only single-device usage never
+/// uploads and so needs neither sync nor a passphrase.
 pub fn init(
     data_dir: &Path,
     server: &str,
@@ -298,40 +299,17 @@ pub fn init(
         }
 
         _ => {
-            // ── Legacy passwordless path ─────────────────────────────────
-            let resp = rt.block_on(client.register(&library_id, &device_name, None, None))?;
-
-            token_store
-                .store(server, &resp.auth_token)
-                .context("failed to store auth token")?;
-
-            let db = open_db(data_dir)?;
-            let sync_repo = SyncRepository::new(&db);
-            let server_device_id = resp
-                .device_id
-                .parse::<uuid::Uuid>()
-                .context("server returned an invalid device_id")?;
-            sync_repo.get_or_create_device_with_id(server_device_id, &device_name)?;
-
-            let mut config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
-            config.sync = Some(toku_core::SyncConfig {
-                server: server.to_string(),
-                library_id: resp.library_id.clone(),
-                device_id: resp.device_id.clone(),
-                device_name: device_name.clone(),
-                encryption: false,
-            });
-            config
-                .save(data_dir)
-                .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
-
-            Ok(InitOutcome {
-                device_id: resp.device_id,
-                library_id: resp.library_id,
-                device_name,
-                server: server.to_string(),
-                encryption: false,
-            })
+            // ── Plaintext opt-out removed (issue #121) ───────────────────
+            //
+            // Hosted/sync mode now mandates client-side E2E encryption
+            // (zero-knowledge). A passwordless library would upload plaintext
+            // ops, which the server rejects, so we refuse up front with an
+            // actionable error instead of registering an unusable device.
+            Err(anyhow::anyhow!(
+                "hosted sync requires client-side encryption: a passphrase is mandatory.\n\
+                 Re-run with `toku sync init --passphrase` (you will be prompted securely).\n\
+                 Local-only, single-device usage needs no sync and no passphrase."
+            ))
         }
     }
 }
@@ -361,19 +339,22 @@ pub fn push(data_dir: &Path) -> anyhow::Result<PushOutcome> {
     }
 
     let total = unpushed.len();
-    let key = load_encryption_key(&token_store, server, sync_config)?;
+    // Zero-knowledge: hosted mode mandates client-side encryption. Refuse to
+    // push if no key is configured rather than uploading plaintext.
+    let key = load_encryption_key(&token_store, server, sync_config)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "hosted sync requires client-side encryption but no key is configured.\n\
+             Re-run `toku sync init --passphrase` to enroll this device with encryption."
+        )
+    })?;
     let wire_ops: Vec<WireOp> = unpushed
         .iter()
         .map(|op| {
-            if let Some(ref key) = key {
-                let mut encrypted = op.clone();
-                encrypted
-                    .encrypt(key)
-                    .map_err(|e| anyhow::anyhow!("failed to encrypt op {}: {e}", op.op_id))?;
-                Ok(wire::to_wire(&encrypted))
-            } else {
-                Ok(wire::to_wire(op))
-            }
+            let mut encrypted = op.clone();
+            encrypted
+                .encrypt(&key)
+                .map_err(|e| anyhow::anyhow!("failed to encrypt op {}: {e}", op.op_id))?;
+            Ok(wire::to_wire(&encrypted))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -496,8 +477,20 @@ pub fn bootstrap(data_dir: &Path) -> anyhow::Result<BootstrapOutcome> {
     let mut snapshot_books = 0usize;
 
     if let Some(snap) = rt.block_on(client.download_snapshot(&token))? {
+        // Zero-knowledge: snapshots are stored as ciphertext. Decrypt with the
+        // library data key before applying.
+        let key = load_encryption_key(&token_store, server, sync_config)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "downloaded an encrypted snapshot but no key is configured.\n\
+                 Re-run `toku sync init --passphrase` to enroll this device with encryption."
+            )
+        })?;
+        let envelope: toku_core::EncryptedEnvelope = serde_json::from_str(&snap.snapshot_json)
+            .context("snapshot is not an encrypted envelope")?;
+        let snapshot_json = toku_core::decrypt_snapshot(&key, &envelope)
+            .map_err(|e| anyhow::anyhow!("failed to decrypt snapshot: {e}"))?;
         let snapshot: toku_core::sync::LibrarySnapshot =
-            serde_json::from_str(&snap.snapshot_json).context("invalid snapshot JSON")?;
+            serde_json::from_str(&snapshot_json).context("invalid snapshot JSON")?;
         let db = open_db(data_dir)?;
         let snapshot_repo = SnapshotRepository::new(&db);
         let result = snapshot_repo

@@ -112,6 +112,25 @@ mod tests {
         }
     }
 
+    /// A structurally-valid encrypted-envelope payload for tests. Hosted mode
+    /// rejects plaintext payloads (issue #121), so test ops must look like
+    /// ciphertext. The `ciphertext` field carries `marker` so assertions can
+    /// still distinguish ops.
+    fn enc_payload(marker: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ev": 1,
+            "alg": "aes-256-gcm",
+            "nonce": "AAAAAAAAAAAAAAAA",
+            "ciphertext": marker,
+            "aad": "v=1,entity_type=book,op_type=update",
+        })
+    }
+
+    /// A structurally-valid encrypted snapshot blob (serialized envelope).
+    fn enc_snapshot(marker: &str) -> String {
+        serde_json::to_string(&enc_payload(marker)).unwrap()
+    }
+
     #[tokio::test]
     async fn health_check() {
         let db_path = test_db_path();
@@ -264,7 +283,7 @@ mod tests {
                                     "entity_type": "book",
                                     "entity_id": "book-1",
                                     "op_type": "create",
-                                    "payload": {"title": "Dune"}
+                                    "payload": enc_payload("dune")
                                 },
                                 {
                                     "op_id": "op-2",
@@ -273,7 +292,7 @@ mod tests {
                                     "entity_type": "book",
                                     "entity_id": "book-1",
                                     "op_type": "update",
-                                    "payload": {"rating": 9}
+                                    "payload": enc_payload("rating")
                                 }
                             ]
                         }))
@@ -374,7 +393,7 @@ mod tests {
                 "entity_type": "book",
                 "entity_id": "b1",
                 "op_type": "create",
-                "payload": {}
+                "payload": null
             }]
         });
 
@@ -685,7 +704,7 @@ mod tests {
                                     "entity_type": "book",
                                     "entity_id": "b1",
                                     "op_type": "create",
-                                    "payload": {"title": "Dune"}
+                                    "payload": enc_payload("dune")
                                 },
                                 {
                                     "op_id": "snap-op-2",
@@ -694,7 +713,7 @@ mod tests {
                                     "entity_type": "book",
                                     "entity_id": "b1",
                                     "op_type": "update",
-                                    "payload": {"rating": 9}
+                                    "payload": enc_payload("rating")
                                 }
                             ]
                         }))
@@ -717,7 +736,7 @@ mod tests {
                     .header("Authorization", format!("Bearer {token}"))
                     .body(Body::from(
                         serde_json::to_string(&serde_json::json!({
-                            "snapshot_json": "{\"version\":1,\"books\":[{\"title\":\"Dune\"}]}",
+                            "snapshot_json": enc_snapshot("dune-snap"),
                             "hlc_at_snapshot": snapshot_hlc,
                         }))
                         .unwrap(),
@@ -752,7 +771,12 @@ mod tests {
             .unwrap();
         let download: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(download["hlc_at_snapshot"], snapshot_hlc);
-        assert!(download["snapshot_json"].as_str().unwrap().contains("Dune"));
+        assert!(
+            download["snapshot_json"]
+                .as_str()
+                .unwrap()
+                .contains("dune-snap")
+        );
 
         // Verify the first op was pruned — pull/all should only return the second
         let resp = app
@@ -817,7 +841,7 @@ mod tests {
                     "entity_type": "book",
                     "entity_id": "b1",
                     "op_type": "create",
-                    "payload": {}
+                    "payload": null
                 })
             })
             .collect();
@@ -1107,7 +1131,7 @@ mod tests {
                 "entity_type": "book",
                 "entity_id": "b1",
                 "op_type": "create",
-                "payload": {"title": "Test Book"}
+                "payload": enc_payload("test-book")
             }]
         });
         let resp = app
@@ -1208,7 +1232,7 @@ mod tests {
                     "entity_type": "book",
                     "entity_id": "b1",
                     "op_type": "create",
-                    "payload": {}
+                    "payload": null
                 },
                 {
                     "op_id": "op-2",
@@ -1217,7 +1241,7 @@ mod tests {
                     "entity_type": "book",
                     "entity_id": "b1",
                     "op_type": "update",
-                    "payload": {"title": "Updated"}
+                    "payload": enc_payload("updated")
                 }
             ]
         });
@@ -1309,7 +1333,7 @@ mod tests {
                     "entity_type": "book",
                     "entity_id": format!("b{i}"),
                     "op_type": "create",
-                    "payload": {}
+                    "payload": null
                 })
             })
             .collect();
@@ -1424,7 +1448,7 @@ mod tests {
                                     "entity_type": "book",
                                     "entity_id": "b1",
                                     "op_type": "create",
-                                    "payload": {"title": "Dune"}
+                                    "payload": enc_payload("dune")
                                 },
                                 {
                                     "op_id": "rk-op-2",
@@ -1433,7 +1457,7 @@ mod tests {
                                     "entity_type": "book",
                                     "entity_id": "b1",
                                     "op_type": "update",
-                                    "payload": {"rating": 9}
+                                    "payload": enc_payload("rating")
                                 }
                             ]
                         }))
@@ -1465,7 +1489,7 @@ mod tests {
                                     "entity_type": "book",
                                     "entity_id": "b1",
                                     "op_type": "create",
-                                    "payload": {"ev": 1, "alg": "aes-256-gcm", "ciphertext": "new-ct-1"}
+                                    "payload": enc_payload("new-ct-1")
                                 },
                                 {
                                     "op_id": "rk-op-2",
@@ -1474,7 +1498,7 @@ mod tests {
                                     "entity_type": "book",
                                     "entity_id": "b1",
                                     "op_type": "update",
-                                    "payload": {"ev": 1, "alg": "aes-256-gcm", "ciphertext": "new-ct-2"}
+                                    "payload": enc_payload("new-ct-2")
                                 }
                             ]
                         }))
@@ -1596,7 +1620,7 @@ mod tests {
                                 "entity_type": "book",
                                 "entity_id": "b1",
                                 "op_type": "create",
-                                "payload": {}
+                                "payload": null
                             }]
                         }))
                         .unwrap(),

@@ -58,6 +58,9 @@ pub struct OpPayload {
     pub entity_type: String,
     pub entity_id: String,
     pub op_type: String,
+    /// Zero-knowledge: in hosted mode this is always an encrypted envelope
+    /// (`{ev, alg, nonce, ciphertext, aad}`) or `null` for content-free ops.
+    /// The server rejects plaintext payloads (issue #121).
     pub payload: serde_json::Value,
 }
 
@@ -74,6 +77,8 @@ pub struct RekeyRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct UploadSnapshotRequest {
+    /// Zero-knowledge: a serialized encrypted envelope over the
+    /// `LibrarySnapshot` JSON. The server rejects plaintext snapshots (#121).
     pub snapshot_json: String,
     pub hlc_at_snapshot: String,
 }

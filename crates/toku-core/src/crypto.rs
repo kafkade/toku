@@ -1,8 +1,10 @@
 //! Client-side encryption for sync ops.
 //!
-//! Implements optional AES-256-GCM encryption with Argon2id key derivation,
-//! per ADR-006 and ADR-008. When enabled, the `fields` JSON is encrypted
-//! before leaving the device; the server stores opaque blobs.
+//! Implements AES-256-GCM encryption with Argon2id key derivation, per
+//! ADR-010 (supersedes ADR-006/008). Client-side encryption is **mandatory**
+//! for hosted/sync mode: the `fields` JSON is encrypted before leaving the
+//! device and the server only ever stores opaque ciphertext (zero-knowledge).
+//! Local-only single-device usage never uploads and so needs no key.
 //!
 //! # Key derivation
 //!
@@ -260,6 +262,104 @@ pub fn decrypt_fields(
 
     serde_json::from_slice(&plaintext)
         .map_err(|e| TokuError::Crypto(format!("deserialize decrypted fields: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot encryption
+// ---------------------------------------------------------------------------
+
+/// AAD string binding a snapshot envelope to its purpose and version.
+///
+/// Snapshots are not tied to a single op's metadata, so the AAD is a fixed
+/// domain separator rather than the per-op binding used by [`build_aad`].
+const SNAPSHOT_AAD: &str = "kind=snapshot,v=1";
+
+/// Encrypt a serialized library snapshot into an [`EncryptedEnvelope`].
+///
+/// Used by the hosted-sync snapshot flow so the server only ever stores
+/// ciphertext (zero-knowledge). `snapshot_json` is the already-serialized
+/// `LibrarySnapshot`; the returned envelope replaces it on the wire.
+pub fn encrypt_snapshot(
+    key: &SyncKey,
+    snapshot_json: &str,
+) -> Result<EncryptedEnvelope, TokuError> {
+    let cipher = Aes256Gcm::new_from_slice(key.as_bytes())
+        .map_err(|e| TokuError::Crypto(format!("cipher init: {e}")))?;
+
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut nonce_bytes).expect("OS CSPRNG failed");
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let payload = Payload {
+        msg: snapshot_json.as_bytes(),
+        aad: SNAPSHOT_AAD.as_bytes(),
+    };
+
+    let ciphertext = cipher
+        .encrypt(nonce, payload)
+        .map_err(|e| TokuError::Crypto(format!("snapshot encryption failed: {e}")))?;
+
+    Ok(EncryptedEnvelope {
+        ev: ENCRYPTION_ENVELOPE_VERSION,
+        alg: ALGORITHM.to_string(),
+        nonce: BASE64_STANDARD.encode(nonce_bytes),
+        ciphertext: BASE64_STANDARD.encode(ciphertext),
+        aad: SNAPSHOT_AAD.to_string(),
+    })
+}
+
+/// Decrypt a snapshot [`EncryptedEnvelope`] back into its serialized JSON.
+///
+/// Verifies the envelope version, algorithm, and the fixed snapshot AAD
+/// before decryption.
+pub fn decrypt_snapshot(key: &SyncKey, envelope: &EncryptedEnvelope) -> Result<String, TokuError> {
+    if envelope.ev != ENCRYPTION_ENVELOPE_VERSION {
+        return Err(TokuError::Crypto(format!(
+            "unsupported envelope version: {}",
+            envelope.ev
+        )));
+    }
+    if envelope.alg != ALGORITHM {
+        return Err(TokuError::Crypto(format!(
+            "unsupported algorithm: {}",
+            envelope.alg
+        )));
+    }
+    if envelope.aad != SNAPSHOT_AAD {
+        return Err(TokuError::Crypto(
+            "AAD mismatch: snapshot envelope is not bound to a snapshot".to_string(),
+        ));
+    }
+
+    let nonce_bytes = BASE64_STANDARD
+        .decode(&envelope.nonce)
+        .map_err(|e| TokuError::Crypto(format!("nonce decode: {e}")))?;
+    if nonce_bytes.len() != 12 {
+        return Err(TokuError::Crypto(format!(
+            "invalid nonce length: {} (expected 12)",
+            nonce_bytes.len()
+        )));
+    }
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = BASE64_STANDARD
+        .decode(&envelope.ciphertext)
+        .map_err(|e| TokuError::Crypto(format!("ciphertext decode: {e}")))?;
+
+    let cipher = Aes256Gcm::new_from_slice(key.as_bytes())
+        .map_err(|e| TokuError::Crypto(format!("cipher init: {e}")))?;
+
+    let payload = Payload {
+        msg: &ciphertext,
+        aad: envelope.aad.as_bytes(),
+    };
+
+    let plaintext = cipher.decrypt(nonce, payload).map_err(|_| {
+        TokuError::Crypto("snapshot decryption failed (wrong key or tampered data)".to_string())
+    })?;
+
+    String::from_utf8(plaintext)
+        .map_err(|e| TokuError::Crypto(format!("snapshot is not valid UTF-8: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -733,5 +833,58 @@ mod tests {
 
             assert_eq!(decrypted, fields, "round trip failed for {et}");
         }
+    }
+
+    // --- Snapshot encryption ---
+
+    #[test]
+    fn snapshot_round_trip() {
+        let (key, _) = test_key_and_salt();
+        let snapshot = r#"{"version":1,"library":{"books":[]}}"#;
+
+        let envelope = encrypt_snapshot(&key, snapshot).unwrap();
+        assert_eq!(envelope.alg, ALGORITHM);
+        // Ciphertext must not leak the plaintext.
+        assert!(!envelope.ciphertext.contains("books"));
+
+        let decrypted = decrypt_snapshot(&key, &envelope).unwrap();
+        assert_eq!(decrypted, snapshot);
+    }
+
+    #[test]
+    fn snapshot_wrong_key_fails() {
+        let (key, _) = test_key_and_salt();
+        let envelope = encrypt_snapshot(&key, "{\"a\":1}").unwrap();
+
+        let other = SyncKey::derive("different-passphrase", &[9u8; 16]).unwrap();
+        assert!(decrypt_snapshot(&other, &envelope).is_err());
+    }
+
+    #[test]
+    fn snapshot_tampered_ciphertext_fails() {
+        let (key, _) = test_key_and_salt();
+        let mut envelope = encrypt_snapshot(&key, "{\"a\":1}").unwrap();
+
+        let mut raw = BASE64_STANDARD.decode(&envelope.ciphertext).unwrap();
+        raw[0] ^= 0xff;
+        envelope.ciphertext = BASE64_STANDARD.encode(&raw);
+
+        assert!(decrypt_snapshot(&key, &envelope).is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_op_envelope_aad() {
+        let (key, _) = test_key_and_salt();
+        // An op envelope must not be decryptable as a snapshot (AAD mismatch).
+        let op_envelope = encrypt_fields(
+            &key,
+            &test_fields(),
+            &test_entity_type(),
+            &test_entity_id(),
+            &test_op_type(),
+        )
+        .unwrap();
+
+        assert!(decrypt_snapshot(&key, &op_envelope).is_err());
     }
 }

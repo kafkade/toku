@@ -156,6 +156,28 @@ The following change:
 | Server trust model | Dumb relay — may store plaintext | Zero-knowledge — stores only encrypted blobs |
 | Auth endpoint | None | `POST /auth/login` (SRP exchange); `POST /auth/enroll` (new device) |
 
+### Zero-Knowledge Enforcement (issue #121)
+
+Mandatory encryption is enforced at the **server boundary**, not just by client convention:
+
+- `push` and `rekey` reject the whole batch (HTTP `422 Unprocessable Entity`) if any op
+  `payload` is not an encrypted envelope (`{ev, alg, nonce, ciphertext, aad}`) or `null`
+  (content-free ops such as deletes). The server requires the *exact* envelope key set, so a
+  client cannot smuggle plaintext fields alongside the ciphertext.
+- `snapshot` upload rejects any `snapshot_json` that is not a serialized encrypted envelope —
+  closing the previous gap where compacted library state was stored in plaintext.
+- The client makes encryption mandatory too: `toku sync init` always requires a passphrase
+  (the passwordless/plaintext opt-out is removed), `push` refuses to upload without a key, and
+  snapshots are encrypted on create / decrypted on bootstrap.
+
+**Server-visible metadata** is minimized to what relay/ordering requires: `op_id`, `device_id`,
+`hlc`, `entity_type`, `entity_id`, `op_type`. The `payload` and snapshot blobs are always
+ciphertext. `entity_type` and `op_type` are deliberately left cleartext — the client binds them
+into the AEAD AAD (so the server cannot re-target or swap an op undetected) and they are needed
+for indexing. Making `entity_type` opaque was evaluated and rejected: it would break the AAD
+binding and op-type indexing while leaking only aggregate counts, never content. This residual
+exposure is documented in `docs/sync-server.md`.
+
 ### Revised Threat Model
 
 | Threat | Old model (ADR-006/008) | New model (ADR-010) |

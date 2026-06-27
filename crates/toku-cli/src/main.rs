@@ -580,8 +580,10 @@ enum SyncAction {
         #[arg(long)]
         device_name: Option<String>,
 
-        /// Enable client-side encryption (prompts for passphrase)
-        #[arg(long)]
+        /// Deprecated: client-side encryption is now mandatory and you are
+        /// always prompted for a passphrase. This flag is kept for
+        /// compatibility and has no effect.
+        #[arg(long, hide = true)]
         passphrase: bool,
     },
 
@@ -3208,21 +3210,24 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
             device_name,
             passphrase,
         } => {
-            let passphrase_value = if passphrase {
-                eprint!("Encryption passphrase: ");
-                let pass = rpassword::read_password().context("failed to read passphrase")?;
-                if pass.is_empty() {
-                    anyhow::bail!("passphrase cannot be empty");
-                }
-                eprint!("Confirm passphrase: ");
-                let confirm = rpassword::read_password().context("failed to read confirmation")?;
-                if pass != confirm {
-                    anyhow::bail!("passphrases do not match");
-                }
-                Some(pass)
-            } else {
-                None
-            };
+            // Client-side E2E encryption is mandatory for hosted mode
+            // (zero-knowledge, issue #121): always prompt for a passphrase.
+            // The legacy `--passphrase` flag is accepted but no longer required.
+            let _ = passphrase;
+            eprintln!(
+                "Hosted sync uses zero-knowledge encryption. Choose a passphrase to protect your library."
+            );
+            eprint!("Encryption passphrase: ");
+            let pass = rpassword::read_password().context("failed to read passphrase")?;
+            if pass.is_empty() {
+                anyhow::bail!("passphrase cannot be empty (encryption is mandatory)");
+            }
+            eprint!("Confirm passphrase: ");
+            let confirm = rpassword::read_password().context("failed to read confirmation")?;
+            if pass != confirm {
+                anyhow::bail!("passphrases do not match");
+            }
+            let passphrase_value = Some(pass);
 
             let outcome = sync::orchestrator::init(
                 data_dir,
@@ -3652,6 +3657,14 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                         )
                         .map_err(|e| anyhow::anyhow!("re-encryption failed: {e}"))?;
                         re_wire.payload = serde_json::to_value(&new_envelope)?;
+                    } else if !wire_op.payload.is_null() {
+                        // Zero-knowledge invariant: every op payload is either an
+                        // encrypted envelope or null. A plaintext payload means the
+                        // server is holding readable content — refuse to proceed.
+                        anyhow::bail!(
+                            "op {} has a plaintext payload; refusing to rekey readable data",
+                            wire_op.op_id
+                        );
                     }
                     re_encrypted_ops.push(re_wire);
                     if (i + 1) % 100 == 0 || i + 1 == total {
@@ -3665,6 +3678,27 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                     .rekey(&token, &new_salt_b64, &re_encrypted_ops)
                     .await
                     .context("rekey request failed")?;
+
+                // Re-encrypt the server snapshot (if any) under the new key so a
+                // later bootstrap can still decrypt it. The snapshot keeps its
+                // original HLC, so re-uploading prunes nothing extra.
+                if let Some(snap) = client.download_snapshot(&token).await? {
+                    let old_envelope: toku_core::EncryptedEnvelope =
+                        serde_json::from_str(&snap.snapshot_json)
+                            .context("stored snapshot is not an encrypted envelope")?;
+                    let snapshot_json = toku_core::decrypt_snapshot(&old_key, &old_envelope)
+                        .map_err(|e| anyhow::anyhow!("failed to decrypt snapshot: {e}"))?;
+                    let new_envelope = toku_core::encrypt_snapshot(&new_key, &snapshot_json)
+                        .map_err(|e| anyhow::anyhow!("failed to re-encrypt snapshot: {e}"))?;
+                    let blob = serde_json::to_string(&new_envelope)
+                        .context("failed to serialize re-encrypted snapshot")?;
+                    client
+                        .upload_snapshot(&token, &blob, &snap.hlc_at_snapshot)
+                        .await
+                        .context("failed to re-upload re-encrypted snapshot")?;
+                    eprintln!("Re-encrypted server snapshot under new key");
+                }
+
                 token_store.store_sync_key(server, new_key.as_exported_bytes())?;
                 eprintln!(
                     "Re-keyed {} ops with new passphrase",
@@ -3691,6 +3725,17 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
             let mut clock = toku_core::HybridClock::new(&device.device_id);
             let hlc_str = clock.now().to_canonical();
 
+            // Zero-knowledge: snapshots are encrypted client-side before upload
+            // so the server only ever stores ciphertext (issue #121).
+            let key_bytes = token_store.load_sync_key(server)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "hosted sync requires client-side encryption but no key is configured.\n\
+                     Run `toku sync init --passphrase` to enroll this device with encryption."
+                )
+            })?;
+            let key = toku_core::SyncKey::from_exported_bytes(&key_bytes)
+                .map_err(|e| anyhow::anyhow!("stored sync key is invalid: {e}"))?;
+
             eprintln!("Creating snapshot...");
             let snapshot = snapshot_repo
                 .export_snapshot(device.device_id, &hlc_str)
@@ -3706,10 +3751,16 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 size_kb
             );
 
-            eprintln!("Uploading snapshot and pruning old ops...");
+            // Encrypt the snapshot and upload only the ciphertext envelope.
+            let envelope = toku_core::encrypt_snapshot(&key, &snapshot_json)
+                .map_err(|e| anyhow::anyhow!("failed to encrypt snapshot: {e}"))?;
+            let encrypted_blob = serde_json::to_string(&envelope)
+                .context("failed to serialize encrypted snapshot")?;
+
+            eprintln!("Uploading encrypted snapshot and pruning old ops...");
             let result = rt.block_on(async {
                 client
-                    .upload_snapshot(&token, &snapshot_json, &hlc_str)
+                    .upload_snapshot(&token, &encrypted_blob, &hlc_str)
                     .await
             })?;
 

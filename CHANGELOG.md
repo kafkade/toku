@@ -28,8 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   256-bit random values with a 24-hour TTL, SHA-256 hashed at rest
 - Account rate-limiting for SRP libraries: 5 consecutive failed login attempts lock
   the account for 15 minutes (HTTP 423); successful login resets the counter
-- Passwordless libraries continue to use the existing static bearer-token path
-  unchanged — full backward compatibility
 
 - User accounts, admin roles, and multi-user schema in the sync server
   (Immich-style self-hosting). A new `users` model stores SRP credentials and
@@ -159,11 +157,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Client-side E2E encryption is now mandatory for hosted/sync mode (zero-knowledge).**
+  `toku sync init` always prompts for an encryption passphrase — the passwordless,
+  plaintext opt-out has been removed. Every op payload and every snapshot is encrypted
+  on-device before upload; the server stores only ciphertext and rejects plaintext
+  uploads with HTTP 422. Snapshots, previously stored server-side as plaintext, are now
+  encrypted too. Local-only single-device usage is unaffected (it never uploads). See
+  `docs/sync-server.md` and ADR-010 for the zero-knowledge guarantee and the documented
+  server-visible metadata (op/device ids, HLC, entity/op type — never content)
 - Sync device registration is now gated once an instance has accounts: the legacy
   unauthenticated `POST /api/v1/register` path is rejected with 403 as soon as the
   first user account exists, so account-managed instances enroll devices only
-  through the authenticated flow. Fresh, accountless instances (passwordless and
-  library-SRP relays) are unaffected
+  through the authenticated flow. Fresh, accountless instances (library-SRP relays)
+  are unaffected
 - Sync session validation now requires an `active` device: a session token belonging
   to a `pending` or `rejected` device is rejected even if the session row still exists
 - `toku sync register` replaced by `toku sync init` with automatic defaults (hostname-based device name, auto-generated library ID)

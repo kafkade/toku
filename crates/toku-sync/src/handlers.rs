@@ -7,7 +7,7 @@ use crate::auth::{AuthDevice, AuthUser, generate_token, sha256_hex};
 use crate::db::SyncDatabase;
 use crate::error::SyncError;
 use crate::models::{
-    AccountDeviceListResponse, AccountDeviceSummary, DeviceApprovalRequest,
+    AccountDeviceListResponse, AccountDeviceSummary, AccountKeysResponse, DeviceApprovalRequest,
     DeviceApprovalsConfigResponse, DeviceResponse, DeviceSessionResponse, DownloadSnapshotResponse,
     EnrollDeviceRequest, EnrollDeviceResponse, HealthResponse, OpPayload, PullQuery, PullResponse,
     PushRequest, PushResponse, RegisterRequest, RegisterResponse, RegistrationConfigResponse,
@@ -701,6 +701,70 @@ pub async fn list_account_devices(
     .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
 
     Ok(Json(AccountDeviceListResponse { devices }))
+}
+
+/// `GET /api/v1/account/keys`
+///
+/// Return the authenticated account's key bundle so a new device can recover the
+/// shared library data key the zero-knowledge way (issue #143):
+/// SRP login → `GET /account/keys` → `AccountKeys::unlock_data_key(password, secret_key)`.
+///
+/// The four fields are opaque ciphertext / public-key material persisted verbatim
+/// at signup — the server never sees the password, Secret Key, or plaintext data
+/// key. An account missing any field (e.g. a row created before #143, or a
+/// partial signup) is reported as `409 Conflict` rather than emitting JSON nulls,
+/// keeping the response contract a set of required non-null strings.
+pub async fn account_keys(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+) -> Result<Json<AccountKeysResponse>, SyncError> {
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let user_id = user.user_id.clone();
+        move || -> Result<AccountKeysResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let (kdf_params, account_public_key, wrapped_private_key, wrapped_data_key): (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = db
+                .conn
+                .query_row(
+                    "SELECT kdf_params, account_public_key, wrapped_private_key, wrapped_data_key
+                     FROM users WHERE id = ?1",
+                    [&user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(|_| SyncError::Unauthorized)?;
+
+            match (
+                kdf_params,
+                account_public_key,
+                wrapped_private_key,
+                wrapped_data_key,
+            ) {
+                (
+                    Some(kdf_params),
+                    Some(account_public_key),
+                    Some(wrapped_private_key),
+                    Some(wrapped_data_key),
+                ) => Ok(AccountKeysResponse {
+                    kdf_params,
+                    account_public_key,
+                    wrapped_private_key,
+                    wrapped_data_key,
+                }),
+                _ => Err(SyncError::Conflict(
+                    "account key bundle not provisioned".into(),
+                )),
+            }
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
 }
 
 /// `DELETE /api/v1/account/devices/{id}`

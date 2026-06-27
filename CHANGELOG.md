@@ -44,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   features": the only multi-user surface is administration, never cross-user data
   access
 
+- Zero-knowledge multi-device key recovery in the sync server: signup now
+  persists the account's wrapped **library data key** (`wrapped_data_key`,
+  migration V7), and a new authenticated `GET /api/v1/account/keys` returns the
+  account key bundle (`kdf_params`, `account_public_key`, `wrapped_private_key`,
+  `wrapped_data_key`) a new device needs to unlock the shared library data key
+  with its Secret Key + password. The server only ever stores and returns
+  ciphertext plus the public key — it can never derive or read the data key. An
+  account with no provisioned bundle returns `409 Conflict` rather than partial
+  results. This unblocks new-device enrollment recovering the *same* data key as
+  the original device, the zero-knowledge way
+
 - Multi-device sync integration test harness (`toku-sync/tests/`): a reusable
   `TestServer` (real in-process Axum relay on a random port) and `SimulatedDevice`
   (real client + database + merge engine + deterministic HLC), plus 10 end-to-end

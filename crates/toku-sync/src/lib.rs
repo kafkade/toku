@@ -73,6 +73,8 @@ pub fn build_router(db_path: PathBuf) -> Router {
             "/api/v1/account/devices/{id}",
             delete(handlers::delete_account_device),
         )
+        // Zero-knowledge account key bundle for multi-device recovery (#143).
+        .route("/api/v1/account/keys", get(handlers::account_keys))
         .layer(middleware::from_fn_with_state(
             db_path.clone(),
             auth::require_user_auth,

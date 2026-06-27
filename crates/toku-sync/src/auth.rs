@@ -813,6 +813,7 @@ pub async fn account_signup(
         let wrapped_private_key = req.wrapped_private_key.clone();
         let account_public_key = req.account_public_key.clone();
         let kdf_params = req.kdf_params.clone();
+        let wrapped_data_key = req.wrapped_data_key.clone();
         move || -> Result<SignupResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
@@ -856,8 +857,8 @@ pub async fn account_signup(
             tx_guard.execute(
                 "INSERT INTO users
                  (id, email, srp_salt, srp_verifier, wrapped_private_key,
-                  account_public_key, kdf_params, role, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', datetime('now'))",
+                  account_public_key, kdf_params, wrapped_data_key, role, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', datetime('now'))",
                 rusqlite::params![
                     user_id,
                     email,
@@ -866,6 +867,7 @@ pub async fn account_signup(
                     wrapped_private_key,
                     account_public_key,
                     kdf_params,
+                    wrapped_data_key,
                     role,
                 ],
             )?;

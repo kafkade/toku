@@ -270,3 +270,86 @@ pub struct RegistrationConfigResponse {
 pub struct SetRegistrationRequest {
     pub open: bool,
 }
+
+/// `GET/PUT /api/v1/admin/device-approvals` — read/toggle the device-approval gate.
+#[derive(Debug, Serialize)]
+pub struct DeviceApprovalsConfigResponse {
+    pub device_approvals_required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetDeviceApprovalsRequest {
+    pub required: bool,
+}
+
+// ── Authenticated device enrollment (issue #120) ─────────────────────────────
+
+/// `POST /api/v1/devices/enroll` — enroll a device under the authenticated user.
+///
+/// The caller must present a user-session bearer (obtained via the account SRP
+/// flow, which already proves possession of password + Secret Key). The device
+/// is bound to the user's library; no library is auto-created for an
+/// unauthenticated caller.
+#[derive(Debug, Deserialize)]
+pub struct EnrollDeviceRequest {
+    /// Target library. Omit to create a fresh library owned by the user; when
+    /// supplied it must be a library the authenticated user owns (or one that
+    /// does not exist yet, in which case it is created owned by the user).
+    #[serde(default)]
+    pub library_id: Option<String>,
+    pub device_name: String,
+    /// Optional base64-encoded library key-derivation salt; first writer wins.
+    #[serde(default)]
+    pub encryption_salt: Option<String>,
+    /// Optional hex/base64 device public key (X25519); stored opaquely.
+    #[serde(default)]
+    pub device_public_key: Option<String>,
+}
+
+/// Response to `POST /api/v1/devices/enroll`.
+///
+/// When the device is immediately `active`, `session_token` + `expires_at` are
+/// populated and the device can sync right away. When `status` is `pending`
+/// (approval flow), both are `None` until an existing trusted device approves
+/// it, after which the device mints a token via `POST /devices/{id}/session`.
+#[derive(Debug, Serialize)]
+pub struct EnrollDeviceResponse {
+    pub device_id: String,
+    pub library_id: String,
+    pub status: String,
+    pub session_token: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// `POST /api/v1/devices/{id}/approval` — approve or reject a pending device.
+#[derive(Debug, Deserialize)]
+pub struct DeviceApprovalRequest {
+    /// `"approve"` or `"reject"`.
+    pub decision: String,
+}
+
+/// Response to `POST /api/v1/devices/{id}/session` — a freshly minted device
+/// session token for an approved (active) device.
+#[derive(Debug, Serialize)]
+pub struct DeviceSessionResponse {
+    pub device_id: String,
+    pub library_id: String,
+    pub session_token: String,
+    pub expires_at: String,
+}
+
+/// A device as exposed to its owning account. Never includes token material.
+#[derive(Debug, Serialize)]
+pub struct AccountDeviceSummary {
+    pub device_id: String,
+    pub library_id: String,
+    pub device_name: String,
+    pub status: String,
+    pub last_seen: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AccountDeviceListResponse {
+    pub devices: Vec<AccountDeviceSummary>,
+}

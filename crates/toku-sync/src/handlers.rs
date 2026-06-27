@@ -7,10 +7,13 @@ use crate::auth::{AuthDevice, AuthUser, generate_token, sha256_hex};
 use crate::db::SyncDatabase;
 use crate::error::SyncError;
 use crate::models::{
-    DeviceResponse, DownloadSnapshotResponse, HealthResponse, OpPayload, PullQuery, PullResponse,
+    AccountDeviceListResponse, AccountDeviceSummary, DeviceApprovalRequest,
+    DeviceApprovalsConfigResponse, DeviceResponse, DeviceSessionResponse, DownloadSnapshotResponse,
+    EnrollDeviceRequest, EnrollDeviceResponse, HealthResponse, OpPayload, PullQuery, PullResponse,
     PushRequest, PushResponse, RegisterRequest, RegisterResponse, RegistrationConfigResponse,
-    RekeyRequest, RekeyResponse, SetRegistrationRequest, SetUserStatusRequest,
-    UploadSnapshotRequest, UploadSnapshotResponse, UserListResponse, UserSummary,
+    RekeyRequest, RekeyResponse, SetDeviceApprovalsRequest, SetRegistrationRequest,
+    SetUserStatusRequest, UploadSnapshotRequest, UploadSnapshotResponse, UserListResponse,
+    UserSummary,
 };
 
 const MAX_BATCH_SIZE: usize = 1000;
@@ -96,6 +99,32 @@ pub async fn register(
             } else {
                 None
             };
+
+            // Hard-gate open registration on account-managed instances (issue #120).
+            //
+            // Once any account exists the instance is "managed": the legacy
+            // unauthenticated relay path (non-SRP library, no session) is closed
+            // so that guessing a `library_id` no longer grants access. Callers
+            // must enroll through POST /api/v1/devices/enroll instead. SRP-session
+            // adds (validated above) and user-session-authenticated adds still
+            // work; zero-account (bootstrap / offline-relay) instances are
+            // unaffected, preserving the legacy passwordless flow.
+            if !is_srp_library {
+                let account_managed: bool = db
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))
+                    .unwrap_or(0)
+                    > 0;
+                if account_managed
+                    && crate::auth::resolve_user_owner(&db, bearer_token.as_deref()).is_none()
+                {
+                    return Err(SyncError::Forbidden(
+                        "open device registration is disabled on this account-managed instance; \
+                         authenticate and enroll via POST /api/v1/devices/enroll"
+                            .into(),
+                    ));
+                }
+            }
 
             // Auto-create library if it doesn't exist.
             db.conn.execute(
@@ -231,6 +260,407 @@ pub async fn delete_device(
             db.conn
                 .execute("DELETE FROM cursors WHERE device_id = ?1", [&target_id])?;
 
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+// ── Authenticated device enrollment (issue #120) ─────────────────────────────
+
+/// Device session token TTL (hours). Mirrors the SRP session TTL.
+const DEVICE_SESSION_TTL_HOURS: i64 = 24;
+
+/// Insert a fresh device session token row and return `(token, expires_at)`.
+/// Runs inside a blocking task with an open connection.
+fn issue_device_session(
+    db: &SyncDatabase,
+    device_id: &str,
+    library_id: &str,
+) -> Result<(String, String), SyncError> {
+    let token = generate_token();
+    let token_hash = sha256_hex(&token);
+    let expires_at: String = db
+        .conn
+        .query_row(
+            "SELECT datetime('now', ?1)",
+            [format!("+{DEVICE_SESSION_TTL_HOURS} hours")],
+            |row| row.get(0),
+        )
+        .map_err(|e| SyncError::Internal(format!("datetime query failed: {e}")))?;
+    db.conn.execute(
+        "INSERT INTO sessions
+         (session_token_hash, device_id, library_id, expires_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        rusqlite::params![token_hash, device_id, library_id, expires_at],
+    )?;
+    Ok((token, expires_at))
+}
+
+/// `POST /api/v1/devices/enroll`
+///
+/// Enroll a device under the authenticated account. Requires a user-session
+/// bearer (issued by the account SRP flow, which already proves possession of
+/// the password + Secret Key). The device is bound to a library the user owns —
+/// no library is auto-created for an unauthenticated caller.
+///
+/// When the instance requires device approvals and the target library already
+/// has an active device, the new device is recorded as `pending` (no token) and
+/// must be approved by an existing trusted device before it can sync.
+pub async fn enroll_device(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Json(req): Json<EnrollDeviceRequest>,
+) -> Result<Json<EnrollDeviceResponse>, SyncError> {
+    if req.device_name.is_empty() {
+        return Err(SyncError::BadRequest("device_name is required".into()));
+    }
+
+    let device_id = uuid::Uuid::now_v7().to_string();
+
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let user_id = user.user_id.clone();
+        let device_id = device_id.clone();
+        let requested_library = req.library_id.clone();
+        let device_name = req.device_name.clone();
+        let encryption_salt = req.encryption_salt.clone();
+        let device_public_key = req.device_public_key.clone();
+        move || -> Result<EnrollDeviceResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let tx = db.conn.unchecked_transaction()?;
+
+            // Resolve the target library, enforcing ownership.
+            let library_id = match requested_library {
+                Some(lib) if !lib.is_empty() => {
+                    let owner: Option<Option<String>> = tx
+                        .query_row(
+                            "SELECT user_id FROM libraries WHERE id = ?1",
+                            [&lib],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .ok();
+                    match owner {
+                        // Existing library: must be owned by this user.
+                        Some(Some(owner_id)) if owner_id == user_id => lib,
+                        Some(_) => {
+                            return Err(SyncError::Forbidden(
+                                "you are not authorized to enroll into this library".into(),
+                            ));
+                        }
+                        // Library does not exist yet: create it owned by the user.
+                        None => {
+                            tx.execute(
+                                "INSERT INTO libraries (id, created_at, user_id)
+                                 VALUES (?1, datetime('now'), ?2)",
+                                rusqlite::params![lib, user_id],
+                            )?;
+                            lib
+                        }
+                    }
+                }
+                // No library specified: mint a fresh one owned by the user.
+                _ => {
+                    let lib = uuid::Uuid::now_v7().to_string();
+                    tx.execute(
+                        "INSERT INTO libraries (id, created_at, user_id)
+                         VALUES (?1, datetime('now'), ?2)",
+                        rusqlite::params![lib, user_id],
+                    )?;
+                    lib
+                }
+            };
+
+            // Establish the library salt on first encrypted enrollment.
+            if let Some(ref salt) = encryption_salt {
+                tx.execute(
+                    "UPDATE libraries SET salt = ?1 WHERE id = ?2 AND salt IS NULL",
+                    rusqlite::params![salt, library_id],
+                )?;
+            }
+
+            // Decide whether this device needs approval. Approval only applies
+            // when the toggle is on AND the library already has an active device
+            // (the first device cannot be approved by anyone).
+            let approvals_required: bool = tx
+                .query_row(
+                    "SELECT device_approvals_required FROM instance_config WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            let active_devices: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM devices WHERE library_id = ?1 AND status = 'active'",
+                [&library_id],
+                |row| row.get(0),
+            )?;
+            let status = if approvals_required && active_devices > 0 {
+                "pending"
+            } else {
+                "active"
+            };
+
+            // SRP/account libraries don't use static auth tokens.
+            tx.execute(
+                "INSERT INTO devices
+                 (device_id, library_id, device_name, auth_token_hash, user_id,
+                  status, device_public_key, created_at)
+                 VALUES (?1, ?2, ?3, '', ?4, ?5, ?6, datetime('now'))",
+                rusqlite::params![
+                    device_id,
+                    library_id,
+                    device_name,
+                    user_id,
+                    status,
+                    device_public_key,
+                ],
+            )?;
+
+            let (session_token, expires_at) = if status == "active" {
+                let (token, exp) = issue_device_session(&db, &device_id, &library_id)?;
+                (Some(token), Some(exp))
+            } else {
+                (None, None)
+            };
+
+            tx.commit()?;
+
+            Ok(EnrollDeviceResponse {
+                device_id,
+                library_id,
+                status: status.to_string(),
+                session_token,
+                expires_at,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
+}
+
+/// `POST /api/v1/devices/{id}/approval`
+///
+/// Approve or reject a `pending` device. Scoped strictly to the authenticated
+/// user: only devices the user owns can be acted on. Approving flips the device
+/// to `active` (it can then mint a session token); rejecting marks it `rejected`
+/// and revokes any sessions.
+pub async fn approve_device(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Path(target_id): Path<String>,
+    Json(req): Json<DeviceApprovalRequest>,
+) -> Result<Json<AccountDeviceSummary>, SyncError> {
+    let approve = match req.decision.as_str() {
+        "approve" => true,
+        "reject" => false,
+        _ => {
+            return Err(SyncError::BadRequest(
+                "decision must be 'approve' or 'reject'".into(),
+            ));
+        }
+    };
+
+    let summary = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let user_id = user.user_id.clone();
+        let target_id = target_id.clone();
+        move || -> Result<AccountDeviceSummary, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // Load the device, scoped to the authenticated owner.
+            let (library_id, device_name, status, last_seen, created_at): (
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+            ) = db
+                .conn
+                .query_row(
+                    "SELECT library_id, device_name, status, last_seen, created_at
+                     FROM devices WHERE device_id = ?1 AND user_id = ?2",
+                    rusqlite::params![target_id, user_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(|_| SyncError::NotFound(format!("device {target_id} not found")))?;
+
+            if status != "pending" {
+                return Err(SyncError::Conflict(format!(
+                    "device is '{status}', not pending approval"
+                )));
+            }
+
+            let new_status = if approve { "active" } else { "rejected" };
+            db.conn.execute(
+                "UPDATE devices SET status = ?1 WHERE device_id = ?2",
+                rusqlite::params![new_status, target_id],
+            )?;
+            if !approve {
+                // Defensive: drop any sessions for a rejected device.
+                db.conn
+                    .execute("DELETE FROM sessions WHERE device_id = ?1", [&target_id])?;
+            }
+
+            Ok(AccountDeviceSummary {
+                device_id: target_id,
+                library_id,
+                device_name,
+                status: new_status.to_string(),
+                last_seen,
+                created_at,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(summary))
+}
+
+/// `POST /api/v1/devices/{id}/session`
+///
+/// Mint a device session token for an `active` device owned by the authenticated
+/// user. Used by a previously `pending` device to obtain its token after
+/// approval, and as a refresh path for an existing device.
+pub async fn create_device_session(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Path(target_id): Path<String>,
+) -> Result<Json<DeviceSessionResponse>, SyncError> {
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let user_id = user.user_id.clone();
+        let target_id = target_id.clone();
+        move || -> Result<DeviceSessionResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            let (library_id, status): (String, String) = db
+                .conn
+                .query_row(
+                    "SELECT library_id, status FROM devices
+                     WHERE device_id = ?1 AND user_id = ?2",
+                    rusqlite::params![target_id, user_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|_| SyncError::NotFound(format!("device {target_id} not found")))?;
+
+            match status.as_str() {
+                "active" => {}
+                "pending" => {
+                    return Err(SyncError::Forbidden(
+                        "device is pending approval by an existing trusted device".into(),
+                    ));
+                }
+                _ => {
+                    return Err(SyncError::Forbidden(
+                        "device enrollment was rejected".into(),
+                    ));
+                }
+            }
+
+            let (session_token, expires_at) = issue_device_session(&db, &target_id, &library_id)?;
+
+            Ok(DeviceSessionResponse {
+                device_id: target_id,
+                library_id,
+                session_token,
+                expires_at,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
+}
+
+/// `GET /api/v1/account/devices`
+///
+/// List the devices owned by the authenticated user, across all of their
+/// libraries. Strictly user-scoped — never exposes another account's devices.
+pub async fn list_account_devices(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+) -> Result<Json<AccountDeviceListResponse>, SyncError> {
+    let devices = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let user_id = user.user_id.clone();
+        move || -> Result<Vec<AccountDeviceSummary>, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let mut stmt = db.conn.prepare(
+                "SELECT device_id, library_id, device_name, status, last_seen, created_at
+                 FROM devices WHERE user_id = ?1 ORDER BY created_at",
+            )?;
+            let rows = stmt
+                .query_map([&user_id], |row| {
+                    Ok(AccountDeviceSummary {
+                        device_id: row.get(0)?,
+                        library_id: row.get(1)?,
+                        device_name: row.get(2)?,
+                        status: row.get(3)?,
+                        last_seen: row.get(4)?,
+                        created_at: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(AccountDeviceListResponse { devices }))
+}
+
+/// `DELETE /api/v1/account/devices/{id}`
+///
+/// Deregister a device owned by the authenticated user. Cleans up the device's
+/// sessions and cursors. Strictly user-scoped.
+pub async fn delete_account_device(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Path(target_id): Path<String>,
+) -> Result<Json<serde_json::Value>, SyncError> {
+    tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let user_id = user.user_id.clone();
+        let target_id = target_id.clone();
+        move || -> Result<(), SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // Confirm ownership first (404 if absent or owned by someone else),
+            // then remove child rows before the device to satisfy FK constraints.
+            let owned: i64 = db.conn.query_row(
+                "SELECT COUNT(*) FROM devices WHERE device_id = ?1 AND user_id = ?2",
+                rusqlite::params![target_id, user_id],
+                |row| row.get(0),
+            )?;
+            if owned == 0 {
+                return Err(SyncError::NotFound(format!("device {target_id} not found")));
+            }
+
+            db.conn
+                .execute("DELETE FROM sessions WHERE device_id = ?1", [&target_id])?;
+            db.conn
+                .execute("DELETE FROM cursors WHERE device_id = ?1", [&target_id])?;
+            db.conn.execute(
+                "DELETE FROM devices WHERE device_id = ?1 AND user_id = ?2",
+                rusqlite::params![target_id, user_id],
+            )?;
             Ok(())
         }
     })
@@ -910,5 +1340,67 @@ pub async fn set_registration(
 
     Ok(Json(RegistrationConfigResponse {
         registration_open: open,
+    }))
+}
+
+/// `GET /api/v1/admin/device-approvals` — read the device-approval gate (admin only).
+pub async fn get_device_approvals(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+) -> Result<Json<DeviceApprovalsConfigResponse>, SyncError> {
+    require_admin(&user)?;
+
+    let required = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || -> Result<bool, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let flag: i64 = db
+                .conn
+                .query_row(
+                    "SELECT device_approvals_required FROM instance_config WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            Ok(flag != 0)
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(DeviceApprovalsConfigResponse {
+        device_approvals_required: required,
+    }))
+}
+
+/// `PUT /api/v1/admin/device-approvals` — enable/disable the device-approval
+/// gate (admin only). When enabled, a newly enrolled device joining a library
+/// that already has an active device is held `pending` until approved.
+pub async fn set_device_approvals(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Json(req): Json<SetDeviceApprovalsRequest>,
+) -> Result<Json<DeviceApprovalsConfigResponse>, SyncError> {
+    require_admin(&user)?;
+
+    let required = req.required;
+    tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || -> Result<(), SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            db.conn.execute(
+                "UPDATE instance_config
+                 SET device_approvals_required = ?1, updated_at = datetime('now')
+                 WHERE id = 1",
+                [i64::from(required)],
+            )?;
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(DeviceApprovalsConfigResponse {
+        device_approvals_required: required,
     }))
 }

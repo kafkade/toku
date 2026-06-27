@@ -40,7 +40,7 @@ pub fn build_router(db_path: PathBuf) -> Router {
             auth::require_auth,
         ));
 
-    // Account/admin routes requiring a *user* session (issue #119).
+    // Account/admin routes requiring a *user* session (issues #119, #120).
     let user_authenticated = Router::new()
         .route("/api/v1/admin/users", get(handlers::list_users))
         .route(
@@ -50,6 +50,28 @@ pub fn build_router(db_path: PathBuf) -> Router {
         .route(
             "/api/v1/admin/registration",
             get(handlers::get_registration).put(handlers::set_registration),
+        )
+        .route(
+            "/api/v1/admin/device-approvals",
+            get(handlers::get_device_approvals).put(handlers::set_device_approvals),
+        )
+        // Authenticated, Secret-Key-gated device enrollment (issue #120).
+        .route("/api/v1/devices/enroll", post(handlers::enroll_device))
+        .route(
+            "/api/v1/devices/{id}/approval",
+            post(handlers::approve_device),
+        )
+        .route(
+            "/api/v1/devices/{id}/session",
+            post(handlers::create_device_session),
+        )
+        .route(
+            "/api/v1/account/devices",
+            get(handlers::list_account_devices),
+        )
+        .route(
+            "/api/v1/account/devices/{id}",
+            delete(handlers::delete_account_device),
         )
         .layer(middleware::from_fn_with_state(
             db_path.clone(),

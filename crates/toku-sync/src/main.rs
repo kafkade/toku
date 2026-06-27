@@ -547,6 +547,50 @@ mod tests {
         cleanup(&db_path);
     }
 
+    /// Issue #120: once an account exists the instance is "account-managed" and
+    /// the legacy open `register` path is hard-gated — guessing a `library_id`
+    /// no longer auto-creates a library or hands out a token.
+    #[tokio::test]
+    async fn register_rejected_on_account_managed_instance() {
+        let db_path = test_db_path();
+
+        // Simulate an account-managed instance by inserting a user directly.
+        {
+            let db = SyncDatabase::open_no_migrate(&db_path).unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO users
+                     (id, email, srp_salt, srp_verifier, role, status, created_at)
+                     VALUES (?1, 'admin@example.com', 'aa', 'bb', 'admin', 'active', datetime('now'))",
+                    [uuid::Uuid::now_v7().to_string()],
+                )
+                .unwrap();
+        }
+
+        let app = build_router(db_path.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/register")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&serde_json::json!({
+                            "library_id": "victim-lib",
+                            "device_name": "attacker"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        cleanup(&db_path);
+    }
+
     #[tokio::test]
     async fn snapshot_download_returns_404_when_none_exists() {
         let db_path = test_db_path();

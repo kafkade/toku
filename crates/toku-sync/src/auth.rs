@@ -146,12 +146,16 @@ pub async fn require_auth(
         move || -> Result<AuthDevice, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
-            // 1. Check the sessions table (SRP-issued, short-lived).
+            // 1. Check the sessions table (SRP-issued, short-lived). Only
+            //    active devices may authenticate — a rejected/pending device
+            //    (issue #120) is denied even if a stale session row lingers.
             let session = db.conn.query_row(
                 "SELECT s.device_id, s.library_id
                  FROM sessions s
+                 JOIN devices d ON d.device_id = s.device_id
                  WHERE s.session_token_hash = ?1
-                   AND s.expires_at > datetime('now')",
+                   AND s.expires_at > datetime('now')
+                   AND d.status = 'active'",
                 [&token_hash],
                 |row| {
                     Ok(AuthDevice {
@@ -173,7 +177,7 @@ pub async fn require_auth(
                 .conn
                 .query_row(
                     "SELECT device_id, library_id
-                     FROM devices WHERE auth_token_hash = ?1",
+                     FROM devices WHERE auth_token_hash = ?1 AND status = 'active'",
                     [&token_hash],
                     |row| {
                         Ok(AuthDevice {

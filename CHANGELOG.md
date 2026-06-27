@@ -142,9 +142,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - iOS app (iPhone + iPad) with SwiftUI: library cover grid, book detail, barcode scanner (ISBN-13 via camera), quick progress update sheet, statistics glance with Swift Charts, full-text search, Goodreads CSV import, adaptive navigation (TabView on iPhone, NavigationSplitView on iPad), status filter chips, and pull-to-refresh
 - TokuKitUI shared SwiftUI component library (StarRatingView, FlowLayout, MetadataRow, StatCard) for reuse across macOS and iOS apps
 - 1Password-style account key hierarchy primitives in `toku-core` for hosted sync: two-secret unlock key derivation (password + Secret Key), wrapped account private keys, wrapped library data keys, and versioned serialized key-material formats for future migrations
+- Authenticated, Secret-Key-gated device enrollment for the sync server: new devices
+  are enrolled through an authenticated account session (which already proves
+  possession of the password + Secret Key via SRP) at `POST /api/v1/devices/enroll`,
+  rather than via open registration. Devices and libraries are scoped to the
+  authenticated account, so a user can only enroll into libraries they own. Account
+  holders can list and remove their own devices with
+  `GET /api/v1/account/devices` and `DELETE /api/v1/account/devices/{id}`
+- Optional trusted-device approval flow for sync (off by default, Immich-style
+  opt-in): when enabled, a newly enrolled device on a library that already has an
+  active device is held in a `pending` state and issued no session token until an
+  existing trusted device approves it via `POST /api/v1/devices/{id}/approval`;
+  the approved device then claims its token from `POST /api/v1/devices/{id}/session`.
+  Rejected devices are denied. Administrators toggle the requirement with
+  `GET`/`PUT /api/v1/admin/device-approvals`
 
 ### Changed
 
+- Sync device registration is now gated once an instance has accounts: the legacy
+  unauthenticated `POST /api/v1/register` path is rejected with 403 as soon as the
+  first user account exists, so account-managed instances enroll devices only
+  through the authenticated flow. Fresh, accountless instances (passwordless and
+  library-SRP relays) are unaffected
+- Sync session validation now requires an `active` device: a session token belonging
+  to a `pending` or `rejected` device is rejected even if the session row still exists
 - `toku sync register` replaced by `toku sync init` with automatic defaults (hostname-based device name, auto-generated library ID)
 - `toku sync push`, `pull`, `devices`, `rekey`, and `compact` no longer require `--server` flag — server URL is read from sync config
 - `toku sync logout` replaced by `toku sync disable` which also clears sync config

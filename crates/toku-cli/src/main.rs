@@ -228,6 +228,16 @@ enum Commands {
         /// Host to bind (use 127.0.0.1 for local-only access)
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Run in hosted mode: require account login + sessions (needed for
+        /// any non-loopback / network-facing deployment).
+        #[arg(long, env = "TOKU_WEB_HOSTED")]
+        hosted: bool,
+
+        /// Mark auth cookies `Secure` (default in hosted mode). Disable only
+        /// for plain-HTTP testing of hosted mode on localhost.
+        #[arg(long, env = "TOKU_WEB_INSECURE_COOKIES")]
+        insecure_cookies: bool,
     },
 
     /// Manage work grouping (link editions of the same creative work)
@@ -751,14 +761,29 @@ fn main() -> Result<()> {
             clap_complete::generate(*shell, &mut Cli::command(), "toku", &mut std::io::stdout());
             return Ok(());
         }
-        Commands::Serve { port, host } => {
+        Commands::Serve {
+            port,
+            host,
+            hosted,
+            insecure_cookies,
+        } => {
             let db_path = data_dir.join("toku.db");
+            let mode = if *hosted {
+                toku_web::WebMode::Hosted
+            } else {
+                toku_web::WebMode::Local
+            };
+            // Hosted mode marks cookies Secure by default (TLS expected, e.g. via
+            // a reverse proxy); --insecure-cookies opts out for local testing.
+            let secure_cookies = *hosted && !*insecure_cookies;
+            let host = host.clone();
+            let port = *port;
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("failed to build tokio runtime")?;
-            return rt.block_on(async {
-                toku_web::serve(db_path, host, *port)
+            return rt.block_on(async move {
+                toku_web::serve(db_path, &host, port, mode, secure_cookies)
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))
             });

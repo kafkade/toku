@@ -19,6 +19,83 @@ use crate::models::{
 const MAX_BATCH_SIZE: usize = 1000;
 const MAX_BATCH_SIZE_SQL: i64 = MAX_BATCH_SIZE as i64;
 
+// ── Zero-knowledge payload enforcement (issue #121) ───────────────────────────
+
+/// Returns `true` if `payload` is a well-formed encrypted envelope.
+///
+/// A valid envelope is a JSON object containing **exactly** the envelope keys
+/// (`ev`, `alg`, `nonce`, `ciphertext`, `aad`) with the expected primitive
+/// types. Requiring an exact key set prevents a client from smuggling
+/// plaintext fields alongside the ciphertext.
+fn is_encrypted_envelope(payload: &serde_json::Value) -> bool {
+    let Some(obj) = payload.as_object() else {
+        return false;
+    };
+    const KEYS: [&str; 5] = ["ev", "alg", "nonce", "ciphertext", "aad"];
+    if obj.len() != KEYS.len() || !KEYS.iter().all(|k| obj.contains_key(*k)) {
+        return false;
+    }
+    obj.get("ev").is_some_and(serde_json::Value::is_u64)
+        && obj.get("alg").is_some_and(serde_json::Value::is_string)
+        && obj.get("nonce").is_some_and(serde_json::Value::is_string)
+        && obj
+            .get("ciphertext")
+            .is_some_and(serde_json::Value::is_string)
+        && obj.get("aad").is_some_and(serde_json::Value::is_string)
+}
+
+/// Enforce zero-knowledge for a synced op payload.
+///
+/// Accepts either an encrypted envelope object or JSON `null` (content-free
+/// ops such as deletes). Any other shape — notably a plaintext `fields`
+/// object — is rejected so the server can never read user content. The op
+/// metadata (ids, hlc, entity/op type) intentionally stays cleartext; the
+/// `payload` must always be ciphertext.
+fn require_ciphertext_payload(payload: &serde_json::Value) -> Result<(), SyncError> {
+    if payload.is_null() || is_encrypted_envelope(payload) {
+        Ok(())
+    } else {
+        Err(SyncError::PlaintextRejected(
+            "op payload must be an encrypted envelope; plaintext is not allowed in hosted mode"
+                .into(),
+        ))
+    }
+}
+
+/// Reject a batch outright if any op carries a plaintext payload.
+fn require_ciphertext_batch(ops: &[OpPayload]) -> Result<(), SyncError> {
+    for op in ops {
+        require_ciphertext_payload(&op.payload).map_err(|_| {
+            SyncError::PlaintextRejected(format!(
+                "op {} carries a plaintext payload; hosted mode requires client-side encryption",
+                op.op_id
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Enforce zero-knowledge for an uploaded snapshot blob.
+///
+/// The snapshot must be a serialized encrypted envelope (ciphertext), never a
+/// plaintext `LibrarySnapshot`.
+fn require_ciphertext_snapshot(snapshot_json: &str) -> Result<(), SyncError> {
+    let value: serde_json::Value = serde_json::from_str(snapshot_json).map_err(|_| {
+        SyncError::PlaintextRejected(
+            "snapshot must be an encrypted envelope; plaintext is not allowed in hosted mode"
+                .into(),
+        )
+    })?;
+    if is_encrypted_envelope(&value) {
+        Ok(())
+    } else {
+        Err(SyncError::PlaintextRejected(
+            "snapshot must be an encrypted envelope; plaintext is not allowed in hosted mode"
+                .into(),
+        ))
+    }
+}
+
 // ── Health ──────────────────────────────────────────────────────────────────
 
 pub async fn health() -> Json<HealthResponse> {
@@ -687,6 +764,9 @@ pub async fn push_ops(
         )));
     }
 
+    // Zero-knowledge: reject the batch if any op carries a plaintext payload.
+    require_ciphertext_batch(&req.ops)?;
+
     let resp = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
         let library_id = device.library_id.clone();
@@ -924,6 +1004,9 @@ pub async fn upload_snapshot(
         return Err(SyncError::BadRequest("hlc_at_snapshot is required".into()));
     }
 
+    // Zero-knowledge: the snapshot blob must be an encrypted envelope.
+    require_ciphertext_snapshot(&req.snapshot_json)?;
+
     let resp = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
         let library_id = device.library_id.clone();
@@ -1043,6 +1126,9 @@ pub async fn rekey(
     if req.ops.is_empty() {
         return Err(SyncError::BadRequest("ops array is empty".into()));
     }
+
+    // Zero-knowledge: re-keyed ops must remain ciphertext.
+    require_ciphertext_batch(&req.ops)?;
 
     let resp = tokio::task::spawn_blocking({
         let db_path = db_path.clone();

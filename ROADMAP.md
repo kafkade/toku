@@ -349,9 +349,9 @@ Rejected sync alternatives:
 #### Sync protocol — technical summary
 
 ```sh
-POST /sync/push     — Client sends new ops (encrypted or plaintext)
+POST /sync/push     — Client sends new ops (always client-side encrypted)
 GET  /sync/pull     — Client receives ops since cursor
-GET  /sync/snapshot — Client downloads latest compacted snapshot
+GET  /sync/snapshot — Client downloads latest compacted snapshot (encrypted)
 POST /sync/register — Register a new device
 GET  /sync/devices  — List registered devices
 DELETE /sync/device — Deregister a device
@@ -368,7 +368,7 @@ Each op:
   "entity_type": "book",
   "entity_id": "uuid",
   "op_type": "update",
-  "payload": "<encrypted-or-plaintext JSON>",
+  "payload": "<encrypted envelope (ciphertext) — never plaintext in hosted mode>",
   "checksum": "sha256"
 }
 ```
@@ -1380,7 +1380,7 @@ Before committing to the architecture, validate:
 
 **Deliverables** (5):
 
-1. **Sync data model + op-log**: Local `sync_ops` table with Hybrid Logical Clock (HLC) timestamps, op IDs (UUID v7), entity type/ID, and encrypted-or-plaintext payload. Every mutation writes to both the domain table and the op-log in a single transaction.
+1. **Sync data model + op-log**: Local `sync_ops` table with Hybrid Logical Clock (HLC) timestamps, op IDs (UUID v7), entity type/ID, and a payload that is always client-side encrypted (ciphertext) before upload. Every mutation writes to both the domain table and the op-log in a single transaction.
 2. **Sync server (`toku-sync` crate)**: Axum REST API for push/pull/snapshot/device management. Thin relay — stores ops and cursors, does not interpret content. Deployable as a Docker image (`kafkade/toku-sync`).
 3. **Push/pull protocol with entity-specific merge rules**: Push sends new ops since last cursor. Pull receives ops and applies entity-specific merge: LWW per field for books, append-only for reading sessions, monotonic for progress, LWW with conflict detection for notes/reviews. Soft deletes with 30-day tombstone retention.
 4. **Mandatory client-side E2E encryption + SRP auth**: Mandatory for hosted mode — no plaintext fallback. 1Password-style two-secret SRP (password + Secret Key). Key hierarchy: (Secret Key + password) → Argon2id → unlock key → wraps key pair → wraps library key. Emergency Kit generated at account creation.

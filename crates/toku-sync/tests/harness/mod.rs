@@ -35,6 +35,10 @@ use uuid::Uuid;
 /// Ensure the token store never touches the OS keychain during tests.
 static INIT_ENV: Once = Once::new();
 
+/// Default passphrase used when a test does not pin its own. Encryption is
+/// mandatory, so every device must enroll/login with a passphrase.
+pub const DEFAULT_TEST_PASSPHRASE: &str = "harness-default-passphrase";
+
 fn ensure_file_token_store() {
     INIT_ENV.call_once(|| {
         // SAFETY: called once, before any device spawns a thread that reads
@@ -113,9 +117,12 @@ pub struct SimulatedDevice {
 }
 
 impl SimulatedDevice {
-    /// Register a new device against `server`, joining `library_id`. Pass
-    /// `passphrase` to enable client-side encryption (both devices in a pair
-    /// must use the same passphrase to converge).
+    /// Register a new device against `server`, joining `library_id`.
+    ///
+    /// Client-side encryption is mandatory in hosted mode (issue #121), so a
+    /// passphrase is always used: pass an explicit one, or `None` to fall back
+    /// to [`DEFAULT_TEST_PASSPHRASE`]. Devices in the same library must share a
+    /// passphrase to converge.
     pub fn register(
         server: &TestServer,
         library_id: &str,
@@ -125,6 +132,7 @@ impl SimulatedDevice {
         ensure_file_token_store();
         let data_dir = tempfile::tempdir().expect("create device temp dir");
 
+        let passphrase = passphrase.or(Some(DEFAULT_TEST_PASSPHRASE));
         let outcome = toku_sync_client::init(
             data_dir.path(),
             server.base_url(),
@@ -153,6 +161,26 @@ impl SimulatedDevice {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The bearer token this device authenticates with (white-box: for tests
+    /// that drive the server over raw HTTP).
+    pub fn auth_token(&self, server: &TestServer) -> String {
+        let store = toku_sync_client::TokenStore::new(self.data_dir());
+        store
+            .load(server.base_url())
+            .expect("load auth token")
+            .expect("device has an auth token")
+    }
+
+    /// The client-side encryption key derived during enrollment (white-box).
+    pub fn sync_key(&self, server: &TestServer) -> toku_core::SyncKey {
+        let store = toku_sync_client::TokenStore::new(self.data_dir());
+        let bytes = store
+            .load_sync_key(server.base_url())
+            .expect("load sync key")
+            .expect("device has a sync key");
+        toku_core::SyncKey::from_exported_bytes(&bytes).expect("valid sync key")
     }
 
     fn data_dir(&self) -> &Path {

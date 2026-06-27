@@ -2,12 +2,12 @@
 
 `toku-sync` is the optional relay server that lets you sync your Toku library across multiple
 devices. It is a small, single-binary HTTP service backed by SQLite. It stores **only** sync
-operations (which are end-to-end encrypted when you enable a passphrase) — it never needs access
-to your decrypted library.
+operations, which are **always** end-to-end encrypted client-side before upload — it can never
+read your library. This is a **zero-knowledge** design: see
+[Zero-knowledge guarantee](#zero-knowledge-guarantee) below.
 
 Syncing is entirely opt-in. Toku works fully offline without ever running this server. See
-[ADR-006](./adr/006-sync-strategy.md) and [ADR-008](./adr/008-sync-wire-protocol.md) for the
-design.
+[ADR-010](./adr/010-self-host-auth.md) (which supersedes ADR-006 and ADR-008) for the design.
 
 This guide covers deploying the server with Docker.
 
@@ -70,13 +70,47 @@ docker compose up -d
 Once the server is reachable, point your Toku CLI at it:
 
 ```bash
-toku sync init --server https://sync.example.com --passphrase "your-secret-passphrase"
+toku sync init --server https://sync.example.com
 toku sync push
 toku sync pull
 ```
 
-The passphrase enables end-to-end encryption — the server stores only opaque encrypted blobs.
+`toku sync init` always prompts for an encryption passphrase — client-side end-to-end
+encryption is **mandatory** in hosted mode, so the server only ever stores opaque ciphertext.
 Use the same passphrase on every device. See `toku sync --help` for the full command set.
+
+## Zero-knowledge guarantee
+
+In hosted mode the server is **zero-knowledge**: it can never read your library content.
+
+- **Op payloads** are encrypted client-side (AES-256-GCM, key derived from your passphrase)
+  before they leave the device. The server **rejects** any plaintext payload with HTTP `422`.
+- **Snapshots** (compacted library state) are likewise encrypted before upload; plaintext
+  snapshots are rejected with `422`.
+- **Re-key** uploads only ever carry re-encrypted ciphertext.
+
+What the server *can* see is limited to the routing/ordering metadata it needs to relay and
+order ops. It never sees field values, titles, notes, ratings, or any content:
+
+| Field | Server-visible? | Why |
+|-------|-----------------|-----|
+| `op_id` (UUID v7) | Yes | Dedup + cursor/ordering |
+| `device_id` | Yes | Per-device cursors and device management |
+| `hlc` (timestamp) | Yes | Hybrid Logical Clock ordering |
+| `entity_type` (e.g. `book`) | Yes | Indexing + bound into the ciphertext AAD |
+| `entity_id` (UUID) | Yes | Routing; opaque identifier, no content |
+| `op_type` (e.g. `update`) | Yes | Merge semantics; bound into the AAD |
+| `payload` | **No** | Always an encrypted envelope (or `null` for content-free ops) |
+| snapshot blob | **No** | Always an encrypted envelope |
+
+`entity_type` and `op_type` are intentionally left cleartext: the client binds them into the
+authenticated-encryption AAD so the server cannot swap or re-target an op without detection,
+and they are needed for indexing. This is an accepted, documented metadata exposure — it
+reveals *how many* ops of each kind exist, never their content. Making `entity_type` opaque
+was considered and rejected for this reason.
+
+Because the server holds no key, losing your passphrase (and Secret Key / Emergency Kit) means
+server-side data is unrecoverable by design. See [`recovery.md`](./recovery.md).
 
 ## Configuration
 

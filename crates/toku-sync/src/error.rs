@@ -23,6 +23,9 @@ pub enum SyncError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("plaintext payload rejected: {0}")]
+    PlaintextRejected(String),
+
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -45,6 +48,7 @@ impl IntoResponse for SyncError {
             SyncError::Unauthorized => StatusCode::UNAUTHORIZED,
             SyncError::Forbidden(_) => StatusCode::FORBIDDEN,
             SyncError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            SyncError::PlaintextRejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             SyncError::Conflict(_) => StatusCode::CONFLICT,
             SyncError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             SyncError::AccountLocked { .. } => StatusCode::from_u16(423).unwrap(),

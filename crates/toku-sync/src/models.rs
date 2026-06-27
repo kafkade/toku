@@ -198,6 +198,10 @@ pub struct SignupRequest {
     /// Versioned KDF parameter blob.
     #[serde(default)]
     pub kdf_params: Option<String>,
+    /// Opaque wrapped library data key (the leaf `SyncKey`, wrapped to the
+    /// account public key). Stored as-is; never derivable server-side (#143).
+    #[serde(default)]
+    pub wrapped_data_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -357,4 +361,23 @@ pub struct AccountDeviceSummary {
 #[derive(Debug, Serialize)]
 pub struct AccountDeviceListResponse {
     pub devices: Vec<AccountDeviceSummary>,
+}
+
+/// `GET /api/v1/account/keys` — the account key bundle a new device needs to
+/// unlock the shared library data key the zero-knowledge way (issue #143).
+///
+/// All four fields are opaque strings persisted verbatim at signup. The server
+/// stores and returns only ciphertext plus the account public key; it can never
+/// derive or read the plaintext data key. Fields are required (non-null) on the
+/// 200 path — an account missing any of them yields `409 Conflict` instead.
+#[derive(Debug, Serialize)]
+pub struct AccountKeysResponse {
+    /// JSON-serialized `toku_core::AccountKdfParams`.
+    pub kdf_params: String,
+    /// Base64-encoded account X25519 public key.
+    pub account_public_key: String,
+    /// JSON-serialized `toku_core::WrappedAccountPrivateKey`.
+    pub wrapped_private_key: String,
+    /// JSON-serialized `toku_core::WrappedDataKey`.
+    pub wrapped_data_key: String,
 }

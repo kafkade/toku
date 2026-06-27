@@ -1,0 +1,15 @@
+-- Persist the wrapped library data key for zero-knowledge multi-device recovery
+-- (issue #143, part of #114).
+--
+-- The #116 key hierarchy wraps a random library data key to the account public
+-- key (ECIES-like). V5 already stores `wrapped_private_key`, `account_public_key`
+-- and `kdf_params`, but NOT the wrapped data key — so a new device could pass SRP
+-- yet never recover the shared library data key the zero-knowledge way.
+--
+-- Additive, nullable, and idempotent (refinery runs each versioned migration at
+-- most once): existing rows get NULL and are reported as "not provisioned" by the
+-- GET /api/v1/account/keys endpoint until the owner re-uploads their bundle.
+--
+-- The column holds opaque ciphertext only (JSON-serialized `toku_core::WrappedDataKey`).
+-- The server can never derive or read the plaintext data key from it.
+ALTER TABLE users ADD COLUMN wrapped_data_key TEXT;

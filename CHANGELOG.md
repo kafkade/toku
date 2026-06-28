@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The self-hosted `toku-sync` Docker image builds for `linux/arm64` (e.g.
+  Raspberry Pi) again, so the published multi-arch image works on ARM hosts
+
 ## [0.3.0] - 2026-06-27
 
 ### Added

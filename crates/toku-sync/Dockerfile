@@ -5,7 +5,7 @@
 # Build context must be the repository root, e.g.:
 #   docker build -f crates/toku-sync/Dockerfile -t toku-sync .
 #
-# The builder cross-compiles a static musl binary on the *native* build platform
+# The builder cross-compiles a glibc binary on the *native* build platform
 # (no QEMU for the Rust compile), then copies it into a minimal distroless image.
 # Supports linux/amd64 and linux/arm64 (e.g. Raspberry Pi).
 
@@ -15,17 +15,20 @@ FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
 # Provided automatically by buildx.
 ARG TARGETARCH
 
-# Map the Docker target arch to a Rust musl target and install the cross
-# toolchain needed to link a static binary for it.
+# Map the Docker target arch to a Rust GNU (glibc) target and install the
+# matching cross toolchain. We cross-compile on the *native* build platform
+# (no QEMU for the Rust compile). Debian's gcc-<arch>-linux-gnu is the correct
+# C compiler/linker for the GNU target, including the bundled SQLite C code
+# (libsqlite3-sys).
 RUN set -eux; \
     case "$TARGETARCH" in \
-        amd64) RUST_TARGET="x86_64-unknown-linux-musl"; GCC_PKG="gcc-x86-64-linux-gnu" ;; \
-        arm64) RUST_TARGET="aarch64-unknown-linux-musl"; GCC_PKG="gcc-aarch64-linux-gnu" ;; \
+        amd64) RUST_TARGET="x86_64-unknown-linux-gnu"; GCC_PKG="gcc-x86-64-linux-gnu" ;; \
+        arm64) RUST_TARGET="aarch64-unknown-linux-gnu"; GCC_PKG="gcc-aarch64-linux-gnu" ;; \
         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     echo "$RUST_TARGET" > /rust_target; \
     apt-get update; \
-    apt-get install -y --no-install-recommends musl-tools "$GCC_PKG"; \
+    apt-get install -y --no-install-recommends "$GCC_PKG"; \
     rm -rf /var/lib/apt/lists/*; \
     rustup target add "$RUST_TARGET"
 
@@ -35,9 +38,10 @@ WORKDIR /build
 # this small by excluding target/, the native apps, etc.
 COPY . .
 
-# Tell cargo/cc which linker to use for the aarch64 musl target.
-ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-    CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
+# Linker + C compiler for the aarch64 GNU cross build. These are ignored for the
+# native amd64 build, which uses the image's default gcc.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     set -eux; \
@@ -50,8 +54,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN mkdir -p /data && chown 65532:65532 /data
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
-# distroless static: tiny, no shell, runs as non-root, ships CA certs + /etc/passwd.
-FROM gcr.io/distroless/static-debian12:nonroot
+# distroless cc: tiny, no shell, runs as non-root; ships glibc + libgcc, CA certs
+# and /etc/passwd — everything the dynamically-linked glibc binary needs.
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 LABEL org.opencontainers.image.title="toku-sync" \
       org.opencontainers.image.description="Sync relay server for the Toku personal book manager" \

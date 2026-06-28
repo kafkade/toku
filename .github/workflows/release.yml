@@ -96,7 +96,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
@@ -154,7 +154,8 @@ jobs:
           echo "✅ Tag $TAG_VERSION matches Cargo.toml"
 
       # Publish crates in dependency order:
-      # toku-core (no deps) → toku-db → toku-import, toku-meta, toku-export → toku-cli
+      # toku-core (no deps) → toku-db → toku-import, toku-meta, toku-export,
+      # toku-web, toku-sync-client → toku-cli
       # Polls crates.io index between publishes to avoid timing issues.
       - name: Publish workspace crates
         env:
@@ -188,5 +189,7 @@ jobs:
           publish_crate toku-import
           publish_crate toku-meta
           publish_crate toku-export
+          publish_crate toku-web
+          publish_crate toku-sync-client
           publish_crate toku-cli
           echo "✅ All crates published"

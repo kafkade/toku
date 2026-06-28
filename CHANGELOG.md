@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state, with backup and tag-pinning guidance) in `docs/sync-server.md`
 - New `docs/self-hosting.md` entry-point that summarizes the self-host story and links to
   the full deployment guide
+- New `docs/security/self-host-threat-model.md` — end-to-end threat model and security-review
+  record for the zero-knowledge, two-secret self-host auth model: assets, adversaries,
+  mitigations, the zero-knowledge sign-off, and a triaged findings table with residual risks
 
 ## [0.3.2] - 2026-06-28
 

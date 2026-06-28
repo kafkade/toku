@@ -2,6 +2,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Wire-protocol version this client speaks (account model = 2). Sent on every
+/// request so a migrated server can reject pre-account clients with 426 (#126).
+pub const SYNC_PROTOCOL_VERSION: i64 = 2;
+/// Header carrying [`SYNC_PROTOCOL_VERSION`].
+pub const SYNC_PROTOCOL_HEADER: &str = "x-toku-sync-protocol";
+
 /// HTTP client for communicating with the toku-sync server.
 pub struct SyncClient {
     http: reqwest::Client,
@@ -60,6 +66,12 @@ pub struct SignupResult {
     pub user_id: String,
     pub email: String,
     pub role: String,
+    /// Relay libraries adopted under this account during admin bootstrap (#126).
+    #[serde(default)]
+    pub adopted_libraries: i64,
+    /// Relay devices adopted under this account during admin bootstrap (#126).
+    #[serde(default)]
+    pub adopted_devices: i64,
 }
 
 /// Response from `POST /api/v1/account/challenge`.
@@ -201,9 +213,15 @@ pub struct DownloadSnapshotResult {
 
 impl SyncClient {
     pub fn new(server_url: &str) -> anyhow::Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            SYNC_PROTOCOL_HEADER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            .default_headers(headers)
             .build()?;
 
         let mut base = server_url.to_string();

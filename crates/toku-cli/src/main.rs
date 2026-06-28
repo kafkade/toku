@@ -681,6 +681,20 @@ enum SyncAction {
     /// Compact the op log by creating a snapshot and pruning old ops
     Compact,
 
+    /// One-time upgrade from the legacy relay (single-passphrase) model to an
+    /// account: generates a Secret Key + account, re-protects all server data
+    /// under the new zero-knowledge key hierarchy, and closes legacy access.
+    Migrate {
+        /// Account email
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Write the Emergency Kit to a file (PDF if the path ends in .pdf,
+        /// HTML for .html, otherwise plain text). Defaults to printing the kit.
+        #[arg(long)]
+        kit_out: Option<PathBuf>,
+    },
+
     /// Review and resolve sync conflicts (note/review edits that collided across devices)
     Conflicts {
         #[command(subcommand)]
@@ -4140,6 +4154,85 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 }
                 OutputFormat::Table => {
                     eprintln!("Snapshot uploaded, {} ops pruned", result.ops_pruned);
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Migrate { email, kit_out } => {
+            let sync_config = require_sync(&config)?;
+            let server = sync_config.server.clone();
+            eprintln!(
+                "Migrating this device from the legacy relay model to an account on {server}."
+            );
+            eprintln!(
+                "A new Secret Key and account password protect all server data going forward;"
+            );
+            eprintln!("legacy single-passphrase access is closed once this completes.");
+
+            let email = match email {
+                Some(e) => e,
+                None => prompt_line("Account email: ")?,
+            };
+            eprintln!("Choose an account password. It is never sent to the server.");
+            let password = read_new_password()?;
+            let secret_key = toku_core::SecretKey::generate()
+                .map_err(|e| anyhow::anyhow!("failed to generate Secret Key: {e}"))?;
+
+            eprintln!("Re-protecting server data under the new key hierarchy...");
+            let outcome = sync::orchestrator::migrate(data_dir, &email, &password, &secret_key)?;
+
+            let kit = toku_core::EmergencyKit::new(
+                outcome.email.clone(),
+                Some(outcome.server.clone()),
+                outcome.secret_key.clone(),
+            );
+            render_emergency_kit(&kit, kit_out.as_deref())?;
+
+            let _ = &token_store;
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "user_id": outcome.user_id,
+                            "email": outcome.email,
+                            "role": outcome.role,
+                            "server": outcome.server,
+                            "library_id": outcome.library_id,
+                            "device_id": outcome.device_id,
+                            "adopted_libraries": outcome.adopted_libraries,
+                            "adopted_devices": outcome.adopted_devices,
+                            "ops_reencrypted": outcome.ops_reencrypted,
+                            "ops_replaced": outcome.ops_replaced,
+                            "had_encryption": outcome.had_encryption,
+                            "secret_key": outcome.secret_key,
+                        }))?
+                    );
+                }
+                _ => {
+                    eprintln!();
+                    eprintln!("Migration complete on {}", outcome.server);
+                    eprintln!("  Email:    {} ({})", outcome.email, outcome.role);
+                    eprintln!("  Library:  {}", outcome.library_id);
+                    eprintln!(
+                        "  Adopted:  {} libraries, {} devices",
+                        outcome.adopted_libraries, outcome.adopted_devices
+                    );
+                    eprintln!(
+                        "  Re-keyed: {} ops ({})",
+                        outcome.ops_replaced,
+                        if outcome.had_encryption {
+                            "from single passphrase"
+                        } else {
+                            "from plaintext"
+                        }
+                    );
+                    eprintln!();
+                    eprintln!("⚠  Your Secret Key is shown only once:");
+                    eprintln!("     {}", outcome.secret_key);
+                    eprintln!("   Store the Emergency Kit offline. It cannot be recovered.");
+                    eprintln!("   Other devices must run `toku sync enroll` to rejoin.");
                 }
             }
             Ok(())

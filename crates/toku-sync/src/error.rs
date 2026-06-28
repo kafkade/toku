@@ -35,6 +35,9 @@ pub enum SyncError {
     #[error("account locked until {until}")]
     AccountLocked { until: String },
 
+    #[error("client too old: minimum sync protocol is {min}; upgrade Toku to continue")]
+    UpgradeRequired { min: i64 },
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -52,6 +55,7 @@ impl IntoResponse for SyncError {
             SyncError::Conflict(_) => StatusCode::CONFLICT,
             SyncError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             SyncError::AccountLocked { .. } => StatusCode::from_u16(423).unwrap(),
+            SyncError::UpgradeRequired { .. } => StatusCode::UPGRADE_REQUIRED,
             SyncError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = ErrorBody {

@@ -11,6 +11,7 @@ pub mod db;
 pub mod error;
 pub mod handlers;
 pub mod models;
+pub mod protocol;
 
 use std::path::PathBuf;
 
@@ -80,9 +81,8 @@ pub fn build_router(db_path: PathBuf) -> Router {
             auth::require_user_auth,
         ));
 
-    // Public routes (unauthenticated)
-    Router::new()
-        .route("/health", get(handlers::health))
+    // Everything except /health is gated on protocol version (#126).
+    let gated = Router::new()
         // Legacy passwordless registration
         .route("/api/v1/register", post(handlers::register))
         // SRP-6a authentication endpoints
@@ -95,6 +95,16 @@ pub fn build_router(db_path: PathBuf) -> Router {
         .route("/api/v1/account/verify", post(auth::account_verify))
         .merge(authenticated)
         .merge(user_authenticated)
+        .layer(middleware::from_fn_with_state(
+            db_path.clone(),
+            protocol::require_protocol,
+        ));
+
+    // Public routes (unauthenticated). Health stays ungated so clients can probe
+    // protocol versions before being turned away.
+    Router::new()
+        .route("/health", get(handlers::health))
+        .merge(gated)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB (rekey may be large)
         .layer(TraceLayer::new_for_http())
         .with_state(db_path)

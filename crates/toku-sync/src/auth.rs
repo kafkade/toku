@@ -872,12 +872,42 @@ pub async fn account_signup(
                 ],
             )?;
 
+            // First admin bootstrap: adopt any orphan relay libraries/devices
+            // (registered under the old unauthenticated model, user_id IS NULL)
+            // and close the door on pre-account clients by bumping the minimum
+            // protocol. This is the server side of `toku sync migrate` (#126).
+            let mut adopted_libraries = 0i64;
+            let mut adopted_devices = 0i64;
+            if role == "admin" {
+                adopted_libraries = tx_guard.execute(
+                    "UPDATE libraries SET user_id = ?1 WHERE user_id IS NULL",
+                    [&user_id],
+                )? as i64;
+                adopted_devices = tx_guard.execute(
+                    "UPDATE devices SET user_id = ?1 WHERE user_id IS NULL",
+                    [&user_id],
+                )? as i64;
+                // Only lock out legacy clients when this was a real migration
+                // (orphan relay data existed). A clean account-model bootstrap
+                // leaves min_protocol untouched.
+                if adopted_libraries > 0 || adopted_devices > 0 {
+                    tx_guard.execute(
+                        "UPDATE instance_config
+                         SET min_protocol = MAX(min_protocol, 2), updated_at = datetime('now')
+                         WHERE id = 1",
+                        [],
+                    )?;
+                }
+            }
+
             tx_guard.commit()?;
 
             Ok(SignupResponse {
                 user_id,
                 email,
                 role: role.to_string(),
+                adopted_libraries,
+                adopted_devices,
             })
         }
     })

@@ -19,9 +19,9 @@ pub use client::{
     SrpVerifyResponse, SyncClient, WireOp,
 };
 pub use orchestrator::{
-    BootstrapOutcome, EnrollOutcome, InitOutcome, LoginOutcome, PullOutcome, PushOutcome,
-    SignupOutcome, StatusOutcome, account_devices, bootstrap, conflict, conflicts,
-    default_device_name, devices, enroll, init, login, pull, push, resolve_all_conflicts,
+    BootstrapOutcome, EnrollOutcome, InitOutcome, LoginOutcome, MigrateOutcome, PullOutcome,
+    PushOutcome, SignupOutcome, StatusOutcome, account_devices, bootstrap, conflict, conflicts,
+    default_device_name, devices, enroll, init, login, migrate, pull, push, resolve_all_conflicts,
     resolve_conflict, signup, status,
 };
 pub use token_store::TokenStore;

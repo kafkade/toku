@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- One-time `toku sync migrate` upgrade path from the legacy relay model to the account
+  model (#126): generates a Secret Key + account, makes the first account the admin and
+  adopts all pre-existing relay libraries/devices, re-keys every server op and snapshot from
+  the single passphrase (or plaintext) into zero-knowledge ciphertext under the new key
+  hierarchy, and renders an Emergency Kit. A migration guide and breaking-change notice were
+  added to `docs/sync-server.md`
+- Sync wire-protocol versioning: `GET /health` now reports `protocol_version` and
+  `min_protocol`; clients send an `X-Toku-Sync-Protocol` header and a migrated server rejects
+  pre-account clients with HTTP 426 (Upgrade Required)
 - Expanded self-hosting documentation for the `toku-sync` relay server: a new
   **First-run onboarding & admin** section (the first account bootstraps as admin,
   opening/closing self-registration, the optional device-approval gate) and an

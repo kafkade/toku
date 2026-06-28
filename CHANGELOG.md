@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Expanded self-hosting documentation for the `toku-sync` relay server: a new
+  **First-run onboarding & admin** section (the first account bootstraps as admin,
+  opening/closing self-registration, the optional device-approval gate) and an
+  **Upgrading** section (pulling a new image while the `/data` volume preserves all
+  state, with backup and tag-pinning guidance) in `docs/sync-server.md`
+- New `docs/self-hosting.md` entry-point that summarizes the self-host story and links to
+  the full deployment guide
+
 ## [0.3.2] - 2026-06-28
 
 ### Fixed

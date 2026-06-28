@@ -566,7 +566,7 @@ enum ExportTarget {
 
 #[derive(Clone, Subcommand)]
 enum SyncAction {
-    /// Set up sync for the first time
+    /// [Deprecated] Set up sync with a per-library passphrase. Prefer `signup`/`login`.
     Init {
         /// Sync server URL (default: http://localhost:8080)
         #[arg(long, default_value = "http://localhost:8080")]
@@ -585,6 +585,56 @@ enum SyncAction {
         /// compatibility and has no effect.
         #[arg(long, hide = true)]
         passphrase: bool,
+    },
+
+    /// Create an account on a sync server (generates your Secret Key + Emergency Kit)
+    Signup {
+        /// Sync server URL (default: http://localhost:8080)
+        #[arg(long, default_value = "http://localhost:8080")]
+        server: String,
+
+        /// Account email
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Name for this device (defaults to hostname)
+        #[arg(long)]
+        device_name: Option<String>,
+
+        /// Write the Emergency Kit to a file (PDF if the path ends in .pdf,
+        /// HTML for .html, otherwise plain text). Defaults to printing the kit.
+        #[arg(long)]
+        kit_out: Option<PathBuf>,
+    },
+
+    /// Log in to your account on this (already-enrolled) device
+    Login {
+        /// Sync server URL (default: http://localhost:8080)
+        #[arg(long, default_value = "http://localhost:8080")]
+        server: String,
+
+        /// Account email
+        #[arg(long)]
+        email: Option<String>,
+    },
+
+    /// Enroll this new device into an existing account (password + Secret Key)
+    Enroll {
+        /// Sync server URL (default: http://localhost:8080)
+        #[arg(long, default_value = "http://localhost:8080")]
+        server: String,
+
+        /// Account email
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Existing library ID to join (omit to create a fresh library)
+        #[arg(long)]
+        library_id: Option<String>,
+
+        /// Name for this device (defaults to hostname)
+        #[arg(long)]
+        device_name: Option<String>,
     },
 
     /// Show sync status
@@ -3179,6 +3229,59 @@ fn prompt_line(prompt: &str) -> Result<String> {
     Ok(buf.trim().to_string())
 }
 
+/// Read a secret without echoing it, keeping it out of shell history/argv.
+fn read_password_prompt(prompt: &str) -> Result<String> {
+    eprint!("{prompt}");
+    rpassword::read_password().context("failed to read password")
+}
+
+/// Read a new password twice (with confirmation), rejecting empties/mismatches.
+fn read_new_password() -> Result<String> {
+    let password = read_password_prompt("Account password: ")?;
+    if password.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+    let confirm = read_password_prompt("Confirm password: ")?;
+    if password != confirm {
+        anyhow::bail!("passwords do not match");
+    }
+    Ok(password)
+}
+
+/// Read and validate a Secret Key without echoing it.
+fn read_secret_key() -> Result<toku_core::SecretKey> {
+    let raw = read_password_prompt("Secret Key: ")?;
+    toku_core::SecretKey::parse(&raw).map_err(|e| anyhow::anyhow!("invalid Secret Key: {e}"))
+}
+
+/// Render an Emergency Kit, choosing the format from the output path's extension
+/// (`.pdf`/`.html`, else text). With no path the plain-text kit is printed.
+fn render_emergency_kit(kit: &toku_core::EmergencyKit, out: Option<&Path>) -> Result<()> {
+    match out {
+        None => {
+            eprintln!();
+            eprintln!("{}", kit.to_text());
+            Ok(())
+        }
+        Some(path) => {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            let bytes = match ext.as_str() {
+                "pdf" => account::render_pdf(kit)?,
+                "html" => kit.to_html().into_bytes(),
+                _ => kit.to_text().into_bytes(),
+            };
+            std::fs::write(path, &bytes)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            eprintln!("Emergency Kit written to {}", path.display());
+            Ok(())
+        }
+    }
+}
+
 fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3214,6 +3317,12 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
             // (zero-knowledge, issue #121): always prompt for a passphrase.
             // The legacy `--passphrase` flag is accepted but no longer required.
             let _ = passphrase;
+            eprintln!(
+                "note: `toku sync init` is deprecated. Prefer `toku sync signup` (new account)"
+            );
+            eprintln!(
+                "      or `toku sync login` / `toku sync enroll` (account + Secret Key auth)."
+            );
             eprintln!(
                 "Hosted sync uses zero-knowledge encryption. Choose a passphrase to protect your library."
             );
@@ -3277,6 +3386,168 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                             "disabled"
                         }
                     );
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Signup {
+            server,
+            email,
+            device_name,
+            kit_out,
+        } => {
+            let email = match email {
+                Some(e) => e,
+                None => prompt_line("Account email: ")?,
+            };
+
+            eprintln!("Choose an account password. It is never sent to the server.");
+            let password = read_new_password()?;
+
+            // Generate the high-entropy Secret Key on this device.
+            let secret_key = toku_core::SecretKey::generate()
+                .map_err(|e| anyhow::anyhow!("failed to generate Secret Key: {e}"))?;
+
+            let outcome = sync::orchestrator::signup(
+                data_dir,
+                &server,
+                &email,
+                &password,
+                &secret_key,
+                device_name,
+            )?;
+
+            // Render the Emergency Kit exactly once.
+            let kit = toku_core::EmergencyKit::new(
+                outcome.email.clone(),
+                Some(outcome.server.clone()),
+                outcome.secret_key.clone(),
+            );
+            render_emergency_kit(&kit, kit_out.as_deref())?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "user_id": outcome.user_id,
+                            "email": outcome.email,
+                            "role": outcome.role,
+                            "device_id": outcome.device_id,
+                            "library_id": outcome.library_id,
+                            "device_name": outcome.device_name,
+                            "server": outcome.server,
+                            "device_status": outcome.device_status,
+                            "secret_key": outcome.secret_key,
+                        }))?
+                    );
+                }
+                _ => {
+                    eprintln!();
+                    eprintln!("Account created on {}", outcome.server);
+                    eprintln!("  Email:   {}", outcome.email);
+                    eprintln!("  Role:    {}", outcome.role);
+                    eprintln!(
+                        "  Device:  {} ({}, {})",
+                        outcome.device_name, outcome.device_id, outcome.device_status
+                    );
+                    eprintln!("  Library: {}", outcome.library_id);
+                    eprintln!();
+                    eprintln!("⚠  Your Secret Key is shown only once:");
+                    eprintln!("     {}", outcome.secret_key);
+                    eprintln!("   Store the Emergency Kit offline. It cannot be recovered.");
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Login { server, email } => {
+            let email = match email {
+                Some(e) => e,
+                None => prompt_line("Account email: ")?,
+            };
+            let password = read_password_prompt("Account password: ")?;
+            let secret_key = read_secret_key()?;
+
+            let outcome =
+                sync::orchestrator::login(data_dir, &server, &email, &password, &secret_key)?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "user_id": outcome.user_id,
+                            "email": outcome.email,
+                            "role": outcome.role,
+                            "server": outcome.server,
+                            "data_key_unlocked": outcome.data_key_unlocked,
+                        }))?
+                    );
+                }
+                _ => {
+                    eprintln!("Logged in to {} as {}", outcome.server, outcome.email);
+                    if !outcome.data_key_unlocked {
+                        eprintln!(
+                            "note: the encryption key was not unlocked (the server's account-keys \
+                             endpoint is unavailable). Sync of encrypted data may not work yet."
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Enroll {
+            server,
+            email,
+            library_id,
+            device_name,
+        } => {
+            let email = match email {
+                Some(e) => e,
+                None => prompt_line("Account email: ")?,
+            };
+            let password = read_password_prompt("Account password: ")?;
+            let secret_key = read_secret_key()?;
+
+            let outcome = sync::orchestrator::enroll(
+                data_dir,
+                &server,
+                &email,
+                &password,
+                &secret_key,
+                device_name,
+                library_id,
+            )?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "user_id": outcome.user_id,
+                            "email": outcome.email,
+                            "device_id": outcome.device_id,
+                            "library_id": outcome.library_id,
+                            "device_name": outcome.device_name,
+                            "server": outcome.server,
+                            "device_status": outcome.device_status,
+                        }))?
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "Enrolled device {} ({}) into library {}",
+                        outcome.device_name, outcome.device_id, outcome.library_id
+                    );
+                    if outcome.device_status == "pending" {
+                        eprintln!(
+                            "This device is pending approval by an existing trusted device. \
+                             Once approved, run `toku sync login` to activate it."
+                        );
+                    }
                 }
             }
             Ok(())
@@ -3432,6 +3703,69 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
         }
 
         SyncAction::Devices => {
+            // Prefer the authenticated, user-scoped listing when logged in;
+            // fall back to the library-scoped device list otherwise.
+            let user_session = config.sync.as_ref().and_then(|sc| {
+                token_store
+                    .load_user_session(&sc.server)
+                    .ok()
+                    .flatten()
+                    .map(|t| (sc.server.clone(), t))
+            });
+
+            if let Some((server, _)) = user_session {
+                let devices = sync::orchestrator::account_devices(data_dir, &server)?;
+                match output_format {
+                    OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&devices)?),
+                    OutputFormat::Csv => {
+                        println!("device_id,device_name,status,library_id,last_seen,created_at");
+                        for d in &devices {
+                            println!(
+                                "{},{},{},{},{},{}",
+                                d.device_id,
+                                d.device_name,
+                                d.status,
+                                d.library_id,
+                                d.last_seen.as_deref().unwrap_or(""),
+                                d.created_at
+                            );
+                        }
+                    }
+                    OutputFormat::Table => {
+                        if devices.is_empty() {
+                            eprintln!("No devices registered.");
+                            return Ok(());
+                        }
+                        use tabled::{Table, Tabled};
+                        #[derive(Tabled)]
+                        struct Row {
+                            #[tabled(rename = "Device ID")]
+                            id: String,
+                            #[tabled(rename = "Name")]
+                            name: String,
+                            #[tabled(rename = "Status")]
+                            status: String,
+                            #[tabled(rename = "Last Seen")]
+                            last_seen: String,
+                            #[tabled(rename = "Registered")]
+                            created: String,
+                        }
+                        let rows: Vec<Row> = devices
+                            .iter()
+                            .map(|d| Row {
+                                id: d.device_id.clone(),
+                                name: d.device_name.clone(),
+                                status: d.status.clone(),
+                                last_seen: d.last_seen.clone().unwrap_or_else(|| "n/a".into()),
+                                created: d.created_at.clone(),
+                            })
+                            .collect();
+                        println!("{}", Table::new(rows));
+                    }
+                }
+                return Ok(());
+            }
+
             let devices = sync::orchestrator::devices(data_dir)?;
 
             match output_format {
@@ -3512,6 +3846,7 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
             let server = &sync_config.server;
             let _ = token_store.delete(server);
             let _ = token_store.delete_sync_key(server);
+            let _ = token_store.delete_user_session(server);
 
             let mut config = config;
             config.sync = None;

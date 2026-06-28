@@ -52,6 +52,92 @@ pub struct DeviceInfo {
     pub created_at: String,
 }
 
+// ── Account (1Password-style) auth DTOs ──────────────────────────────────────
+
+/// Response from `POST /api/v1/account/signup`.
+#[derive(Debug, Deserialize)]
+pub struct SignupResult {
+    pub user_id: String,
+    pub email: String,
+    pub role: String,
+}
+
+/// Response from `POST /api/v1/account/challenge`.
+#[derive(Debug, Deserialize)]
+pub struct AccountChallengeResult {
+    pub challenge_id: String,
+    /// Hex-encoded server public ephemeral B.
+    pub server_public_b: String,
+    /// Hex-encoded SRP salt stored at signup.
+    pub srp_salt: String,
+}
+
+/// Response from `POST /api/v1/account/verify` — a user-session token.
+#[derive(Debug, Deserialize)]
+pub struct AccountVerifyResult {
+    pub session_token: String,
+    /// Hex-encoded server proof M2 — the client MUST verify this.
+    pub server_proof_m2: String,
+    pub expires_at: String,
+    pub user_id: String,
+    pub role: String,
+}
+
+/// Response from `POST /api/v1/devices/enroll`.
+#[derive(Debug, Deserialize)]
+pub struct EnrollDeviceResult {
+    pub device_id: String,
+    pub library_id: String,
+    /// `"active"` (ready to sync) or `"pending"` (awaiting approval).
+    pub status: String,
+    pub session_token: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// Response from `POST /api/v1/devices/{id}/session`.
+#[derive(Debug, Deserialize)]
+pub struct DeviceSessionResult {
+    pub device_id: String,
+    pub library_id: String,
+    pub session_token: String,
+    pub expires_at: String,
+}
+
+/// A device as exposed to its owning account (`GET /api/v1/account/devices`).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AccountDeviceInfo {
+    pub device_id: String,
+    pub library_id: String,
+    pub device_name: String,
+    pub status: String,
+    pub last_seen: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountDeviceListBody {
+    devices: Vec<AccountDeviceInfo>,
+}
+
+/// The account key bundle returned by `GET /api/v1/account/keys`.
+///
+/// **Contract is owned by issue #143** (persist `wrapped_data_key` + expose this
+/// endpoint). Until that lands the endpoint does not exist server-side and these
+/// calls will fail at runtime; the field names below are this client's assumed
+/// contract and must be reconciled with #143 when it is finalized. Each field is
+/// an opaque string the client deserializes back into the `toku_core` key types.
+#[derive(Debug, Deserialize)]
+pub struct AccountKeyBundle {
+    /// JSON-serialized `toku_core::AccountKdfParams`.
+    pub kdf_params: String,
+    /// Base64 account X25519 public key (`AccountKeys::public_key`).
+    pub account_public_key: String,
+    /// JSON-serialized `toku_core::WrappedAccountPrivateKey`.
+    pub wrapped_private_key: String,
+    /// JSON-serialized `toku_core::WrappedDataKey`.
+    pub wrapped_data_key: String,
+}
+
 /// Wire format for a sync op (matches server's OpPayload).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireOp {
@@ -247,6 +333,216 @@ impl SyncClient {
         }
 
         Ok(resp.json().await?)
+    }
+
+    // ── Account (1Password-style) auth ───────────────────────────────────────
+
+    /// Create an account on the server (`POST /api/v1/account/signup`).
+    ///
+    /// The SRP identity is the account `email`; only the verifier + salt are
+    /// uploaded, so the server never sees the password. The wrapped key material
+    /// is opaque to the server (zero-knowledge): it stores the strings as-is.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn account_signup(
+        &self,
+        email: &str,
+        srp_salt_hex: &str,
+        srp_verifier_hex: &str,
+        wrapped_private_key: &str,
+        account_public_key: &str,
+        kdf_params: &str,
+        wrapped_data_key: &str,
+    ) -> anyhow::Result<SignupResult> {
+        let url = format!("{}/api/v1/account/signup", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "email": email,
+                "srp_salt": srp_salt_hex,
+                "srp_verifier": srp_verifier_hex,
+                "wrapped_private_key": wrapped_private_key,
+                "account_public_key": account_public_key,
+                "kdf_params": kdf_params,
+                // Owned by issue #143; harmless extra field on older servers.
+                "wrapped_data_key": wrapped_data_key,
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Start an account SRP login (`POST /api/v1/account/challenge`).
+    pub async fn account_challenge(
+        &self,
+        email: &str,
+        client_public_a_hex: &str,
+    ) -> anyhow::Result<AccountChallengeResult> {
+        let url = format!("{}/api/v1/account/challenge", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "email": email,
+                "client_public_a": client_public_a_hex,
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Complete an account SRP login (`POST /api/v1/account/verify`). The caller
+    /// MUST verify the returned `server_proof_m2` before trusting the token.
+    pub async fn account_verify(
+        &self,
+        challenge_id: &str,
+        client_proof_m1_hex: &str,
+    ) -> anyhow::Result<AccountVerifyResult> {
+        let url = format!("{}/api/v1/account/verify", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "challenge_id": challenge_id,
+                "client_proof_m1": client_proof_m1_hex,
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Fetch the authenticated user's wrapped key bundle
+    /// (`GET /api/v1/account/keys`). **Endpoint owned by issue #143.**
+    pub async fn account_keys(&self, session_token: &str) -> anyhow::Result<AccountKeyBundle> {
+        let url = format!("{}/api/v1/account/keys", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(session_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Enroll a device under the authenticated user (`POST /api/v1/devices/enroll`).
+    /// Requires a user-session bearer token (from the account SRP flow).
+    pub async fn enroll_device(
+        &self,
+        session_token: &str,
+        library_id: Option<&str>,
+        device_name: &str,
+        encryption_salt_b64: Option<&str>,
+        device_public_key: Option<&str>,
+    ) -> anyhow::Result<EnrollDeviceResult> {
+        let url = format!("{}/api/v1/devices/enroll", self.base_url);
+        let mut body = serde_json::json!({ "device_name": device_name });
+        if let Some(lib) = library_id {
+            body["library_id"] = serde_json::Value::String(lib.to_string());
+        }
+        if let Some(salt) = encryption_salt_b64 {
+            body["encryption_salt"] = serde_json::Value::String(salt.to_string());
+        }
+        if let Some(pk) = device_public_key {
+            body["device_public_key"] = serde_json::Value::String(pk.to_string());
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(session_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Mint a fresh device-session token for an already-enrolled, active device
+    /// (`POST /api/v1/devices/{id}/session`). Requires a user-session bearer.
+    pub async fn create_device_session(
+        &self,
+        session_token: &str,
+        device_id: &str,
+    ) -> anyhow::Result<DeviceSessionResult> {
+        let url = format!("{}/api/v1/devices/{device_id}/session", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(session_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// List the authenticated user's devices (`GET /api/v1/account/devices`).
+    pub async fn list_account_devices(
+        &self,
+        session_token: &str,
+    ) -> anyhow::Result<Vec<AccountDeviceInfo>> {
+        let url = format!("{}/api/v1/account/devices", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(session_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        let body: AccountDeviceListBody = resp.json().await?;
+        Ok(body.devices)
+    }
+
+    /// Deregister one of the authenticated user's devices
+    /// (`DELETE /api/v1/account/devices/{id}`).
+    pub async fn delete_account_device(
+        &self,
+        session_token: &str,
+        device_id: &str,
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/api/v1/account/devices/{device_id}", self.base_url);
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(session_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(extract_error(resp).await);
+        }
+
+        Ok(())
     }
 
     // ── Devices ──────────────────────────────────────────────────────────────

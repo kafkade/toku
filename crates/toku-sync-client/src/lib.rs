@@ -15,11 +15,13 @@ pub mod token_store;
 pub mod wire;
 
 pub use client::{
-    DeviceInfo, EnrollResponse, SrpChallengeResponse, SrpVerifyResponse, SyncClient, WireOp,
+    AccountDeviceInfo, AccountKeyBundle, DeviceInfo, EnrollResponse, SrpChallengeResponse,
+    SrpVerifyResponse, SyncClient, WireOp,
 };
 pub use orchestrator::{
-    BootstrapOutcome, InitOutcome, PullOutcome, PushOutcome, StatusOutcome, bootstrap, conflict,
-    conflicts, default_device_name, devices, init, pull, push, resolve_all_conflicts,
-    resolve_conflict, status,
+    BootstrapOutcome, EnrollOutcome, InitOutcome, LoginOutcome, PullOutcome, PushOutcome,
+    SignupOutcome, StatusOutcome, account_devices, bootstrap, conflict, conflicts,
+    default_device_name, devices, enroll, init, login, pull, push, resolve_all_conflicts,
+    resolve_conflict, signup, status,
 };
 pub use token_store::TokenStore;

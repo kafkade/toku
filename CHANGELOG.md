@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Account-based sync CLI: `toku sync signup`, `toku sync login`, and
+  `toku sync enroll` bring the 1Password-style two-secret flow to the command
+  line. `signup` creates an account, generates the device Secret Key, renders the
+  Emergency Kit once (printed, or written with `--kit-out` as `.pdf`/`.html`/text),
+  and enrolls the first device as admin in one step. `login` re-authenticates an
+  already-enrolled device; `enroll` joins an existing account from a new device,
+  recovering the shared library data key the zero-knowledge way (SRP login → fetch
+  the wrapped key bundle → unwrap the same `SyncKey` locally). The account password
+  and Secret Key are read with non-echoing prompts and never appear in argv or
+  shell history, and the Secret Key is never written to disk. `toku sync devices`
+  now lists your account's devices across the account when you are logged in
+- Account-aware `toku-sync-client`: account signup/challenge/verify, device
+  enrollment, account-scoped device listing/removal, and account key-bundle
+  retrieval, with a separate account (user) session stored alongside the
+  per-device sync token
+
 - Account **Secret Key** + **Emergency Kit** for zero-knowledge sync (1Password-style
   two-secret model). A high-entropy 128-bit Secret Key is generated on-device, formatted
   for transcription with a `TK` version prefix and a checksum that catches typos
@@ -176,6 +192,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `toku sync push`, `pull`, `devices`, `rekey`, and `compact` no longer require `--server` flag — server URL is read from sync config
 - `toku sync logout` replaced by `toku sync disable` which also clears sync config
 - iOS and iPad app now displays as `toku` (lowercase) on the home screen
+
+### Deprecated
+
+- `toku sync init` and its `--passphrase` flag are deprecated in favor of
+  `toku sync signup` (new account) and `toku sync login` / `toku sync enroll`
+  (account + Secret Key auth). `init` still works and prints a notice pointing to
+  the account commands
 
 ### Removed
 

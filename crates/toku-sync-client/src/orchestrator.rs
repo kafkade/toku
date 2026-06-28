@@ -82,6 +82,48 @@ pub struct BootstrapOutcome {
     pub applied: usize,
 }
 
+/// Outcome of [`signup`].
+#[derive(Debug, Clone, Serialize)]
+pub struct SignupOutcome {
+    pub user_id: String,
+    pub email: String,
+    pub role: String,
+    pub device_id: String,
+    pub library_id: String,
+    pub device_name: String,
+    pub server: String,
+    /// Device enrollment status (`active` or `pending`).
+    pub device_status: String,
+    /// The formatted Secret Key — surfaced **once** so the caller can render an
+    /// Emergency Kit. Never persisted to disk by the orchestrator.
+    pub secret_key: String,
+}
+
+/// Outcome of [`login`].
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginOutcome {
+    pub user_id: String,
+    pub email: String,
+    pub role: String,
+    pub server: String,
+    /// Whether the leaf data key was unwrapped and stored (requires the #143
+    /// `GET /api/v1/account/keys` endpoint).
+    pub data_key_unlocked: bool,
+}
+
+/// Outcome of [`enroll`].
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrollOutcome {
+    pub user_id: String,
+    pub email: String,
+    pub device_id: String,
+    pub library_id: String,
+    pub device_name: String,
+    pub server: String,
+    /// `active` (synced immediately) or `pending` (awaiting approval).
+    pub device_status: String,
+}
+
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -602,4 +644,357 @@ pub fn default_device_name() -> String {
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-device".to_string())
+}
+
+// ── Account (1Password-style) auth flows (issue #123) ────────────────────────
+
+/// Perform an account SRP-6a login and return the verified session result.
+///
+/// The SRP identity is the account `email`; the password never leaves this
+/// machine. The server proof `M2` is verified before the session token is
+/// trusted. A wrong password surfaces here as an authentication error with no
+/// server-side disclosure of which secret was wrong.
+fn account_srp_login(
+    rt: &tokio::runtime::Runtime,
+    client: &SyncClient,
+    email: &str,
+    password: &str,
+) -> anyhow::Result<crate::client::AccountVerifyResult> {
+    use rand::RngExt;
+    use sha2::Sha256;
+    use srp::ClientG2048;
+
+    let srp_client = ClientG2048::<Sha256>::new();
+
+    let mut a = [0u8; 48];
+    rand::rng().fill(&mut a);
+    let a_pub_hex = hex::encode(srp_client.compute_public_ephemeral(&a));
+
+    let challenge = rt.block_on(client.account_challenge(email, &a_pub_hex))?;
+
+    let b_pub_bytes = hex::decode(&challenge.server_public_b)
+        .context("server returned invalid hex for server_public_b")?;
+    let srp_salt_bytes =
+        hex::decode(&challenge.srp_salt).context("server returned invalid hex for srp_salt")?;
+
+    let client_verifier = srp_client
+        .process_reply(
+            &a,
+            email.as_bytes(),
+            password.as_bytes(),
+            &srp_salt_bytes,
+            &b_pub_bytes,
+        )
+        .map_err(|_| anyhow::anyhow!("incorrect email or password"))?;
+
+    let m1_hex = hex::encode(client_verifier.proof());
+    let verify = rt.block_on(client.account_verify(&challenge.challenge_id, &m1_hex))?;
+
+    let m2_bytes = hex::decode(&verify.server_proof_m2)
+        .context("server returned invalid hex for server_proof_m2")?;
+    client_verifier
+        .verify_server(&m2_bytes)
+        .map_err(|_| anyhow::anyhow!("server identity could not be verified (SRP M2 mismatch)"))?;
+
+    Ok(verify)
+}
+
+/// Record an enrolled device + sync config locally and store the data key.
+#[allow(clippy::too_many_arguments)]
+fn finalize_device(
+    data_dir: &Path,
+    token_store: &TokenStore,
+    server: &str,
+    device_id: &str,
+    library_id: &str,
+    device_name: &str,
+    device_session: Option<&str>,
+    data_key: &SyncKey,
+) -> anyhow::Result<()> {
+    if let Some(token) = device_session {
+        // The device-session token is the primary credential for push/pull.
+        token_store
+            .store(server, token)
+            .context("failed to store device session token")?;
+    }
+    token_store
+        .store_sync_key(server, data_key.as_exported_bytes())
+        .context("failed to store sync key")?;
+
+    let db = open_db(data_dir)?;
+    let sync_repo = SyncRepository::new(&db);
+    let server_device_id = device_id
+        .parse::<uuid::Uuid>()
+        .context("server returned an invalid device_id")?;
+    sync_repo.get_or_create_device_with_id(server_device_id, device_name)?;
+
+    let mut config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
+    config.sync = Some(toku_core::SyncConfig {
+        server: server.to_string(),
+        library_id: library_id.to_string(),
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+        encryption: true,
+    });
+    config
+        .save(data_dir)
+        .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
+    Ok(())
+}
+
+/// Reconstruct the account key hierarchy from a server key bundle and unwrap the
+/// leaf data key with the password + Secret Key.
+///
+/// A failure here (after a successful SRP login) means the Secret Key — or the
+/// password used for the key hierarchy — was wrong. The error is deliberately
+/// non-specific about which secret failed.
+fn unlock_data_key_from_bundle(
+    bundle: &crate::client::AccountKeyBundle,
+    password: &str,
+    secret_key: &toku_core::SecretKey,
+) -> anyhow::Result<SyncKey> {
+    let kdf: toku_core::AccountKdfParams =
+        serde_json::from_str(&bundle.kdf_params).context("invalid kdf_params in key bundle")?;
+    let wrapped_private_key: toku_core::WrappedAccountPrivateKey =
+        serde_json::from_str(&bundle.wrapped_private_key)
+            .context("invalid wrapped_private_key in key bundle")?;
+    let wrapped_data_key: toku_core::WrappedDataKey =
+        serde_json::from_str(&bundle.wrapped_data_key)
+            .context("invalid wrapped_data_key in key bundle")?;
+
+    let account_keys = toku_core::AccountKeys {
+        version: 1,
+        kdf,
+        public_key: bundle.account_public_key.clone(),
+        wrapped_private_key,
+        wrapped_data_key,
+    };
+
+    account_keys
+        .unlock_data_key(password, secret_key.as_bytes())
+        .map_err(|_| anyhow::anyhow!("incorrect password or Secret Key"))
+}
+
+/// Create an account on `server`, build the key hierarchy, enroll this device,
+/// and persist session + key material. Returns the formatted Secret Key so the
+/// caller can render the Emergency Kit exactly once.
+pub fn signup(
+    data_dir: &Path,
+    server: &str,
+    email: &str,
+    password: &str,
+    secret_key: &toku_core::SecretKey,
+    device_name: Option<String>,
+) -> anyhow::Result<SignupOutcome> {
+    use rand::RngExt;
+    use sha2::Sha256;
+    use srp::ClientG2048;
+
+    if password.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+
+    let rt = build_runtime()?;
+    let token_store = TokenStore::new(data_dir);
+    let client = SyncClient::new(server)?;
+    let device_name = device_name.unwrap_or_else(default_device_name);
+
+    // ── Build the account key hierarchy (zero-knowledge) ─────────────────────
+    let (account_keys, data_key) = toku_core::AccountKeys::create(password, secret_key.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to build account keys: {e}"))?;
+
+    let kdf_params =
+        serde_json::to_string(&account_keys.kdf).context("failed to serialize kdf_params")?;
+    let wrapped_private_key = serde_json::to_string(&account_keys.wrapped_private_key)
+        .context("failed to serialize wrapped_private_key")?;
+    let wrapped_data_key = serde_json::to_string(&account_keys.wrapped_data_key)
+        .context("failed to serialize wrapped_data_key")?;
+
+    // ── SRP verifier (identity = email) ──────────────────────────────────────
+    let srp_client = ClientG2048::<Sha256>::new();
+    let mut srp_salt = [0u8; 16];
+    rand::rng().fill(&mut srp_salt);
+    let srp_salt_hex = hex::encode(srp_salt);
+    let srp_verifier_hex =
+        hex::encode(srp_client.compute_verifier(email.as_bytes(), password.as_bytes(), &srp_salt));
+
+    let signup = rt.block_on(client.account_signup(
+        email,
+        &srp_salt_hex,
+        &srp_verifier_hex,
+        &wrapped_private_key,
+        &account_keys.public_key,
+        &kdf_params,
+        &wrapped_data_key,
+    ))?;
+
+    // ── Log in (user session) then enroll this device ────────────────────────
+    let verify = account_srp_login(&rt, &client, email, password)?;
+    token_store.store_user_session(server, &verify.session_token, &verify.expires_at)?;
+
+    let enroll =
+        rt.block_on(client.enroll_device(&verify.session_token, None, &device_name, None, None))?;
+
+    finalize_device(
+        data_dir,
+        &token_store,
+        server,
+        &enroll.device_id,
+        &enroll.library_id,
+        &device_name,
+        enroll.session_token.as_deref(),
+        &data_key,
+    )?;
+
+    Ok(SignupOutcome {
+        user_id: signup.user_id,
+        email: signup.email,
+        role: signup.role,
+        device_id: enroll.device_id,
+        library_id: enroll.library_id,
+        device_name,
+        server: server.to_string(),
+        device_status: enroll.status,
+        secret_key: secret_key.format(),
+    })
+}
+
+/// Log in on an already-enrolled device: refresh the user session, unwrap the
+/// leaf data key (via the #143 key bundle), and refresh this device's session.
+pub fn login(
+    data_dir: &Path,
+    server: &str,
+    email: &str,
+    password: &str,
+    secret_key: &toku_core::SecretKey,
+) -> anyhow::Result<LoginOutcome> {
+    if password.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+
+    let rt = build_runtime()?;
+    let token_store = TokenStore::new(data_dir);
+    let client = SyncClient::new(server)?;
+
+    let verify = account_srp_login(&rt, &client, email, password)?;
+    token_store.store_user_session(server, &verify.session_token, &verify.expires_at)?;
+
+    // Unwrap and store the leaf data key. Requires the #143 endpoint; when it is
+    // unavailable we still complete the login (session is valid) but report that
+    // the data key was not unlocked so the caller can warn.
+    let mut data_key_unlocked = false;
+    match rt.block_on(client.account_keys(&verify.session_token)) {
+        Ok(bundle) => {
+            let data_key = unlock_data_key_from_bundle(&bundle, password, secret_key)?;
+            token_store
+                .store_sync_key(server, data_key.as_exported_bytes())
+                .context("failed to store sync key")?;
+            data_key_unlocked = true;
+        }
+        Err(e) => {
+            // Surface a wrong-secret error, but tolerate a missing endpoint
+            // (pre-#143 servers) so login still establishes the session.
+            let msg = e.to_string();
+            if msg.contains("incorrect password or Secret Key") {
+                return Err(e);
+            }
+        }
+    }
+
+    // Refresh this device's session token if we know our device id.
+    if let Some(sync_config) = toku_core::TokuConfig::load(data_dir)
+        .unwrap_or_default()
+        .sync
+        && sync_config.server == server
+        && !sync_config.device_id.is_empty()
+        && let Ok(session) =
+            rt.block_on(client.create_device_session(&verify.session_token, &sync_config.device_id))
+    {
+        token_store.store(server, &session.session_token)?;
+    }
+
+    Ok(LoginOutcome {
+        user_id: verify.user_id,
+        email: email.to_string(),
+        role: verify.role,
+        server: server.to_string(),
+        data_key_unlocked,
+    })
+}
+
+/// Join an existing account from a new device: SRP login, unwrap the shared data
+/// key, then enroll this device (handling the optional approval flow).
+pub fn enroll(
+    data_dir: &Path,
+    server: &str,
+    email: &str,
+    password: &str,
+    secret_key: &toku_core::SecretKey,
+    device_name: Option<String>,
+    library_id: Option<String>,
+) -> anyhow::Result<EnrollOutcome> {
+    if password.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+
+    let rt = build_runtime()?;
+    let token_store = TokenStore::new(data_dir);
+    let client = SyncClient::new(server)?;
+    let device_name = device_name.unwrap_or_else(default_device_name);
+
+    let verify = account_srp_login(&rt, &client, email, password)?;
+    token_store.store_user_session(server, &verify.session_token, &verify.expires_at)?;
+
+    // Recover the shared library data key the zero-knowledge way (#143).
+    let bundle = rt
+        .block_on(client.account_keys(&verify.session_token))
+        .context("could not fetch account key bundle (requires the #143 account-keys endpoint)")?;
+    let data_key = unlock_data_key_from_bundle(&bundle, password, secret_key)?;
+
+    let enroll = rt.block_on(client.enroll_device(
+        &verify.session_token,
+        library_id.as_deref(),
+        &device_name,
+        None,
+        None,
+    ))?;
+
+    // `pending` devices have no session token until an existing device approves
+    // them; we still record the device + key material so a later `login` (which
+    // mints the session via create_device_session) just works.
+    finalize_device(
+        data_dir,
+        &token_store,
+        server,
+        &enroll.device_id,
+        &enroll.library_id,
+        &device_name,
+        enroll.session_token.as_deref(),
+        &data_key,
+    )?;
+
+    Ok(EnrollOutcome {
+        user_id: verify.user_id,
+        email: email.to_string(),
+        device_id: enroll.device_id,
+        library_id: enroll.library_id,
+        device_name,
+        server: server.to_string(),
+        device_status: enroll.status,
+    })
+}
+
+/// List the authenticated user's devices (user-scoped). Requires a stored user
+/// session (from `signup`/`login`/`enroll`).
+pub fn account_devices(
+    data_dir: &Path,
+    server: &str,
+) -> anyhow::Result<Vec<crate::client::AccountDeviceInfo>> {
+    let rt = build_runtime()?;
+    let token_store = TokenStore::new(data_dir);
+    let client = SyncClient::new(server)?;
+    let session = token_store.load_user_session(server)?.ok_or_else(|| {
+        anyhow::anyhow!("not logged in to {server}. Run `toku sync login` first.")
+    })?;
+    rt.block_on(client.list_account_devices(&session))
 }

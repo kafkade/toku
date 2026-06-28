@@ -70,6 +70,7 @@ pub struct TokenStore {
 
 const KEYRING_SERVICE: &str = "toku-sync";
 const KEYRING_SERVICE_SYNCKEY: &str = "toku-sync-key";
+const KEYRING_SERVICE_USER: &str = "toku-sync-user";
 
 impl TokenStore {
     pub fn new(data_dir: &Path) -> Self {
@@ -159,6 +160,69 @@ impl TokenStore {
 
         // Also remove from file fallback
         self.delete_file(&key)
+    }
+
+    // ── User (account) session ───────────────────────────────────────────────
+    //
+    // The account SRP login yields a *user*-session token (used for account- and
+    // admin-scoped calls such as device enrollment and the user-scoped device
+    // listing). It is stored separately from the primary *device*-session token
+    // that `store`/`load` manage for push/pull.
+
+    /// Store the account user-session token and its expiry.
+    pub fn store_user_session(
+        &self,
+        server_url: &str,
+        token: &str,
+        expires_at: &str,
+    ) -> anyhow::Result<()> {
+        let key = normalize_url(server_url);
+
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_USER, &key)
+                && entry.set_password(token).is_ok()
+            {
+                let _ = self.store_file(&format!("{key}:usersession_expires"), expires_at);
+                return Ok(());
+            }
+        }
+
+        self.store_file(&format!("{key}:usersession"), token)?;
+        self.store_file(&format!("{key}:usersession_expires"), expires_at)
+    }
+
+    /// Load the account user-session token, if present.
+    pub fn load_user_session(&self, server_url: &str) -> anyhow::Result<Option<String>> {
+        let key = normalize_url(server_url);
+
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_USER, &key) {
+                match entry.get_password() {
+                    Ok(token) => return Ok(Some(token)),
+                    Err(keyring_core::Error::NoEntry) => {}
+                    Err(_) => {}
+                }
+            }
+        }
+
+        self.load_file(&format!("{key}:usersession"))
+    }
+
+    /// Delete the stored account user-session token.
+    pub fn delete_user_session(&self, server_url: &str) -> anyhow::Result<()> {
+        let key = normalize_url(server_url);
+
+        if !keychain_disabled() {
+            ensure_keyring_store();
+            if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_USER, &key) {
+                let _ = entry.delete_credential();
+            }
+        }
+
+        let _ = self.delete_file(&format!("{key}:usersession_expires"));
+        self.delete_file(&format!("{key}:usersession"))
     }
 
     /// Store the derived sync encryption key in the OS keychain.

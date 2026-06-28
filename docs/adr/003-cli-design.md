@@ -48,14 +48,22 @@ toku config [--edit]
 
 Sync is opt-in and additive — every command above works fully offline. The
 `toku sync` namespace manages multi-device synchronization. See ADR-006
-(sync strategy) and ADR-008 (wire protocol) for the underlying design.
+(sync strategy), ADR-008 (wire protocol), and ADR-010 (self-host + zero-knowledge
+auth, which supersedes ADR-006/008's auth model) for the underlying design.
 
 ```sh
+# Account auth (1Password-style: account password + device-generated Secret Key)
+toku sync signup [--server <url>] [--email <addr>] [--device-name <name>] [--kit-out <file>]
+toku sync login  [--server <url>] [--email <addr>]                  # Re-auth on an enrolled device
+toku sync enroll [--server <url>] [--email <addr>] [--library-id <uuid>] [--device-name <name>]
+
+# Deprecated: per-library passphrase setup (prefer signup/login/enroll)
 toku sync init [--server <url>] [--library-id <uuid>] [--device-name <name>] [--passphrase]
+
 toku sync status                                   # Show sync state, pending ops, devices, conflicts
 toku sync push                                     # Push local changes to the sync server
 toku sync pull                                     # Pull remote changes from the sync server
-toku sync devices                                  # List devices registered to this library
+toku sync devices                                  # List devices (user-scoped when logged in)
 toku sync deregister <device-id>                   # Deregister another device from the server
 toku sync disable                                  # Disable sync (local data preserved)
 toku sync purge [--days <n>]                        # Purge tombstoned books past the retention period (default 30)
@@ -67,13 +75,26 @@ toku sync conflicts resolve <id> --keep local|remote
 toku sync conflicts resolve-all --keep local|remote
 ```
 
-> **Note**: `toku sync init` defaults the server to `http://localhost:8080`.
-> The `--library-id` must match across all devices for a single library; omit it
-> on the first device to generate one. `--passphrase` enables client-side
-> encryption (interactive, hidden input). Only note and review edits can produce
-> user-visible conflicts; all other entities merge silently per ADR-006's
-> entity-specific rules. Like every other command, sync subcommands respect
-> `--format table|json|csv` and `NO_COLOR`.
+> **Account auth (ADR-010)**: `signup` creates an account, generates a
+> high-entropy **Secret Key** on the device, renders an **Emergency Kit** (shown
+> once — `--kit-out file.pdf|.html|.txt`), and enrolls the first device as admin.
+> `login` re-authenticates an already-enrolled device; `enroll` joins an existing
+> account from a new device. All three prompt for the account password (and, for
+> `login`/`enroll`, the Secret Key) via hidden input — secrets never appear in
+> argv or shell history. The server never sees the password or Secret Key (SRP);
+> recovering the shared library data key on a new device uses the wrapped key
+> hierarchy fetched over an authenticated session. The Secret Key is never written
+> to plaintext config — only derived session/key material is kept in the OS
+> keychain.
+>
+> **Note**: All sync subcommands default the server to `http://localhost:8080`.
+> The deprecated `toku sync init` uses a per-library passphrase: `--library-id`
+> must match across all devices for a single library; omit it on the first device
+> to generate one; `--passphrase` enables client-side encryption (interactive,
+> hidden input). Only note and review edits can produce user-visible conflicts;
+> all other entities merge silently per ADR-006's entity-specific rules. Like
+> every other command, sync subcommands respect `--format table|json|csv` and
+> `NO_COLOR`.
 
 ## Rationale
 

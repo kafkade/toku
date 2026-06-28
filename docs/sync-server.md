@@ -79,6 +79,74 @@ toku sync pull
 encryption is **mandatory** in hosted mode, so the server only ever stores opaque ciphertext.
 Use the same passphrase on every device. See `toku sync --help` for the full command set.
 
+## First-run onboarding & admin
+
+A fresh server starts with **no accounts**. The first person to sign up becomes the
+instance administrator; after that, self-registration is closed by default so a
+publicly reachable server can't be claimed by a stranger.
+
+### 1. Create the first (admin) account
+
+From your first device, point the CLI at the new server and sign up:
+
+```bash
+toku sync signup --server https://sync.example.com --email you@example.com
+```
+
+This first account **automatically becomes the admin** (regardless of the registration
+setting). During signup the CLI generates your account **Secret Key** and prints an
+**Emergency Kit** — save the kit somewhere safe (write `--kit-out kit.pdf` to render a
+file). You authenticate with your password *and* Secret Key; the server only ever
+receives an SRP verifier and opaque, client-encrypted key material.
+
+> **No server-side recovery.** The server is zero-knowledge and holds no key. If you lose
+> both your password and your Secret Key / Emergency Kit, your encrypted data is
+> unrecoverable — there is no admin override and no reset link. See
+> [`recovery.md`](./recovery.md) and the [Zero-knowledge guarantee](#zero-knowledge-guarantee).
+
+### 2. Add more accounts or devices
+
+Self-registration stays **closed** after the first account. The admin controls who can
+join through authenticated admin endpoints (a valid **admin session** bearer token is
+required — obtained by logging in as the admin account; there is intentionally no
+unauthenticated admin surface). The relevant endpoints are:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET/PUT /api/v1/admin/registration` | Read / open / close self-registration |
+| `GET/PUT /api/v1/admin/device-approvals` | Read / toggle the device-approval gate |
+| `GET /api/v1/admin/users` | List accounts |
+| `POST /api/v1/admin/users/{id}/status` | Enable / disable an account |
+
+For example, to temporarily open self-registration so additional people can sign up
+(replace `$ADMIN_TOKEN` with your admin session token and close it again afterwards):
+
+```bash
+curl -X PUT https://sync.example.com/api/v1/admin/registration \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"open": true}'
+```
+
+New users then run `toku sync signup` exactly as above; additional devices for an
+existing account use `toku sync enroll` (password + Secret Key).
+
+The last remaining active admin cannot disable their own account, so an instance always
+keeps at least one administrator.
+
+### 3. (Optional) Require device approval
+
+For an extra gate, enable **device approvals**. When enabled, a newly enrolled device
+joining a library that already has an active device is held `pending` until an existing
+device approves it:
+
+```bash
+curl -X PUT https://sync.example.com/api/v1/admin/device-approvals \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"required": true}'
+```
+
 ## Zero-knowledge guarantee
 
 In hosted mode the server is **zero-knowledge**: it can never read your library content.
@@ -146,6 +214,47 @@ docker run --rm -v toku-sync-data:/data -v "$PWD:/backup" busybox \
 > The image runs as a non-root user (uid `65532`). A freshly created **named** volume inherits the
 > correct ownership automatically. If you use a **bind mount** instead, make sure the host directory
 > is writable by uid `65532` (e.g. `sudo chown 65532:65532 ./data`).
+
+## Upgrading
+
+The container is stateless — **all** persistent state lives in the `/data` volume — so
+upgrading is just pulling a newer image and recreating the container. Your data, accounts,
+and devices survive the upgrade because the volume is untouched.
+
+### Docker Compose
+
+```bash
+docker compose pull        # fetch the newer image
+docker compose up -d       # recreate the container with the same volume
+```
+
+### docker run
+
+```bash
+docker stop toku-sync && docker rm toku-sync
+docker pull ghcr.io/kafkade/toku-sync:latest
+docker run -d \
+  --name toku-sync \
+  -p 8080:8080 \
+  -v toku-sync-data:/data \
+  ghcr.io/kafkade/toku-sync:latest
+```
+
+After recreating, confirm the new version is healthy:
+
+```bash
+curl https://sync.example.com/health
+# {"status":"ok","version":"0.3.2"}
+```
+
+> **Back up before upgrading.** Take a copy of `sync.db` (see [Data persistence](#data-persistence))
+> before pulling a new image so you can roll back if needed. Schema migrations run
+> automatically on start and are forward-only.
+>
+> **Pin a tag for production.** `:latest` is convenient but moves underneath you. For
+> reproducible upgrades, pin a specific version (e.g. `ghcr.io/kafkade/toku-sync:0.3.2`)
+> and bump it deliberately. Both `MAJOR.MINOR` and full `MAJOR.MINOR.PATCH` tags are
+> published alongside `latest`.
 
 ## Health checks
 

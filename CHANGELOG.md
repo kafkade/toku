@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The self-hosted `toku-sync` Docker image builds for `linux/arm64` (e.g.
-  Raspberry Pi) again, so the published multi-arch image works on ARM hosts
+- The published multi-arch `toku-sync` Docker image now builds successfully for
+  `linux/arm64` (e.g. Raspberry Pi), completing the ARM build fix from 0.3.1 that
+  still failed while compiling bundled SQLite
 
 ## [0.3.0] - 2026-06-27
 

@@ -19,16 +19,19 @@ ARG TARGETARCH
 # matching cross toolchain. We cross-compile on the *native* build platform
 # (no QEMU for the Rust compile). Debian's gcc-<arch>-linux-gnu is the correct
 # C compiler/linker for the GNU target, including the bundled SQLite C code
-# (libsqlite3-sys).
+# (libsqlite3-sys). We must also install libc6-dev-<arch>-cross to get the
+# target's libc headers (bits/libc-header-start.h, etc.); gcc-<arch>-linux-gnu
+# only *Recommends* it, and --no-install-recommends would otherwise drop it,
+# breaking the bundled SQLite C compile.
 RUN set -eux; \
     case "$TARGETARCH" in \
-        amd64) RUST_TARGET="x86_64-unknown-linux-gnu"; GCC_PKG="gcc-x86-64-linux-gnu" ;; \
-        arm64) RUST_TARGET="aarch64-unknown-linux-gnu"; GCC_PKG="gcc-aarch64-linux-gnu" ;; \
+        amd64) RUST_TARGET="x86_64-unknown-linux-gnu"; GCC_PKG="gcc-x86-64-linux-gnu"; LIBC_PKG="libc6-dev-amd64-cross" ;; \
+        arm64) RUST_TARGET="aarch64-unknown-linux-gnu"; GCC_PKG="gcc-aarch64-linux-gnu"; LIBC_PKG="libc6-dev-arm64-cross" ;; \
         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     echo "$RUST_TARGET" > /rust_target; \
     apt-get update; \
-    apt-get install -y --no-install-recommends "$GCC_PKG"; \
+    apt-get install -y --no-install-recommends "$GCC_PKG" "$LIBC_PKG"; \
     rm -rf /var/lib/apt/lists/*; \
     rustup target add "$RUST_TARGET"
 

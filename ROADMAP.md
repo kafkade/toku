@@ -707,7 +707,9 @@ All statistics computed locally from SQLite queries. No server needed.
 
 ## Section 6: Ebook File Management (Future — Phase 6)
 
-**Recommendation**: Defer file management to Phase 6 (post-1.0). The MVP is a reading tracker, not a file manager. The architecture accommodates file management through the modular crate design, but the feature set is not committed.
+**Recommendation**: Defer file management to Phase 6 (post-1.0). The MVP is a reading tracker, not a file manager. The architecture accommodates file management through the modular crate design.
+
+**Status**: Phase 6 is now planned and broken down into tracked GitHub issues under the **Phase 6: File Management** milestone (epic #154, sub-issues #147–#153). The four areas below — file association/disk organization, integrity & disk usage, format conversion, and the OPDS server — are committed deliverables. Implementation has not yet started; the critical path opens with ADR-011 (#151) → `toku-files` crate + schema (#153) → file association (#148).
 
 ### 6.1 — File Management (Phase 6)
 
@@ -1364,10 +1366,26 @@ Before committing to the architecture, validate:
 
 ---
 
-### Phase 6: File Management 🔴
+### Phase 6: File Management 🟡
 
 **Theme**: "Calibre-grade ebook management."
-**Deliverables**: File association, disk organization, format conversion (via Calibre), OPDS server.
+**Goal**: Optional management of the actual ebook files (`.epub`, `.pdf`, `.mobi`, `.azw3`) on disk, in a new `toku-files` crate (`toku-core` + `toku-db`, no network). Stays local-first; file binaries are explicitly **not** synced in Phase 7.
+
+**Deliverables** (5):
+
+1. **File association** — link ebook files to books; multiple formats per book (#148)
+2. **Disk organization** — configurable templates, e.g. `{author}/{title}.{format}` (#152)
+3. **Integrity & usage** — SHA-256 checksums + disk-usage reporting (#149)
+4. **Format conversion** — optional shell-out to Calibre `ebook-convert`; DRM-free only (#147)
+5. **OPDS server** — serve the library to e-readers; local-network-only by default (#150)
+
+**Foundations**: ADR-011 file-management architecture (#151), `toku-files` crate scaffold + `files` table schema (#153).
+
+**Status**: Planned and tracked under the **Phase 6: File Management** milestone (epic #154). Not yet started.
+
+**Dependencies**: Phase 3 (stable data model). Independent of sync — can proceed in parallel with the remaining Phase 7 work.
+
+**Out of scope**: File/binary sync (deferred — see §6.4 and the Phase 7 cut line), DRM stripping (DRM-free only).
 
 ---
 

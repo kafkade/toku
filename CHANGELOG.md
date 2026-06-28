@@ -60,6 +60,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   features": the only multi-user surface is administration, never cross-user data
   access
 
+- Zero-knowledge multi-device key recovery in the sync server: signup now
+  persists the account's wrapped **library data key** (`wrapped_data_key`,
+  migration V7), and a new authenticated `GET /api/v1/account/keys` returns the
+  account key bundle (`kdf_params`, `account_public_key`, `wrapped_private_key`,
+  `wrapped_data_key`) a new device needs to unlock the shared library data key
+  with its Secret Key + password. The server only ever stores and returns
+  ciphertext plus the public key — it can never derive or read the data key. An
+  account with no provisioned bundle returns `409 Conflict` rather than partial
+  results. This unblocks new-device enrollment recovering the *same* data key as
+  the original device, the zero-knowledge way
+
 - Multi-device sync integration test harness (`toku-sync/tests/`): a reusable
   `TestServer` (real in-process Axum relay on a random port) and `SimulatedDevice`
   (real client + database + merge engine + deterministic HLC), plus 10 end-to-end
@@ -170,6 +181,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the approved device then claims its token from `POST /api/v1/devices/{id}/session`.
   Rejected devices are denied. Administrators toggle the requirement with
   `GET`/`PUT /api/v1/admin/device-approvals`
+- First-run onboarding and session authentication for the web dashboard. `toku serve`
+  now has two modes: the default **local** mode is unchanged (no login, binds loopback
+  only, and refuses non-loopback hosts), while `toku serve --hosted` requires sign-in so
+  the dashboard can be exposed on a network. On first run, hosted mode walks you through
+  creating an admin account and shows your **Emergency Kit** (email + Secret Key) once.
+  Sign-in verifies your password server-side (SRP verifier, constant-time compare), issues
+  a fresh 24-hour session cookie, and locks the account for 15 minutes after 5 failed
+  attempts. All forms are CSRF-protected and `/healthz` stays public for liveness probes.
+  The trusted-server trade-off (the hosted dashboard renders your decrypted library
+  server-side) is documented in `docs/web-auth.md`
 
 ### Changed
 

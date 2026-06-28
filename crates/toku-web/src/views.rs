@@ -33,6 +33,10 @@ fn base(title: &str, content: Markup) -> Markup {
                             " "
                             a.nav-link href="/sync" { "Sync" }
                             (crate::sync_status::header_badge())
+                            @if crate::auth::is_hosted_global() {
+                                " "
+                                a.nav-link href="/logout" { "Sign out" }
+                            }
                         }
                     }
                 }
@@ -112,7 +116,7 @@ pub fn sync_page(o: &SyncOverview) -> Markup {
 }
 
 /// Render the sync conflicts page.
-pub fn conflicts_page(conflicts: &[SyncConflict]) -> Markup {
+pub fn conflicts_page(conflicts: &[SyncConflict], csrf: &str) -> Markup {
     let content = html! {
         div.dashboard-header {
             h1 { "Sync Conflicts" }
@@ -128,10 +132,12 @@ pub fn conflicts_page(conflicts: &[SyncConflict]) -> Markup {
                 p { (conflicts.len()) " unresolved conflict" @if conflicts.len() != 1 { "s" } "." }
                 div.conflict-bulk {
                     form method="post" action="/conflicts/resolve-all" {
+                        (crate::auth_views::csrf_field(csrf))
                         input type="hidden" name="keep" value="local";
                         button.btn.btn-secondary type="submit" { "Keep all local" }
                     }
                     form method="post" action="/conflicts/resolve-all" {
+                        (crate::auth_views::csrf_field(csrf))
                         input type="hidden" name="keep" value="remote";
                         button.btn.btn-secondary type="submit" { "Keep all remote" }
                     }
@@ -139,14 +145,14 @@ pub fn conflicts_page(conflicts: &[SyncConflict]) -> Markup {
             }
 
             @for c in conflicts {
-                (conflict_card(c))
+                (conflict_card(c, csrf))
             }
         }
     };
     base("Sync Conflicts", content)
 }
 
-fn conflict_card(c: &SyncConflict) -> Markup {
+fn conflict_card(c: &SyncConflict, csrf: &str) -> Markup {
     let field = c.field_name.as_deref().unwrap_or("value");
     let local = c.local_value.as_deref().unwrap_or("(empty)");
     let remote = c.remote_value.as_deref().unwrap_or("(empty)");
@@ -172,10 +178,12 @@ fn conflict_card(c: &SyncConflict) -> Markup {
             }
             div.conflict-actions {
                 form method="post" action=(resolve_action) {
+                    (crate::auth_views::csrf_field(csrf))
                     input type="hidden" name="keep" value="local";
                     button.btn.btn-primary type="submit" { "Keep local" }
                 }
                 form method="post" action=(resolve_action) {
+                    (crate::auth_views::csrf_field(csrf))
                     input type="hidden" name="keep" value="remote";
                     button.btn.btn-primary type="submit" { "Keep remote" }
                 }

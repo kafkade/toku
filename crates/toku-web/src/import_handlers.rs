@@ -110,8 +110,8 @@ impl ImportObserver for WebImportObserver {
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// `GET /import` — import type selection page.
-pub async fn import_page() -> Html<String> {
-    Html(import_views::import_page().into_string())
+pub async fn import_page(csrf: crate::auth::CsrfToken) -> Html<String> {
+    Html(import_views::import_page(csrf.value()).into_string())
 }
 
 /// `POST /import/upload` — handle CSV file upload (Goodreads or StoryGraph).
@@ -297,6 +297,7 @@ pub struct CalibreForm {
 /// `GET /import/preview/{id}` — show dry-run preview.
 pub async fn import_preview(
     State(state): State<AppState>,
+    csrf: crate::auth::CsrfToken,
     Path(id): Path<String>,
 ) -> Result<Html<String>, WebError> {
     let sessions = state
@@ -314,7 +315,7 @@ pub async fn import_preview(
         .ok_or_else(|| WebError::Internal("no preview available".into()))?;
 
     Ok(Html(
-        import_views::preview_page(&id, &session.source, report).into_string(),
+        import_views::preview_page(&id, &session.source, report, csrf.value()).into_string(),
     ))
 }
 

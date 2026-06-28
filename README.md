@@ -68,6 +68,8 @@ their ever-growing libraries.
 - 🖥️ Interactive TUI browser with split-pane layout, filters, and live detail view
 - 🔄 Bulk operations for tagging, status changes, and deletions across filtered sets
 - 🌐 Web dashboard (`toku serve`) with statistics, import wizard, library views, and dark mode
+  — loopback-only by default, or run authenticated for network access
+  ([hosted mode & auth](docs/web-auth.md))
 - 🍎 macOS app (SwiftUI) with sidebar navigation, sortable table/grid views, and Swift Charts
 - 📱 iOS app (iPhone + iPad) with cover grid, barcode scanner, and reading progress updates
 - 🪟 Windows desktop app (Tauri v2) wrapping the web UI in a native window with system tray

@@ -22,7 +22,10 @@ fn parse_keep(value: &str) -> Result<ConflictKeep, WebError> {
 }
 
 /// `GET /conflicts` — list unresolved sync conflicts with resolution actions.
-pub async fn conflicts_page(State(state): State<AppState>) -> Result<Html<String>, WebError> {
+pub async fn conflicts_page(
+    State(state): State<AppState>,
+    csrf: crate::auth::CsrfToken,
+) -> Result<Html<String>, WebError> {
     let db_path = state.db_path.clone();
 
     let conflicts = tokio::task::spawn_blocking(move || {
@@ -32,7 +35,9 @@ pub async fn conflicts_page(State(state): State<AppState>) -> Result<Html<String
     .await
     .map_err(|e| WebError::Internal(e.to_string()))??;
 
-    Ok(Html(views::conflicts_page(&conflicts).into_string()))
+    Ok(Html(
+        views::conflicts_page(&conflicts, csrf.value()).into_string(),
+    ))
 }
 
 /// `POST /conflicts/resolve/{id}` — resolve one conflict, then redirect back.

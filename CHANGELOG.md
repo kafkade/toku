@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-28
+
 ### Fixed
 
 - The published multi-arch `toku-sync` Docker image now builds successfully for

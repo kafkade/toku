@@ -254,3 +254,12 @@ incorrect for a networked self-hosted server.
 | OIDC/OAuth2 (delegate to external IdP) | Adds mandatory external dependency; breaks offline onboarding; does not solve E2E key hierarchy |
 | Keep ADR-006/008 for self-hosted, add ZK only for managed | Inconsistent security model; self-hosted users deserve the same guarantees |
 | Full Pildora model (vault sharing, per-item keys) | No sharing feature exists; per-item keys are unnecessary complexity for a personal tool |
+
+## Relay migration (issue #126)
+
+Pre-account relay instances upgrade via a one-time `toku sync migrate`: the client generates
+a Secret Key + account password, the first account bootstraps as admin and the server adopts
+all orphan (unowned) libraries/devices, and all server ops/snapshots are re-keyed from the
+single passphrase (or plaintext) into zero-knowledge ciphertext under the new key hierarchy.
+The instance then locks `min_protocol = 2`, closing the legacy unauthenticated path. The
+migration is forward-only; back up `sync.db` first.

@@ -98,10 +98,15 @@ fn require_ciphertext_snapshot(snapshot_json: &str) -> Result<(), SyncError> {
 
 // ── Health ──────────────────────────────────────────────────────────────────
 
-pub async fn health() -> Json<HealthResponse> {
+pub async fn health(State(db_path): State<PathBuf>) -> Json<HealthResponse> {
+    let min = SyncDatabase::open_no_migrate(&db_path)
+        .map(|db| crate::protocol::min_protocol(&db))
+        .unwrap_or(crate::protocol::PROTOCOL_RELAY);
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
+        min_protocol: min,
     })
 }
 

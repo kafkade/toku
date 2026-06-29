@@ -244,7 +244,7 @@ After recreating, confirm the new version is healthy:
 
 ```bash
 curl https://sync.example.com/health
-# {"status":"ok","version":"0.3.2"}
+# {"status":"ok","version":"0.3.2","protocol_version":2,"min_protocol":1}
 ```
 
 > **Back up before upgrading.** Take a copy of `sync.db` (see [Data persistence](#data-persistence))
@@ -255,6 +255,46 @@ curl https://sync.example.com/health
 > reproducible upgrades, pin a specific version (e.g. `ghcr.io/kafkade/toku-sync:0.3.2`)
 > and bump it deliberately. Both `MAJOR.MINOR` and full `MAJOR.MINOR.PATCH` tags are
 > published alongside `latest`.
+
+## Migrating from the legacy relay model
+
+Early instances ran the **relay model**: a client-chosen `library_id`, an optional single
+passphrase, unauthenticated registration, and (sometimes) plaintext ops on the server. The
+current model uses **accounts** (email + password) with a high-entropy Secret Key, an
+end-to-end key hierarchy, and zero-knowledge ops. A one-time migration moves existing data
+and devices onto the new model without stranding anything.
+
+### Wire protocol versions
+
+The server advertises two numbers in `GET /health`:
+
+- `protocol_version` — what the server speaks (currently `2`, the account model).
+- `min_protocol` — the lowest client protocol accepted. Fresh and un-migrated instances stay
+  at `1`, so legacy clients keep working. After migration it becomes `2`.
+
+Once `min_protocol` is `2`, pre-account clients are rejected with **HTTP 426 (Upgrade
+Required)**. Upgrade those installs to a current Toku build before they can sync again.
+
+### One-time client migration
+
+On a device that already has legacy sync configured, run:
+
+```bash
+toku sync migrate --email you@example.com
+```
+
+This generates a fresh Secret Key + account password, creates your account on the server
+(the **first** account becomes admin and adopts all pre-existing libraries/devices),
+re-protects every server op and snapshot under the new zero-knowledge key hierarchy
+(plaintext ops are encrypted for the first time), and locks the instance to protocol 2.
+Your Secret Key and Emergency Kit are shown **once** — store them offline.
+
+**Other devices** rejoin afterwards with `toku sync enroll --email you@example.com` using the
+same password + Secret Key.
+
+> **Breaking change:** migration is forward-only and closes the old unauthenticated
+> registration path. Minimum client version: the first release that ships `toku sync
+> migrate` (account protocol 2). Back up `sync.db` first.
 
 ## Health checks
 

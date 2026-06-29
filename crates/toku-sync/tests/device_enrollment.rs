@@ -32,6 +32,7 @@ fn post_json(url: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
     rt().block_on(async {
         let resp = reqwest::Client::new()
             .post(url)
+            .header("x-toku-sync-protocol", "2")
             .json(body)
             .send()
             .await
@@ -41,11 +42,11 @@ fn post_json(url: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
         (status, val)
     })
 }
-
 fn post_json_auth(url: &str, bearer: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
     rt().block_on(async {
         let resp = reqwest::Client::new()
             .post(url)
+            .header("x-toku-sync-protocol", "2")
             .bearer_auth(bearer)
             .json(body)
             .send()
@@ -247,7 +248,8 @@ fn register_open_until_first_account_then_gated() {
     // Create the first account → instance is now managed.
     account(&server, "admin@example.com", "admin pass");
 
-    // Guessing any library_id via the open path is now rejected.
+    // An updated client (protocol 2) is rejected with 403 — the instance is now
+    // account-managed and the open relay path is closed.
     let (status, _) = post_json(
         &format!("{}/api/v1/register", server.base_url()),
         &serde_json::json!({ "library_id": "victim-lib", "device_name": "attacker" }),
@@ -256,6 +258,20 @@ fn register_open_until_first_account_then_gated() {
         status, 403,
         "open register must be closed on an account-managed instance"
     );
+
+    // A legacy (header-less, pre-account) client is turned away with 426 once the
+    // bootstrap admin adopted the relay library and locked min_protocol (#126).
+    let status = rt().block_on(async {
+        reqwest::Client::new()
+            .post(format!("{}/api/v1/register", server.base_url()))
+            .json(&serde_json::json!({ "library_id": "x", "device_name": "old" }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    });
+    assert_eq!(status, 426, "pre-account clients must be told to upgrade");
 }
 
 /// (b) Device enrollment requires a valid account session.

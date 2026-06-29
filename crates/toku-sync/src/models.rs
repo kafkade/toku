@@ -148,6 +148,10 @@ pub struct PullResponse {
 pub struct HealthResponse {
     pub status: &'static str,
     pub version: &'static str,
+    /// Wire protocol this server speaks.
+    pub protocol_version: i64,
+    /// Lowest client protocol the server currently accepts.
+    pub min_protocol: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -209,6 +213,13 @@ pub struct SignupResponse {
     pub user_id: String,
     pub email: String,
     pub role: String,
+    /// Relay libraries adopted under this account during first-admin bootstrap
+    /// (#126). Zero for every signup except the migrating admin.
+    #[serde(default)]
+    pub adopted_libraries: i64,
+    /// Relay devices adopted under this account during first-admin bootstrap.
+    #[serde(default)]
+    pub adopted_devices: i64,
 }
 
 /// `POST /api/v1/account/challenge` — start a user SRP login.

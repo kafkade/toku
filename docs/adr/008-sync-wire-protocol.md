@@ -221,3 +221,12 @@ The open questions from the draft were resolved during review and acceptance (is
 - **Rate limiting strategy** — A **per-device token bucket** on the server (default
   ~60 requests/min) returning `429` + `Retry-After`, with exponential client backoff.
   See Decision → Rate limiting.
+
+## Protocol versioning (issue #126)
+
+The wire protocol is versioned via an `X-Toku-Sync-Protocol` request header and an
+`instance_config.min_protocol` gate. Protocol **1** is the original relay (library
+passphrase, unauthenticated `register`); protocol **2** is the account model (SRP + Secret
+Key + wrapped key hierarchy). `GET /health` advertises `protocol_version` and `min_protocol`.
+Once an instance is migrated (see ADR-010 / #126) `min_protocol` becomes `2` and pre-account
+clients are rejected with `426 Upgrade Required`.

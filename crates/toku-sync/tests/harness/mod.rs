@@ -187,6 +187,12 @@ impl SimulatedDevice {
         self.data_dir.path()
     }
 
+    /// Public path to this device's data directory (for orchestrator-level
+    /// tests such as relay→account migration).
+    pub fn data_dir_path(&self) -> &Path {
+        self.data_dir.path()
+    }
+
     fn open_db(&self) -> Database {
         Database::open(&self.data_dir().join("toku.db")).expect("open device db")
     }

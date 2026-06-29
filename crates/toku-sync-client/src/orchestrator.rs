@@ -124,6 +124,30 @@ pub struct EnrollOutcome {
     pub device_status: String,
 }
 
+/// Outcome of [`migrate`].
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrateOutcome {
+    pub user_id: String,
+    pub email: String,
+    pub role: String,
+    pub server: String,
+    pub library_id: String,
+    pub device_id: String,
+    /// Relay libraries adopted under the new admin account (#126).
+    pub adopted_libraries: i64,
+    /// Relay devices adopted under the new admin account (#126).
+    pub adopted_devices: i64,
+    /// Ops re-encrypted client-side under the fresh data key.
+    pub ops_reencrypted: usize,
+    /// Ops the server replaced during rekey.
+    pub ops_replaced: usize,
+    /// True when ops were encrypted under the legacy single passphrase; false
+    /// when previously-plaintext ops were encrypted for the first time.
+    pub had_encryption: bool,
+    /// The formatted Secret Key — surfaced **once** for the Emergency Kit.
+    pub secret_key: String,
+}
+
 fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -981,6 +1005,207 @@ pub fn enroll(
         device_name,
         server: server.to_string(),
         device_status: enroll.status,
+    })
+}
+
+/// Re-encrypt one wire op from the legacy single-key (or plaintext) world into a
+/// fresh data key, preserving all metadata. `old_key` is `None` when the relay
+/// stored plaintext; an encrypted op then is an error (we can't decrypt it).
+fn reencrypt_wire_op(
+    wire_op: &WireOp,
+    old_key: Option<&SyncKey>,
+    new_key: &SyncKey,
+) -> anyhow::Result<WireOp> {
+    let mut out = wire_op.clone();
+    if wire_op.payload.is_object() && wire_op.payload.get("ev").is_some() {
+        let envelope: toku_core::EncryptedEnvelope =
+            serde_json::from_value(wire_op.payload.clone())
+                .context("invalid encrypted envelope")?;
+        let entity_type: toku_core::EntityType = wire_op
+            .entity_type
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid entity_type"))?;
+        let entity_id: uuid::Uuid = wire_op
+            .entity_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid entity_id: {e}"))?;
+        let op_type: toku_core::OpType = wire_op
+            .op_type
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid op_type"))?;
+        let old = old_key.ok_or_else(|| {
+            anyhow::anyhow!(
+                "op {} is encrypted but no old key is available",
+                wire_op.op_id
+            )
+        })?;
+        let plaintext =
+            toku_core::decrypt_fields(old, &envelope, &entity_type, &entity_id, &op_type)
+                .map_err(|e| anyhow::anyhow!("decryption failed for op {}: {e}", wire_op.op_id))?;
+        let new_envelope =
+            toku_core::encrypt_fields(new_key, &plaintext, &entity_type, &entity_id, &op_type)
+                .map_err(|e| anyhow::anyhow!("re-encryption failed: {e}"))?;
+        out.payload = serde_json::to_value(&new_envelope)?;
+    } else if !wire_op.payload.is_null() {
+        // Legacy plaintext op: encrypt it for the first time so the migrated
+        // server holds only zero-knowledge ciphertext.
+        let entity_type: toku_core::EntityType = wire_op
+            .entity_type
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid entity_type"))?;
+        let entity_id: uuid::Uuid = wire_op
+            .entity_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid entity_id: {e}"))?;
+        let op_type: toku_core::OpType = wire_op
+            .op_type
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid op_type"))?;
+        let new_envelope = toku_core::encrypt_fields(
+            new_key,
+            &wire_op.payload,
+            &entity_type,
+            &entity_id,
+            &op_type,
+        )
+        .map_err(|e| anyhow::anyhow!("encryption failed for op {}: {e}", wire_op.op_id))?;
+        out.payload = serde_json::to_value(&new_envelope)?;
+    }
+    Ok(out)
+}
+
+/// One-time upgrade from the relay model to the account/key-hierarchy model
+/// (issue #126). Creates the account (first account becomes admin and adopts
+/// orphan libraries/devices server-side), re-binds this device to a fresh
+/// account session, generates a new library data key, and rekeys every server
+/// op (and any snapshot) from the legacy single passphrase — or plaintext — into
+/// zero-knowledge ciphertext under the new key. Idempotent-friendly: safe to
+/// re-run for a partially-migrated instance (a duplicate email signup is
+/// rejected; existing data key login still rekeys).
+pub fn migrate(
+    data_dir: &Path,
+    email: &str,
+    password: &str,
+    secret_key: &toku_core::SecretKey,
+) -> anyhow::Result<MigrateOutcome> {
+    if password.is_empty() {
+        anyhow::bail!("password cannot be empty");
+    }
+
+    let rt = build_runtime()?;
+    let token_store = TokenStore::new(data_dir);
+    let config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
+    let sync_config = require_sync(&config)?;
+    let server = sync_config.server.clone();
+    let library_id = sync_config.library_id.clone();
+    let device_id = sync_config.device_id.clone();
+    if device_id.is_empty() {
+        anyhow::bail!("no device id in sync config; cannot migrate this install");
+    }
+    let client = SyncClient::new(&server)?;
+
+    // Old encryption key (passphrase-derived) if this relay used encryption.
+    let old_key = load_encryption_key(&token_store, &server, sync_config)?;
+
+    // Build the fresh account key hierarchy + data key.
+    let (account_keys, data_key) = toku_core::AccountKeys::create(password, secret_key.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to build account keys: {e}"))?;
+    let kdf_params =
+        serde_json::to_string(&account_keys.kdf).context("failed to serialize kdf_params")?;
+    let wrapped_private_key = serde_json::to_string(&account_keys.wrapped_private_key)
+        .context("failed to serialize wrapped_private_key")?;
+    let wrapped_data_key = serde_json::to_string(&account_keys.wrapped_data_key)
+        .context("failed to serialize wrapped_data_key")?;
+
+    // SRP verifier (identity = email).
+    let (srp_salt_hex, srp_verifier_hex) = {
+        use rand::RngExt;
+        use sha2::Sha256;
+        use srp::ClientG2048;
+        let srp_client = ClientG2048::<Sha256>::new();
+        let mut salt = [0u8; 16];
+        rand::rng().fill(&mut salt);
+        (
+            hex::encode(salt),
+            hex::encode(srp_client.compute_verifier(email.as_bytes(), password.as_bytes(), &salt)),
+        )
+    };
+
+    let signup = rt.block_on(client.account_signup(
+        email,
+        &srp_salt_hex,
+        &srp_verifier_hex,
+        &wrapped_private_key,
+        &account_keys.public_key,
+        &kdf_params,
+        &wrapped_data_key,
+    ))?;
+
+    // Account session, then a device session for this already-registered device
+    // (now adopted under the admin account).
+    let verify = account_srp_login(&rt, &client, email, password)?;
+    token_store.store_user_session(&server, &verify.session_token, &verify.expires_at)?;
+    let device_session =
+        rt.block_on(client.create_device_session(&verify.session_token, &device_id))?;
+    token_store.store(&server, &device_session.session_token)?;
+    let token = device_session.session_token;
+
+    // Rekey all server ops + snapshot under the fresh data key.
+    let (ops_reencrypted, ops_replaced) = rt.block_on(async {
+        let pull = client.pull_all_ops(&token).await?;
+        let new_salt = SyncKey::generate_salt();
+        let new_salt_b64 = base64::engine::general_purpose::STANDARD.encode(new_salt);
+        let mut reencrypted = Vec::with_capacity(pull.ops.len());
+        for wire_op in &pull.ops {
+            reencrypted.push(reencrypt_wire_op(wire_op, old_key.as_ref(), &data_key)?);
+        }
+        let count = reencrypted.len();
+        let rekey = client.rekey(&token, &new_salt_b64, &reencrypted).await?;
+        if let Some(old) = old_key.as_ref()
+            && let Some(snap) = client.download_snapshot(&token).await?
+        {
+            let old_env: toku_core::EncryptedEnvelope =
+                serde_json::from_str(&snap.snapshot_json)
+                    .context("stored snapshot is not an encrypted envelope")?;
+            let plain = toku_core::decrypt_snapshot(old, &old_env)
+                .map_err(|e| anyhow::anyhow!("failed to decrypt snapshot: {e}"))?;
+            let new_env = toku_core::encrypt_snapshot(&data_key, &plain)
+                .map_err(|e| anyhow::anyhow!("failed to re-encrypt snapshot: {e}"))?;
+            let blob = serde_json::to_string(&new_env)?;
+            client
+                .upload_snapshot(&token, &blob, &snap.hlc_at_snapshot)
+                .await?;
+        }
+        anyhow::Ok((count, rekey.ops_replaced))
+    })?;
+
+    // Persist the new data key and mark encryption enabled.
+    token_store.store_sync_key(&server, data_key.as_exported_bytes())?;
+    let mut config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
+    config.sync = Some(toku_core::SyncConfig {
+        server: server.clone(),
+        library_id: library_id.clone(),
+        device_id: device_id.clone(),
+        device_name: sync_config.device_name.clone(),
+        encryption: true,
+    });
+    config
+        .save(data_dir)
+        .map_err(|e| anyhow::anyhow!("failed to save config: {e}"))?;
+
+    Ok(MigrateOutcome {
+        user_id: signup.user_id,
+        email: signup.email,
+        role: signup.role,
+        server,
+        library_id,
+        device_id,
+        adopted_libraries: signup.adopted_libraries,
+        adopted_devices: signup.adopted_devices,
+        ops_reencrypted,
+        ops_replaced,
+        had_encryption: old_key.is_some(),
+        secret_key: secret_key.format(),
     })
 }
 

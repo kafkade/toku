@@ -17,6 +17,7 @@ toku-db.workspace = true
 toku-meta.workspace = true
 toku-import.workspace = true
 toku-export.workspace = true
+toku-files.workspace = true
 toku-web.workspace = true
 toku-sync-client.workspace = true
 clap = { version = "4", features = ["derive", "env"] }

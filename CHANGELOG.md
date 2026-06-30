@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- File association CLI: `toku file add/list/remove` links ebook files (`.epub`,
+  `.pdf`, `.mobi`, `.azw3`) to books with multiple formats per book, auto-detecting
+  format from the extension, recording size, and storing a SHA-256 checksum (with
+  duplicate-checksum detection). Supports `--format table|json|csv` and `NO_COLOR`;
+  `remove` takes a format or path and an optional `--delete-file`. Backed by a new
+  local-only `files` table and `toku-files` crate (#148)
 - One-time `toku sync migrate` upgrade path from the legacy relay model to the account
   model (#126): generates a Secret Key + account, makes the first account the admin and
   adopts all pre-existing relay libraries/devices, re-keys every server op and snapshot from

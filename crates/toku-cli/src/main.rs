@@ -12,7 +12,7 @@ use toku_core::{
     TokuConfig, compute_stats, parse_duration_to_minutes,
 };
 use toku_db::{BookRepository, Database};
-
+use toku_files::{EbookFile, FileFormat, FileRepository, sha256_file};
 mod account;
 mod import_ui;
 mod sync;
@@ -190,6 +190,12 @@ enum Commands {
     Tag {
         #[command(subcommand)]
         action: TagAction,
+    },
+
+    /// Associate ebook files (.epub/.pdf/.mobi/.azw3) with books
+    File {
+        #[command(subcommand)]
+        action: FileAction,
     },
 
     /// Export your library (csv, json, markdown, backup)
@@ -409,6 +415,37 @@ enum TagAction {
 
     /// List all tags with book counts
     List,
+}
+
+#[derive(Subcommand)]
+enum FileAction {
+    /// Associate an ebook file with a book (format auto-detected from extension)
+    Add {
+        /// Book title
+        book: String,
+
+        /// Path to the ebook file
+        path: PathBuf,
+    },
+
+    /// List files associated with a book
+    List {
+        /// Book title
+        book: String,
+    },
+
+    /// Remove a file association by format or path
+    Remove {
+        /// Book title
+        book: String,
+
+        /// File format (epub/pdf/mobi/azw3) or exact path to remove
+        target: String,
+
+        /// Also delete the file from disk (default: only drop the DB record)
+        #[arg(long)]
+        delete_file: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -936,6 +973,7 @@ fn main() -> Result<()> {
         Commands::Lookup { query, limit } => cmd_lookup(&query, limit, &cli.format),
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
+        Commands::File { action } => cmd_file(&db, &repo, action, &cli.format),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
         Commands::Bulk { action } => cmd_bulk(&db, &repo, action),
         Commands::Stats {
@@ -2221,6 +2259,148 @@ fn cmd_tag(repo: &BookRepository, action: TagAction, output_format: &OutputForma
             }
             eprintln!("\n{} tag(s)", tags.len());
             Ok(())
+        }
+    }
+}
+
+fn human_size(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+fn cmd_file(
+    db: &Database,
+    repo: &BookRepository,
+    action: FileAction,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    let files = FileRepository::new(db);
+    match action {
+        FileAction::Add { book, path } => {
+            let book = resolve_book(repo, &book)?;
+            if !path.is_file() {
+                anyhow::bail!("file not found: {}", path.display());
+            }
+            let format = FileFormat::from_path(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let size_bytes = std::fs::metadata(&path)
+                .with_context(|| format!("reading {}", path.display()))?
+                .len() as i64;
+            let checksum = sha256_file(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let stored = path
+                .canonicalize()
+                .unwrap_or(path.clone())
+                .to_string_lossy()
+                .to_string();
+            let file = EbookFile::new(book.id, stored, format, size_bytes, checksum);
+            files.add_file(&file).map_err(|e| anyhow::anyhow!("{e}"))?;
+            eprintln!(
+                "✓ Linked {} ({}) to \"{}\"",
+                file.format,
+                human_size(file.size_bytes),
+                book.title
+            );
+            Ok(())
+        }
+        FileAction::List { book } => {
+            let book = resolve_book(repo, &book)?;
+            let list = files
+                .list_files(&book.id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if list.is_empty() {
+                eprintln!(
+                    "No files linked to \"{}\". Add one with: toku file add",
+                    book.title
+                );
+                return Ok(());
+            }
+            match output_format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&list)?);
+                }
+                OutputFormat::Csv => {
+                    println!("format,size_bytes,checksum,exists,path");
+                    for f in &list {
+                        println!(
+                            "{},{},{},{},\"{}\"",
+                            f.format,
+                            f.size_bytes,
+                            f.checksum,
+                            Path::new(&f.path).exists(),
+                            f.path.replace('"', "\"\"")
+                        );
+                    }
+                }
+                OutputFormat::Table => {
+                    use tabled::{Table, Tabled};
+
+                    #[derive(Tabled)]
+                    struct Row {
+                        #[tabled(rename = "Format")]
+                        format: String,
+                        #[tabled(rename = "Size")]
+                        size: String,
+                        #[tabled(rename = "Checksum")]
+                        checksum: String,
+                        #[tabled(rename = "On disk")]
+                        exists: String,
+                        #[tabled(rename = "Path")]
+                        path: String,
+                    }
+                    let rows: Vec<Row> = list
+                        .iter()
+                        .map(|f| Row {
+                            format: f.format.to_string(),
+                            size: human_size(f.size_bytes),
+                            checksum: f.checksum.chars().take(12).collect(),
+                            exists: if Path::new(&f.path).exists() {
+                                "yes"
+                            } else {
+                                "MISSING"
+                            }
+                            .to_string(),
+                            path: f.path.clone(),
+                        })
+                        .collect();
+                    println!("{}", Table::new(rows));
+                }
+            }
+            eprintln!("\n{} file(s)", list.len());
+            Ok(())
+        }
+        FileAction::Remove {
+            book,
+            target,
+            delete_file,
+        } => {
+            let book = resolve_book(repo, &book)?;
+            let removed = match target.parse::<FileFormat>() {
+                Ok(fmt) => files.remove_by_format(&book.id, fmt),
+                Err(_) => files.remove_by_path(&book.id, &target),
+            }
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            match removed {
+                Some(f) => {
+                    if delete_file {
+                        match std::fs::remove_file(&f.path) {
+                            Ok(()) => eprintln!("✓ Deleted file {}", f.path),
+                            Err(e) => eprintln!("⚠ Removed record, but file delete failed: {e}"),
+                        }
+                    }
+                    eprintln!("✓ Removed {} from \"{}\"", f.format, book.title);
+                    Ok(())
+                }
+                None => anyhow::bail!("no file matching \"{target}\" linked to \"{}\"", book.title),
+            }
         }
     }
 }

@@ -5906,6 +5906,7 @@ dependencies = [
  "toku-core",
  "toku-db",
  "toku-export",
+ "toku-files",
  "toku-import",
  "toku-meta",
  "toku-sync-client",
@@ -5992,6 +5993,21 @@ dependencies = [
  "toku-db",
  "toku-import",
  "toku-sync-client",
+ "uuid",
+]
+
+[[package]]
+name = "toku-files"
+version = "0.3.2"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toku-core",
+ "toku-db",
  "uuid",
 ]
 

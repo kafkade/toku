@@ -18,7 +18,7 @@ serde_json.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
 axum = { version = "0.8", features = ["multipart"] }
-axum-extra = { version = "0.10", features = ["cookie"] }
+axum-extra = { version = "0.12", features = ["cookie"] }
 maud = "0.27"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

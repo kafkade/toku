@@ -179,7 +179,7 @@ pub fn encrypt_fields(
 
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut nonce_bytes).expect("OS CSPRNG failed");
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     let payload = Payload {
         msg: &plaintext,
@@ -187,7 +187,7 @@ pub fn encrypt_fields(
     };
 
     let ciphertext = cipher
-        .encrypt(nonce, payload)
+        .encrypt(&nonce, payload)
         .map_err(|e| TokuError::Crypto(format!("encryption failed: {e}")))?;
 
     Ok(EncryptedEnvelope {
@@ -242,7 +242,8 @@ pub fn decrypt_fields(
             nonce_bytes.len()
         )));
     }
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|e| TokuError::Crypto(format!("invalid nonce: {e}")))?;
 
     let ciphertext = BASE64_STANDARD
         .decode(&envelope.ciphertext)
@@ -256,7 +257,7 @@ pub fn decrypt_fields(
         aad: envelope.aad.as_bytes(),
     };
 
-    let plaintext = cipher.decrypt(nonce, payload).map_err(|_| {
+    let plaintext = cipher.decrypt(&nonce, payload).map_err(|_| {
         TokuError::Crypto("decryption failed (wrong key or tampered data)".to_string())
     })?;
 
@@ -288,7 +289,7 @@ pub fn encrypt_snapshot(
 
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut nonce_bytes).expect("OS CSPRNG failed");
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     let payload = Payload {
         msg: snapshot_json.as_bytes(),
@@ -296,7 +297,7 @@ pub fn encrypt_snapshot(
     };
 
     let ciphertext = cipher
-        .encrypt(nonce, payload)
+        .encrypt(&nonce, payload)
         .map_err(|e| TokuError::Crypto(format!("snapshot encryption failed: {e}")))?;
 
     Ok(EncryptedEnvelope {
@@ -340,7 +341,8 @@ pub fn decrypt_snapshot(key: &SyncKey, envelope: &EncryptedEnvelope) -> Result<S
             nonce_bytes.len()
         )));
     }
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|e| TokuError::Crypto(format!("invalid nonce: {e}")))?;
 
     let ciphertext = BASE64_STANDARD
         .decode(&envelope.ciphertext)
@@ -354,7 +356,7 @@ pub fn decrypt_snapshot(key: &SyncKey, envelope: &EncryptedEnvelope) -> Result<S
         aad: envelope.aad.as_bytes(),
     };
 
-    let plaintext = cipher.decrypt(nonce, payload).map_err(|_| {
+    let plaintext = cipher.decrypt(&nonce, payload).map_err(|_| {
         TokuError::Crypto("snapshot decryption failed (wrong key or tampered data)".to_string())
     })?;
 

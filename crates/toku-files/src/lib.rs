@@ -16,6 +16,8 @@ mod convert;
 mod organize;
 mod repo;
 mod template;
+mod usage;
+mod verify;
 
 pub use convert::{ConvertError, Converter, DEFAULT_BINARY};
 pub use organize::{
@@ -25,6 +27,8 @@ pub use repo::FileRepository;
 pub use template::{
     PathTemplate, TemplateContext, UNKNOWN_AUTHOR, UNKNOWN_SERIES, UNKNOWN_YEAR, sanitize_segment,
 };
+pub use usage::{UsageTotals, usage_by_format, usage_by_format_typed, usage_by_key, usage_totals};
+pub use verify::{VerifyOutcome, VerifyStatus, verify_file};
 
 /// Supported ebook file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

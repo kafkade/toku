@@ -11,13 +11,39 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 /// Default Calibre conversion binary looked up on `$PATH`.
 pub const DEFAULT_BINARY: &str = "ebook-convert";
 
 /// Where to point users when `ebook-convert` is missing.
 const INSTALL_URL: &str = "https://calibre-ebook.com/download";
+
+/// `ETXTBSY` — "text file busy". Same numeric value (26) on Linux and macOS.
+const ETXTBSY: i32 = 26;
+
+/// Run a command, retrying briefly on `ETXTBSY` ("text file busy").
+///
+/// Spawning an executable that was *just* written can transiently fail with
+/// `ETXTBSY` on Linux: a concurrently forked-but-not-yet-exec'd child process
+/// may still hold a writable descriptor to the target file at `execve` time.
+/// The window is tiny, so a couple of short retries clear it once that
+/// descriptor closes. On other errors (or platforms) this behaves like a plain
+/// `Command::output()`.
+fn run_capturing(cmd: &mut Command) -> std::io::Result<Output> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        match cmd.output() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt + 1 < MAX_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+            }
+            other => return other,
+        }
+    }
+}
 
 /// Runs Calibre's `ebook-convert` to convert ebook files between formats.
 ///
@@ -61,7 +87,9 @@ impl Converter {
     /// guidance, so callers can surface a friendly message and exit cleanly
     /// rather than panicking.
     pub fn ensure_available(&self) -> Result<(), ConvertError> {
-        match Command::new(&self.binary).arg("--version").output() {
+        let mut cmd = Command::new(&self.binary);
+        cmd.arg("--version");
+        match run_capturing(&mut cmd) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ConvertError::NotInstalled {
                 binary: self.binary.to_string_lossy().into_owned(),
@@ -79,19 +107,17 @@ impl Converter {
     pub fn convert(&self, src: &Path, dst: &Path) -> Result<(), ConvertError> {
         self.ensure_available()?;
 
-        let output = Command::new(&self.binary)
-            .arg(src)
-            .arg(dst)
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ConvertError::NotInstalled {
-                        binary: self.binary.to_string_lossy().into_owned(),
-                    }
-                } else {
-                    ConvertError::Io(e.to_string())
+        let mut cmd = Command::new(&self.binary);
+        cmd.arg(src).arg(dst);
+        let output = run_capturing(&mut cmd).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ConvertError::NotInstalled {
+                    binary: self.binary.to_string_lossy().into_owned(),
                 }
-            })?;
+            } else {
+                ConvertError::Io(e.to_string())
+            }
+        })?;
 
         if output.status.success() {
             Ok(())

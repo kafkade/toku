@@ -66,6 +66,9 @@ impl std::str::FromStr for FileFormat {
     }
 }
 
+/// Default provenance for a file record: added directly by the user.
+pub const SOURCE_USER: &str = "user";
+
 /// An ebook file associated with a book.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EbookFile {
@@ -76,6 +79,11 @@ pub struct EbookFile {
     pub size_bytes: i64,
     /// SHA-256 checksum, hex-encoded.
     pub checksum: String,
+    /// Provenance of this file association (e.g. `user`, `calibre`, `goodreads`).
+    pub source: String,
+    /// Optional external reference from the source (e.g. an import id or the
+    /// original path in the source library). `None` for user-added files.
+    pub source_ref: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -96,9 +104,20 @@ impl EbookFile {
             format,
             size_bytes,
             checksum,
+            source: SOURCE_USER.to_string(),
+            source_ref: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Set the provenance of this file record. Use for importer-created records
+    /// (e.g. `with_source("calibre", Some(original_path))`).
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<String>, source_ref: Option<String>) -> Self {
+        self.source = source.into();
+        self.source_ref = source_ref;
+        self
     }
 }
 

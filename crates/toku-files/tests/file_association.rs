@@ -79,3 +79,53 @@ fn duplicate_checksum_rejected() {
     );
     assert!(files.add_file(&dup).is_err());
 }
+
+#[test]
+fn provenance_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let book_id = seed_book(&db);
+    let files = FileRepository::new(&db);
+
+    // Default record: user-added, no external reference.
+    let user_epub = dir.path().join("user.epub");
+    std::fs::write(&user_epub, b"user bytes").unwrap();
+    let f_user = EbookFile::new(
+        book_id,
+        user_epub.to_string_lossy().to_string(),
+        FileFormat::Epub,
+        10,
+        sha256_file(&user_epub).unwrap(),
+    );
+    assert_eq!(f_user.source, "user");
+    assert_eq!(f_user.source_ref, None);
+
+    // Importer-created record with provenance.
+    let cal_pdf = dir.path().join("calibre.pdf");
+    std::fs::write(&cal_pdf, b"calibre bytes").unwrap();
+    let f_cal = EbookFile::new(
+        book_id,
+        cal_pdf.to_string_lossy().to_string(),
+        FileFormat::Pdf,
+        13,
+        sha256_file(&cal_pdf).unwrap(),
+    )
+    .with_source("calibre", Some("/library/Calibre/dune.pdf".to_string()));
+
+    files.add_file(&f_user).unwrap();
+    files.add_file(&f_cal).unwrap();
+
+    let listed = files.list_files(&book_id).unwrap();
+    assert_eq!(listed.len(), 2);
+
+    let epub = listed
+        .iter()
+        .find(|f| f.format == FileFormat::Epub)
+        .unwrap();
+    assert_eq!(epub.source, "user");
+    assert_eq!(epub.source_ref, None);
+
+    let pdf = listed.iter().find(|f| f.format == FileFormat::Pdf).unwrap();
+    assert_eq!(pdf.source, "calibre");
+    assert_eq!(pdf.source_ref.as_deref(), Some("/library/Calibre/dune.pdf"));
+}

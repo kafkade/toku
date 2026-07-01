@@ -125,7 +125,7 @@ mod tests {
         assert_eq!(by.get("epub").unwrap().total_bytes, 150);
         assert_eq!(by.get("pdf").unwrap().file_count, 1);
         assert_eq!(by.get("pdf").unwrap().total_bytes, 250);
-        assert!(by.get("mobi").is_none());
+        assert!(!by.contains_key("mobi"));
     }
 
     #[test]

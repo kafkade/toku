@@ -11,6 +11,9 @@ use crate::views;
 #[derive(serde::Deserialize)]
 pub struct ResolveForm {
     pub keep: String,
+    /// Custom merged value, used only when `keep == "custom"`.
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 fn parse_keep(value: &str) -> Result<ConflictKeep, WebError> {
@@ -41,14 +44,28 @@ pub async fn conflicts_page(
 }
 
 /// `POST /conflicts/resolve/{id}` — resolve one conflict, then redirect back.
+///
+/// Supports keeping the local/remote side, or (`keep == "custom"`) writing an
+/// arbitrary user-supplied merged value.
 pub async fn resolve_conflict(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Form(form): Form<ResolveForm>,
 ) -> Result<Redirect, WebError> {
-    let keep = parse_keep(&form.keep)?;
     let db_path = state.db_path.clone();
 
+    if form.keep == "custom" {
+        let value = form.value.unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            let db = Database::open(&db_path)?;
+            SyncRepository::new(&db).resolve_conflict_with_value(&id, Some(&value))
+        })
+        .await
+        .map_err(|e| WebError::Internal(e.to_string()))??;
+        return Ok(Redirect::to("/conflicts"));
+    }
+
+    let keep = parse_keep(&form.keep)?;
     tokio::task::spawn_blocking(move || {
         let db = Database::open(&db_path)?;
         SyncRepository::new(&db).resolve_conflict(&id, keep)

@@ -655,6 +655,18 @@ pub fn resolve_conflict(data_dir: &Path, id: &str, keep: ConflictKeep) -> anyhow
     Ok(sync_repo.resolve_conflict(id, keep)?)
 }
 
+/// Resolve a single conflict with a user-supplied merged value.
+/// Returns `false` if the conflict is missing or already resolved.
+pub fn resolve_conflict_with_value(
+    data_dir: &Path,
+    id: &str,
+    value: Option<&str>,
+) -> anyhow::Result<bool> {
+    let db = open_db(data_dir)?;
+    let sync_repo = SyncRepository::new(&db);
+    Ok(sync_repo.resolve_conflict_with_value(id, value)?)
+}
+
 /// Resolve every unresolved conflict with the same choice. Returns the count resolved.
 pub fn resolve_all_conflicts(data_dir: &Path, keep: ConflictKeep) -> anyhow::Result<usize> {
     let db = open_db(data_dir)?;

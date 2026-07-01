@@ -802,14 +802,18 @@ enum ConflictAction {
         id: String,
     },
 
-    /// Resolve a single conflict by keeping the local or remote value
+    /// Resolve a single conflict, keeping one side or a custom merged value
     Resolve {
         /// Conflict ID
         id: String,
 
-        /// Which side to keep
-        #[arg(long, value_enum)]
-        keep: KeepArg,
+        /// Which side to keep (mutually exclusive with --value)
+        #[arg(long, value_enum, group = "resolution")]
+        keep: Option<KeepArg>,
+
+        /// Resolve with a custom merged value (mutually exclusive with --keep)
+        #[arg(long, group = "resolution")]
+        value: Option<String>,
     },
 
     /// Resolve every unresolved conflict the same way
@@ -4448,7 +4452,7 @@ fn print_conflict_human(c: &toku_db::SyncConflict) {
     eprintln!("  Local  [{}]: {local}", c.local_hlc);
     eprintln!("  Remote [{}]: {remote}", c.remote_hlc);
     eprintln!(
-        "  Resolve: toku sync conflicts resolve {} --keep local|remote",
+        "  Resolve: toku sync conflicts resolve {} --keep local|remote  (or --value \"...\")",
         c.id
     );
 }
@@ -4524,15 +4528,24 @@ fn cmd_sync_conflicts(
             Ok(())
         }
 
-        ConflictAction::Resolve { id, keep } => {
-            let resolved = sync::orchestrator::resolve_conflict(data_dir, &id, keep.into())?;
+        ConflictAction::Resolve { id, keep, value } => {
+            let (resolved, kept) = if let Some(value) = value {
+                let resolved =
+                    sync::orchestrator::resolve_conflict_with_value(data_dir, &id, Some(&value))?;
+                (resolved, "custom".to_string())
+            } else if let Some(keep) = keep {
+                let resolved = sync::orchestrator::resolve_conflict(data_dir, &id, keep.into())?;
+                let kept = match keep {
+                    KeepArg::Local => "local",
+                    KeepArg::Remote => "remote",
+                };
+                (resolved, kept.to_string())
+            } else {
+                anyhow::bail!("provide either --keep local|remote or --value \"...\"");
+            };
             if !resolved {
                 anyhow::bail!("no unresolved conflict found with id {id}");
             }
-            let kept = match keep {
-                KeepArg::Local => "local",
-                KeepArg::Remote => "remote",
-            };
             match output_format {
                 OutputFormat::Json => {
                     println!(

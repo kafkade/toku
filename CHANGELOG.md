@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Inline manual-merge editor for sync conflicts: the web conflicts page now offers a
+  "Merge manually" action alongside keep-local/keep-remote, revealing an editable field
+  (textarea for note/review content, 0–10 number input for review ratings) pre-filled with
+  the local value. Resolving with a custom value writes it to the entity, bumps the HLC, and
+  emits a propagating `SyncOp::Update` so the merged value syncs to other devices. The CLI
+  gains `toku sync conflicts resolve <id> --value "..."` for the same custom-value path (#129)
 - File association CLI: `toku file add/list/remove` links ebook files (`.epub`,
   `.pdf`, `.mobi`, `.azw3`) to books with multiple formats per book, auto-detecting
   format from the extension, recording size, and storing a SHA-256 checksum (with

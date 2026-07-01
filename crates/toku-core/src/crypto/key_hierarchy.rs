@@ -463,13 +463,13 @@ fn encrypt_with_aes_gcm(
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| TokuError::Crypto(format!("cipher init for {material_name}: {e}")))?;
     let nonce_bytes = random_array::<12>(&format!("{material_name} nonce"))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let payload = Payload {
         msg: plaintext,
         aad,
     };
     let ciphertext = cipher
-        .encrypt(nonce, payload)
+        .encrypt(&nonce, payload)
         .map_err(|_| TokuError::Crypto(format!("{material_name} encryption failed")))?;
 
     Ok((
@@ -488,7 +488,7 @@ fn decrypt_with_aes_gcm(
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| TokuError::Crypto(format!("cipher init for {material_name}: {e}")))?;
     let nonce_bytes = decode_b64_fixed::<12>(nonce_b64, &format!("{material_name} nonce"))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let ciphertext = BASE64_STANDARD
         .decode(ciphertext_b64)
         .map_err(|e| TokuError::Crypto(format!("{material_name} ciphertext decode: {e}")))?;
@@ -497,7 +497,7 @@ fn decrypt_with_aes_gcm(
         aad,
     };
     cipher
-        .decrypt(nonce, payload)
+        .decrypt(&nonce, payload)
         .map_err(|_| TokuError::Crypto(format!("{material_name} decryption failed")))
 }
 

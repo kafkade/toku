@@ -46,6 +46,23 @@ impl<'a> FileRepository<'a> {
         Ok(())
     }
 
+    /// List every file association in the library, ordered by book then format.
+    ///
+    /// Used by integrity verification (`verify --all`) and disk-usage reporting,
+    /// which operate across the whole catalog rather than a single book.
+    pub fn list_all_files(&self) -> Result<Vec<EbookFile>, FileError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, book_id, path, format, size_bytes, checksum, source, source_ref, created_at, updated_at
+             FROM files ORDER BY book_id, format",
+        )?;
+        let files = stmt
+            .query_map([], |row| Ok(row_to_file(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(files)
+    }
+
     /// List all files associated with a book, ordered by format.
     pub fn list_files(&self, book_id: &Uuid) -> Result<Vec<EbookFile>, FileError> {
         let mut stmt = self.db.conn.prepare(

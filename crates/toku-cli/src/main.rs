@@ -12,7 +12,10 @@ use toku_core::{
     TokuConfig, compute_stats, parse_duration_to_minutes,
 };
 use toku_db::{BookRepository, Database};
-use toku_files::{Converter, EbookFile, FileFormat, FileRepository, sha256_file};
+use toku_files::{
+    Converter, EbookFile, FileFormat, FileRepository, UsageTotals, VerifyStatus, sha256_file,
+    usage_by_key, usage_totals, verify_file,
+};
 mod account;
 mod import_ui;
 mod sync;
@@ -486,6 +489,32 @@ enum FileAction {
         /// Copy files into the library instead of moving them
         #[arg(long)]
         copy: bool,
+    },
+
+    /// Verify file integrity by recomputing SHA-256 checksums
+    ///
+    /// Streams each associated file to recompute its checksum and compares it to
+    /// the value stored when the file was linked. Flags files whose contents
+    /// changed (mismatch) or that are no longer on disk (missing). Exits with a
+    /// non-zero status if any problem is found, for use in scripts.
+    Verify {
+        /// Book title to verify (omit and use --all to verify everything)
+        book: Option<String>,
+
+        /// Verify files for every book in the library
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Report disk usage of associated files, with an optional breakdown
+    ///
+    /// Totals reflect the catalog's recorded file sizes. Use --by to group the
+    /// breakdown by format (default), author, or shelf. A file linked to
+    /// multiple authors or shelves is counted under each of them.
+    Usage {
+        /// Group the breakdown by: format (default), author, or shelf
+        #[arg(long, value_name = "DIMENSION")]
+        by: Option<String>,
     },
 }
 
@@ -2460,7 +2489,292 @@ fn cmd_file(
             dry_run,
             copy,
         } => cmd_file_organize(db, repo, data_dir, book, all, dry_run, copy, output_format),
+        FileAction::Verify { book, all } => cmd_file_verify(db, repo, book, all, output_format),
+        FileAction::Usage { by } => cmd_file_usage(db, repo, by.as_deref(), output_format),
     }
+}
+
+/// Recompute SHA-256 for associated files and report integrity problems.
+///
+/// Verifies a single book's files, or the whole library with `--all`. Prints a
+/// per-file status plus a summary, and exits non-zero when any file is missing
+/// or its contents no longer match the stored checksum.
+fn cmd_file_verify(
+    db: &Database,
+    repo: &BookRepository,
+    book: Option<String>,
+    all: bool,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    let files = FileRepository::new(db);
+
+    let targets: Vec<EbookFile> = match (&book, all) {
+        (Some(_), true) => anyhow::bail!("pass either a book title or --all, not both"),
+        (None, false) => anyhow::bail!("specify a book title, or use --all to verify everything"),
+        (Some(title), false) => {
+            let book = resolve_book(repo, title)?;
+            files
+                .list_files(&book.id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        (None, true) => files.list_all_files().map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
+
+    if targets.is_empty() {
+        eprintln!("No files to verify. Link some with: toku file add");
+        return Ok(());
+    }
+
+    let outcomes: Vec<toku_files::VerifyOutcome> = targets
+        .iter()
+        .map(verify_file)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mismatches = outcomes
+        .iter()
+        .filter(|o| o.status == VerifyStatus::Mismatch)
+        .count();
+    let missing = outcomes
+        .iter()
+        .filter(|o| o.status == VerifyStatus::Missing)
+        .count();
+    let ok = outcomes.len() - mismatches - missing;
+
+    match output_format {
+        OutputFormat::Json => {
+            #[derive(serde::Serialize)]
+            struct Row {
+                status: String,
+                format: String,
+                path: String,
+                stored_checksum: String,
+                computed_checksum: Option<String>,
+            }
+            let rows: Vec<Row> = outcomes
+                .iter()
+                .map(|o| Row {
+                    status: o.status.as_str().to_string(),
+                    format: o.file.format.to_string(),
+                    path: o.file.path.clone(),
+                    stored_checksum: o.file.checksum.clone(),
+                    computed_checksum: o.computed.clone(),
+                })
+                .collect();
+            #[derive(serde::Serialize)]
+            struct Report<'a> {
+                ok: usize,
+                mismatch: usize,
+                missing: usize,
+                files: &'a [Row],
+            }
+            let report = Report {
+                ok,
+                mismatch: mismatches,
+                missing,
+                files: &rows,
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Csv => {
+            println!("status,format,path,stored_checksum,computed_checksum");
+            for o in &outcomes {
+                println!(
+                    "{},{},\"{}\",{},{}",
+                    o.status,
+                    o.file.format,
+                    o.file.path.replace('"', "\"\""),
+                    o.file.checksum,
+                    o.computed.as_deref().unwrap_or("")
+                );
+            }
+        }
+        OutputFormat::Table => {
+            use tabled::{Table, Tabled};
+
+            #[derive(Tabled)]
+            struct Row {
+                #[tabled(rename = "Status")]
+                status: String,
+                #[tabled(rename = "Format")]
+                format: String,
+                #[tabled(rename = "Path")]
+                path: String,
+            }
+            let rows: Vec<Row> = outcomes
+                .iter()
+                .map(|o| Row {
+                    status: match o.status {
+                        VerifyStatus::Ok => "ok",
+                        VerifyStatus::Mismatch => "MISMATCH",
+                        VerifyStatus::Missing => "MISSING",
+                    }
+                    .to_string(),
+                    format: o.file.format.to_string(),
+                    path: o.file.path.clone(),
+                })
+                .collect();
+            println!("{}", Table::new(rows));
+        }
+    }
+
+    eprintln!(
+        "\n{} ok, {} mismatch, {} missing ({} file(s) checked)",
+        ok,
+        mismatches,
+        missing,
+        outcomes.len()
+    );
+
+    if mismatches + missing > 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Report total disk usage of associated files with an optional breakdown.
+///
+/// Totals are computed from the recorded file sizes in the catalog. The
+/// breakdown groups by format (default), author, or shelf; a file linked to
+/// multiple authors or shelves contributes to each bucket, while books with
+/// none fall into an `(unassigned)` bucket.
+fn cmd_file_usage(
+    db: &Database,
+    repo: &BookRepository,
+    by: Option<&str>,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    let files = FileRepository::new(db);
+    let all_files = files.list_all_files().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let dimension = by.unwrap_or("format").to_lowercase();
+    if !matches!(dimension.as_str(), "format" | "author" | "shelf") {
+        anyhow::bail!("unknown --by value \"{dimension}\" (expected format, author, or shelf)");
+    }
+
+    let totals = usage_totals(&all_files);
+
+    // Build the grouped breakdown. Author/shelf require joins through the book
+    // repository; a file with no authors/shelves is bucketed as "(unassigned)".
+    const UNASSIGNED: &str = "(unassigned)";
+    let grouped: std::collections::BTreeMap<String, UsageTotals> = match dimension.as_str() {
+        "format" => usage_by_key(&all_files, |f| vec![f.format.to_string()]),
+        "author" => usage_by_key(&all_files, |f| {
+            let names: Vec<String> = repo
+                .get_book_authors(&f.book_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(a, _)| a.name)
+                .collect();
+            if names.is_empty() {
+                vec![UNASSIGNED.to_string()]
+            } else {
+                names
+            }
+        }),
+        "shelf" => usage_by_key(&all_files, |f| {
+            let names: Vec<String> = repo
+                .get_book_shelves(&f.book_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            if names.is_empty() {
+                vec![UNASSIGNED.to_string()]
+            } else {
+                names
+            }
+        }),
+        _ => unreachable!(),
+    };
+
+    // Sort breakdown rows by descending size for human-facing output.
+    let mut rows: Vec<(String, UsageTotals)> = grouped.into_iter().collect();
+    rows.sort_by(|a, b| {
+        b.1.total_bytes
+            .cmp(&a.1.total_bytes)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    match output_format {
+        OutputFormat::Json => {
+            #[derive(serde::Serialize)]
+            struct Group {
+                key: String,
+                file_count: u64,
+                size_bytes: i64,
+            }
+            #[derive(serde::Serialize)]
+            struct Report {
+                dimension: String,
+                total_files: u64,
+                total_bytes: i64,
+                breakdown: Vec<Group>,
+            }
+            let report = Report {
+                dimension: dimension.clone(),
+                total_files: totals.file_count,
+                total_bytes: totals.total_bytes,
+                breakdown: rows
+                    .iter()
+                    .map(|(k, v)| Group {
+                        key: k.clone(),
+                        file_count: v.file_count,
+                        size_bytes: v.total_bytes,
+                    })
+                    .collect(),
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Csv => {
+            println!("{dimension},file_count,size_bytes");
+            for (k, v) in &rows {
+                println!(
+                    "\"{}\",{},{}",
+                    k.replace('"', "\"\""),
+                    v.file_count,
+                    v.total_bytes
+                );
+            }
+            println!("\"TOTAL\",{},{}", totals.file_count, totals.total_bytes);
+        }
+        OutputFormat::Table => {
+            use tabled::{Table, Tabled};
+
+            #[derive(Tabled)]
+            struct Row {
+                #[tabled(rename = "Group")]
+                key: String,
+                #[tabled(rename = "Files")]
+                files: u64,
+                #[tabled(rename = "Size")]
+                size: String,
+            }
+            let table_rows: Vec<Row> = rows
+                .iter()
+                .map(|(k, v)| Row {
+                    key: k.clone(),
+                    files: v.file_count,
+                    size: human_size(v.total_bytes),
+                })
+                .collect();
+            let header = match dimension.as_str() {
+                "author" => "By author",
+                "shelf" => "By shelf",
+                _ => "By format",
+            };
+            println!("{header}:");
+            println!("{}", Table::new(table_rows));
+            println!(
+                "\nTotal: {} across {} file(s)",
+                human_size(totals.total_bytes),
+                totals.file_count
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Convert an associated ebook file to another format via Calibre's

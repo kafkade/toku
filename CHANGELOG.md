@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- File integrity & disk usage: `toku file verify [<book>|--all]` recomputes each associated
+  file's SHA-256 by streaming its contents (constant memory, even for multi-GB files) and
+  flags files whose contents changed (`mismatch`) or that are gone from disk (`missing`).
+  It prints a per-file status and summary, and exits non-zero when any problem is found so it
+  can gate scripts. `toku file usage [--by format|author|shelf]` reports total disk usage with
+  a breakdown; a file linked to multiple authors or shelves is counted under each, and books
+  with none fall into an `(unassigned)` bucket. Both support `--format table|json|csv` (#149)
 - Format conversion: `toku convert <book> --to <format> [--from <format>] [--force]` converts
   an associated ebook to another format by shelling out to Calibre's `ebook-convert`. The
   output is written next to the source file (same name, new extension) and auto-associated with

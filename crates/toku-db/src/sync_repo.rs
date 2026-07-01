@@ -344,7 +344,58 @@ impl<'a> SyncRepository<'a> {
             return Ok(false);
         }
 
-        self.apply_resolution(&conflict, keep)?;
+        self.apply_resolution(&conflict, conflict.kept_value(keep))?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        self.db.conn.execute(
+            "UPDATE sync_conflicts SET resolved = 1, resolved_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(true)
+    }
+
+    /// Resolve a single conflict with a user-supplied merged value.
+    ///
+    /// Unlike [`resolve_conflict`], this writes an arbitrary value (rather than
+    /// the local or remote side) to the underlying note/review entity, bumps the
+    /// per-field HLC, emits a propagating sync op, and marks the conflict
+    /// resolved. A no-op (returns `false`) if the conflict is missing or already
+    /// resolved. Returns [`DbError::InvalidOperation`] if the value is invalid
+    /// for the field (e.g. a non-integer or out-of-range review rating).
+    pub fn resolve_conflict_with_value(
+        &self,
+        id: &str,
+        value: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let Some(conflict) = self.get_conflict(id)? else {
+            return Ok(false);
+        };
+        if conflict.resolved {
+            return Ok(false);
+        }
+
+        let field = conflict.field_name.as_deref().ok_or_else(|| {
+            DbError::InvalidOperation("conflict has no field to resolve".to_string())
+        })?;
+        let entity_type = EntityType::from_str(&conflict.entity_type)
+            .map_err(|_| DbError::InvalidOperation("unknown conflict entity type".to_string()))?;
+
+        // Validate the merged value against the target field's domain.
+        if let (EntityType::Review, "rating") = (entity_type, field)
+            && let Some(v) = value
+        {
+            let rating: i64 = v
+                .trim()
+                .parse()
+                .map_err(|_| DbError::InvalidOperation(format!("invalid rating value: {v:?}")))?;
+            if !(0..=10).contains(&rating) {
+                return Err(DbError::InvalidOperation(format!(
+                    "rating must be between 0 and 10, got {rating}"
+                )));
+            }
+        }
+
+        self.apply_resolution(&conflict, value)?;
 
         let now = chrono::Utc::now().to_rfc3339();
         self.db.conn.execute(
@@ -359,7 +410,7 @@ impl<'a> SyncRepository<'a> {
         let conflicts = self.list_unresolved_conflicts()?;
         let mut resolved = 0;
         for conflict in &conflicts {
-            self.apply_resolution(conflict, keep)?;
+            self.apply_resolution(conflict, conflict.kept_value(keep))?;
             resolved += 1;
         }
         if resolved > 0 {
@@ -372,14 +423,17 @@ impl<'a> SyncRepository<'a> {
         Ok(resolved)
     }
 
-    /// Write the chosen value into the live entity, bump its HLC, and emit a
+    /// Write the given value into the live entity, bump its HLC, and emit a
     /// propagating sync op. Best-effort: if no device identity exists yet, the
     /// entity value is still updated but no op is generated.
-    fn apply_resolution(&self, conflict: &SyncConflict, keep: ConflictKeep) -> Result<(), DbError> {
+    fn apply_resolution(
+        &self,
+        conflict: &SyncConflict,
+        value: Option<&str>,
+    ) -> Result<(), DbError> {
         let field = conflict.field_name.as_deref().ok_or_else(|| {
             DbError::InvalidOperation("conflict has no field to resolve".to_string())
         })?;
-        let value = conflict.kept_value(keep);
 
         let entity_type = EntityType::from_str(&conflict.entity_type)
             .map_err(|_| DbError::InvalidOperation("unknown conflict entity type".to_string()))?;
@@ -882,5 +936,152 @@ mod tests {
         seed_book_and_note(&db, &note_id, "x");
         insert_conflict(&db, "c1", &note_id, "a", "b", true);
         assert!(!repo.resolve_conflict("c1", ConflictKeep::Local).unwrap());
+    }
+
+    fn seed_review(db: &Database, review_id: &str, content: Option<&str>, rating: Option<i64>) {
+        let now = "2026-06-15T10:00:00Z";
+        db.conn
+            .execute(
+                "INSERT OR IGNORE INTO books (id, title, created_at, updated_at)
+                 VALUES (?1, 'Dune', ?2, ?2)",
+                params!["01972123-aaaa-7000-8000-000000000abc", now],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO reviews (id, book_id, content, rating, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    review_id,
+                    "01972123-aaaa-7000-8000-000000000abc",
+                    content,
+                    rating,
+                    now
+                ],
+            )
+            .unwrap();
+    }
+
+    fn insert_rating_conflict(db: &Database, id: &str, entity_id: &str, local: &str, remote: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO sync_conflicts
+                 (id, entity_type, entity_id, field_name, local_value, remote_value,
+                  local_hlc, remote_hlc, resolved, created_at)
+                 VALUES (?1, 'review', ?2, 'rating', ?3, ?4, ?5, ?6, 0,
+                         '2026-06-15T10:30:00Z')",
+                params![
+                    id,
+                    entity_id,
+                    local,
+                    remote,
+                    format!("hlc-a-{id}"),
+                    format!("hlc-b-{id}")
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_conflict_with_value_updates_note_and_emits_op() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+        repo.get_or_create_device("test-device").unwrap();
+
+        let note_id = Uuid::now_v7().to_string();
+        seed_book_and_note(&db, &note_id, "remote text");
+        insert_conflict(&db, "c1", &note_id, "local text", "remote text", false);
+
+        let resolved = repo
+            .resolve_conflict_with_value("c1", Some("merged text"))
+            .unwrap();
+        assert!(resolved);
+
+        // Note content set to the custom merged value.
+        let content: String = db
+            .conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "merged text");
+
+        // Conflict marked resolved and excluded from listings.
+        assert_eq!(repo.count_unresolved_conflicts().unwrap(), 0);
+        let conflict = repo.get_conflict("c1").unwrap().unwrap();
+        assert!(conflict.resolved);
+        assert!(conflict.resolved_at.is_some());
+
+        // A propagating op was emitted.
+        let ops = repo.get_unpushed_ops().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].entity_type, EntityType::Note);
+        assert_eq!(ops[0].op_type, OpType::Update);
+    }
+
+    #[test]
+    fn resolve_conflict_with_value_updates_review_rating() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+        repo.get_or_create_device("test-device").unwrap();
+
+        let review_id = Uuid::now_v7().to_string();
+        seed_review(&db, &review_id, Some("nice"), Some(4));
+        insert_rating_conflict(&db, "c1", &review_id, "4", "8");
+
+        assert!(repo.resolve_conflict_with_value("c1", Some("6")).unwrap());
+
+        let rating: i64 = db
+            .conn
+            .query_row(
+                "SELECT rating FROM reviews WHERE id = ?1",
+                params![review_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rating, 6);
+        assert_eq!(repo.count_unresolved_conflicts().unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_conflict_with_invalid_rating_is_rejected() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+        repo.get_or_create_device("test-device").unwrap();
+
+        let review_id = Uuid::now_v7().to_string();
+        seed_review(&db, &review_id, Some("nice"), Some(4));
+        insert_rating_conflict(&db, "c1", &review_id, "4", "8");
+
+        assert!(repo.resolve_conflict_with_value("c1", Some("99")).is_err());
+        assert!(
+            repo.resolve_conflict_with_value("c1", Some("notnum"))
+                .is_err()
+        );
+        // Conflict left unresolved after a rejected value.
+        assert_eq!(repo.count_unresolved_conflicts().unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_with_value_missing_or_resolved_conflict_is_noop() {
+        let db = test_db();
+        let repo = SyncRepository::new(&db);
+
+        assert!(
+            !repo
+                .resolve_conflict_with_value("missing", Some("x"))
+                .unwrap()
+        );
+
+        let note_id = Uuid::now_v7().to_string();
+        seed_book_and_note(&db, &note_id, "x");
+        insert_conflict(&db, "c1", &note_id, "a", "b", true);
+        assert!(
+            !repo
+                .resolve_conflict_with_value("c1", Some("merged"))
+                .unwrap()
+        );
     }
 }

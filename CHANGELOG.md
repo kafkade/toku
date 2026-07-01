@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Format conversion: `toku convert <book> --to <format> [--from <format>] [--force]` converts
+  an associated ebook to another format by shelling out to Calibre's `ebook-convert`. The
+  output is written next to the source file (same name, new extension) and auto-associated with
+  the book (provenance `calibre-convert`). `--from` is inferred when the book has a single file
+  and required when it has several; `--force` overwrites an existing output. The Calibre
+  dependency is **optional and never hard** — if `ebook-convert` is not on `$PATH`, the command
+  prints install guidance (<https://calibre-ebook.com/download>) and exits non-zero instead of
+  panicking. Subprocess failures are reported with the underlying `ebook-convert` stderr.
+  DRM-free files only — no DRM stripping (#147)
+- Disk organization: `toku file organize [<book>|--all]` moves (or `--copy`) associated
+  ebook files into a managed library laid out by a configurable path template, updating the
+  stored DB paths in a single transaction. `--dry-run` previews the plan without touching
+  disk or the database; re-running is idempotent, and colliding targets get a deterministic
+  numeric suffix (e.g. `Title (2).epub`). Template tokens `{author}`, `{title}`, `{series}`,
+  `{format}`, `{year}` are
+  sanitized for cross-platform (Linux/macOS/Windows) safety. Configured via a new `[files]`
+  section in `config.toml` — `library_root` (defaults to `<data_dir>/library`) and
+  `organize_template` (defaults to `{author}/{title}.{format}`). Supports
+  `--format table|json|csv` (#152)
+- Inline manual-merge editor for sync conflicts: the web conflicts page now offers a
+  "Merge manually" action alongside keep-local/keep-remote, revealing an editable field
+  (textarea for note/review content, 0–10 number input for review ratings) pre-filled with
+  the local value. Resolving with a custom value writes it to the entity, bumps the HLC, and
+  emits a propagating `SyncOp::Update` so the merged value syncs to other devices. The CLI
+  gains `toku sync conflicts resolve <id> --value "..."` for the same custom-value path (#129)
+- File association CLI: `toku file add/list/remove` links ebook files (`.epub`,
+  `.pdf`, `.mobi`, `.azw3`) to books with multiple formats per book, auto-detecting
+  format from the extension, recording size, and storing a SHA-256 checksum (with
+  duplicate-checksum detection). Supports `--format table|json|csv` and `NO_COLOR`;
+  `remove` takes a format or path and an optional `--delete-file`. Backed by a new
+  local-only `files` table and `toku-files` crate (#148). The `files` table tracks
+  provenance (`source` + optional `source_ref`) so importer-created file records are
+  distinguishable from user-added ones (#153)
 - One-time `toku sync migrate` upgrade path from the legacy relay model to the account
   model (#126): generates a Secret Key + account, makes the first account the admin and
   adopts all pre-existing relay libraries/devices, re-keys every server op and snapshot from

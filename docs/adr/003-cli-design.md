@@ -36,6 +36,8 @@ toku import goodreads|calibre|storygraph <path> [--dry-run]
 toku export csv|json|backup [--output <path>]
 toku stats [--year <year>]
 toku tag add|remove|list <tag> [<books>...]
+toku file add|list|remove|organize <book> [<path>|<format>] [--all] [--dry-run] [--copy]
+toku convert <book> --to <format> [--from <format>] [--force]   # optional; needs Calibre
 toku bulk tag|status|delete [--status <s>] [--tag <t>] [--dry-run]
 toku config [--edit]
 ```

@@ -157,6 +157,13 @@ fn conflict_card(c: &SyncConflict, csrf: &str) -> Markup {
     let local = c.local_value.as_deref().unwrap_or("(empty)");
     let remote = c.remote_value.as_deref().unwrap_or("(empty)");
     let resolve_action = format!("/conflicts/resolve/{}", c.id);
+    // Prefill the merge editor with the local value (falling back to remote).
+    let merge_prefill = c
+        .local_value
+        .as_deref()
+        .or(c.remote_value.as_deref())
+        .unwrap_or("");
+    let is_rating = c.entity_type == "review" && c.field_name.as_deref() == Some("rating");
 
     html! {
         div.conflict-card {
@@ -186,6 +193,24 @@ fn conflict_card(c: &SyncConflict, csrf: &str) -> Markup {
                     (crate::auth_views::csrf_field(csrf))
                     input type="hidden" name="keep" value="remote";
                     button.btn.btn-primary type="submit" { "Keep remote" }
+                }
+            }
+            details.conflict-merge {
+                summary.conflict-merge-toggle { "Merge manually" }
+                form.conflict-merge-form method="post" action=(resolve_action) {
+                    (crate::auth_views::csrf_field(csrf))
+                    input type="hidden" name="keep" value="custom";
+                    @if is_rating {
+                        label.conflict-merge-label for=(format!("merge-{}", c.id)) { "Merged rating (0–10)" }
+                        input.conflict-merge-input id=(format!("merge-{}", c.id))
+                            type="number" name="value" min="0" max="10" step="1"
+                            value=(merge_prefill) required;
+                    } @else {
+                        label.conflict-merge-label for=(format!("merge-{}", c.id)) { "Merged value" }
+                        textarea.conflict-merge-textarea id=(format!("merge-{}", c.id))
+                            name="value" rows="4" { (merge_prefill) }
+                    }
+                    button.btn.btn-primary.conflict-merge-submit type="submit" { "Resolve with merged value" }
                 }
             }
         }
@@ -937,6 +962,23 @@ main {
 .conflict-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
 .conflict-actions form { display: inline; }
 .conflict-actions .btn-primary { margin-left: 0; }
+.conflict-merge { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.75rem; }
+.conflict-merge-toggle {
+    cursor: pointer; font-size: 0.85rem; font-weight: 600; color: var(--accent);
+    user-select: none;
+}
+.conflict-merge-form { margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }
+.conflict-merge-label { font-size: 0.8rem; font-weight: 600; color: var(--text-secondary); }
+.conflict-merge-textarea, .conflict-merge-input {
+    width: 100%; box-sizing: border-box; padding: 0.5rem 0.6rem;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; font-family: inherit; font-size: 0.9rem; resize: vertical;
+}
+.conflict-merge-input { max-width: 8rem; }
+.conflict-merge-textarea:focus, .conflict-merge-input:focus {
+    outline: none; border-color: var(--accent);
+}
+.conflict-merge-submit { align-self: flex-start; margin-left: 0; }
 
 /* Responsive */
 @media (max-width: 640px) {

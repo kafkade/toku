@@ -714,7 +714,7 @@ All statistics computed locally from SQLite queries. No server needed.
 ### 6.1 — File Management (Phase 6)
 
 - Associate ebook files (.epub, .pdf, .mobi, .azw3) with book entries 🟡
-- Organize files on disk using configurable templates (`{author}/{title}.{format}`) 🟡
+- Organize files on disk using configurable templates (`{author}/{title}.{format}`) 🟢
 - Multiple formats per book 🟢
 - File integrity checking (SHA-256 checksums) 🟢
 - Disk usage reporting 🟢

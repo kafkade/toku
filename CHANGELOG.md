@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Format conversion: `toku convert <book> --to <format> [--from <format>] [--force]` converts
+  an associated ebook to another format by shelling out to Calibre's `ebook-convert`. The
+  output is written next to the source file (same name, new extension) and auto-associated with
+  the book (provenance `calibre-convert`). `--from` is inferred when the book has a single file
+  and required when it has several; `--force` overwrites an existing output. The Calibre
+  dependency is **optional and never hard** — if `ebook-convert` is not on `$PATH`, the command
+  prints install guidance (<https://calibre-ebook.com/download>) and exits non-zero instead of
+  panicking. Subprocess failures are reported with the underlying `ebook-convert` stderr.
+  DRM-free files only — no DRM stripping (#147)
 - Disk organization: `toku file organize [<book>|--all]` moves (or `--copy`) associated
   ebook files into a managed library laid out by a configurable path template, updating the
   stored DB paths in a single transaction. `--dry-run` previews the plan without touching

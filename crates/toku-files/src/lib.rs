@@ -12,10 +12,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod convert;
 mod organize;
 mod repo;
 mod template;
 
+pub use convert::{ConvertError, Converter, DEFAULT_BINARY};
 pub use organize::{
     OrganizeOutcome, OrganizeSummary, PlanAction, PlannedMove, apply_plan, plan_organize,
 };

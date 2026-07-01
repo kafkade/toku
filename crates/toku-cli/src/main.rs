@@ -446,6 +446,24 @@ enum FileAction {
         #[arg(long)]
         delete_file: bool,
     },
+
+    /// Organize associated files on disk using the configured path template
+    Organize {
+        /// Book title to organize (omit and use --all to organize everything)
+        book: Option<String>,
+
+        /// Organize files for every book in the library
+        #[arg(long)]
+        all: bool,
+
+        /// Preview the planned moves without touching disk or the database
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Copy files into the library instead of moving them
+        #[arg(long)]
+        copy: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -977,7 +995,7 @@ fn main() -> Result<()> {
         Commands::Lookup { query, limit } => cmd_lookup(&query, limit, &cli.format),
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
-        Commands::File { action } => cmd_file(&db, &repo, action, &cli.format),
+        Commands::File { action } => cmd_file(&db, &repo, action, &data_dir, &cli.format),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
         Commands::Bulk { action } => cmd_bulk(&db, &repo, action),
         Commands::Stats {
@@ -2286,6 +2304,7 @@ fn cmd_file(
     db: &Database,
     repo: &BookRepository,
     action: FileAction,
+    data_dir: &Path,
     output_format: &OutputFormat,
 ) -> Result<()> {
     let files = FileRepository::new(db);
@@ -2405,6 +2424,168 @@ fn cmd_file(
                 }
                 None => anyhow::bail!("no file matching \"{target}\" linked to \"{}\"", book.title),
             }
+        }
+        FileAction::Organize {
+            book,
+            all,
+            dry_run,
+            copy,
+        } => cmd_file_organize(db, repo, data_dir, book, all, dry_run, copy, output_format),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_file_organize(
+    db: &Database,
+    repo: &BookRepository,
+    data_dir: &Path,
+    book: Option<String>,
+    all: bool,
+    dry_run: bool,
+    copy: bool,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    use toku_files::{PathTemplate, PlanAction, apply_plan, plan_organize};
+
+    // Exactly one of <book> or --all.
+    if book.is_some() && all {
+        anyhow::bail!("specify either a book or --all, not both");
+    }
+    if book.is_none() && !all {
+        anyhow::bail!("specify a book to organize, or --all for the whole library");
+    }
+
+    let config = TokuConfig::load(data_dir).context("failed to load config")?;
+    let root = match &config.files.library_root {
+        Some(dir) => PathBuf::from(dir),
+        None => data_dir.join("library"),
+    };
+    let template =
+        PathTemplate::parse(&config.files.organize_template).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Which books to organize.
+    let book_ids: Vec<uuid::Uuid> = match &book {
+        Some(query) => vec![resolve_book(repo, query)?.id],
+        None => repo.list_books()?.into_iter().map(|b| b.id).collect(),
+    };
+
+    let plan =
+        plan_organize(db, &book_ids, &root, &template, copy).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if plan.is_empty() {
+        eprintln!("No associated files to organize.");
+        return Ok(());
+    }
+
+    render_organize_plan(&plan, dry_run, output_format);
+
+    let actionable = plan
+        .iter()
+        .filter(|p| matches!(p.action, PlanAction::Move | PlanAction::Copy))
+        .count();
+
+    if dry_run {
+        eprintln!(
+            "\nDry run: {} file(s) would be {}, {} skipped. Nothing changed.",
+            actionable,
+            if copy { "copied" } else { "moved" },
+            plan.len() - actionable,
+        );
+        return Ok(());
+    }
+
+    if actionable == 0 {
+        eprintln!("\nEverything is already organized. Nothing to do.");
+        return Ok(());
+    }
+
+    let summary = apply_plan(db, &plan).map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!(
+        "\n✓ Organized library at {}: {} moved, {} copied, {} skipped.",
+        root.display(),
+        summary.moved,
+        summary.copied,
+        summary.skipped,
+    );
+    Ok(())
+}
+
+fn render_organize_plan(
+    plan: &[toku_files::PlannedMove],
+    dry_run: bool,
+    output_format: &OutputFormat,
+) {
+    use toku_files::PlanAction;
+
+    let action_label = |a: &PlanAction| -> String {
+        match a {
+            PlanAction::Move => "move".to_string(),
+            PlanAction::Copy => "copy".to_string(),
+            PlanAction::Skip { reason } => format!("skip ({reason})"),
+        }
+    };
+
+    match output_format {
+        OutputFormat::Json => {
+            let items: Vec<serde_json::Value> = plan
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "book": p.book_title,
+                        "format": p.format,
+                        "action": action_label(&p.action),
+                        "from": p.from.to_string_lossy(),
+                        "to": p.to.to_string_lossy(),
+                    })
+                })
+                .collect();
+            if let Ok(s) = serde_json::to_string_pretty(&items) {
+                println!("{s}");
+            }
+        }
+        OutputFormat::Csv => {
+            println!("action,book,format,from,to");
+            for p in plan {
+                println!(
+                    "{},\"{}\",{},\"{}\",\"{}\"",
+                    action_label(&p.action),
+                    p.book_title.replace('"', "\"\""),
+                    p.format,
+                    p.from.to_string_lossy().replace('"', "\"\""),
+                    p.to.to_string_lossy().replace('"', "\"\""),
+                );
+            }
+        }
+        OutputFormat::Table => {
+            use tabled::{Table, Tabled};
+
+            #[derive(Tabled)]
+            struct Row {
+                #[tabled(rename = "Action")]
+                action: String,
+                #[tabled(rename = "Book")]
+                book: String,
+                #[tabled(rename = "Format")]
+                format: String,
+                #[tabled(rename = "Target")]
+                to: String,
+            }
+            let rows: Vec<Row> = plan
+                .iter()
+                .map(|p| Row {
+                    action: action_label(&p.action),
+                    book: p.book_title.clone(),
+                    format: p.format.clone(),
+                    to: p.to.to_string_lossy().to_string(),
+                })
+                .collect();
+            let heading = if dry_run {
+                "Planned changes (dry run):"
+            } else {
+                "Planned changes:"
+            };
+            eprintln!("{heading}");
+            println!("{}", Table::new(rows));
         }
     }
 }

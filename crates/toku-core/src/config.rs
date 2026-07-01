@@ -16,6 +16,34 @@ pub struct TokuConfig {
     pub metadata_source: String,
     /// Sync configuration (optional — absent until `toku sync init`)
     pub sync: Option<SyncConfig>,
+    /// Ebook file management configuration (disk organization).
+    pub files: FilesConfig,
+}
+
+/// File-management configuration stored in `config.toml` under `[files]`.
+///
+/// Controls how `toku file organize` lays out ebook files on disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct FilesConfig {
+    /// Managed library root. When unset, defaults to `<data_dir>/library`.
+    pub library_root: Option<String>,
+    /// Path template used to organize files, relative to the library root.
+    /// Supports the `{author}`, `{title}`, `{series}`, `{format}`, and `{year}`
+    /// tokens, e.g. `{author}/{title}.{format}`.
+    pub organize_template: String,
+}
+
+/// Default path template: `{author}/{title}.{format}`.
+pub const DEFAULT_ORGANIZE_TEMPLATE: &str = "{author}/{title}.{format}";
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            library_root: None,
+            organize_template: DEFAULT_ORGANIZE_TEMPLATE.to_string(),
+        }
+    }
 }
 
 /// Sync configuration stored in `config.toml` under `[sync]`.
@@ -40,6 +68,7 @@ impl Default for TokuConfig {
             color: "auto".to_string(),
             metadata_source: "openlibrary".to_string(),
             sync: None,
+            files: FilesConfig::default(),
         }
     }
 }
@@ -109,6 +138,7 @@ mod tests {
             color: "never".to_string(),
             metadata_source: "google".to_string(),
             sync: None,
+            files: FilesConfig::default(),
         };
         cfg.save(&dir).expect("save should succeed");
 

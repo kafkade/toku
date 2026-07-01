@@ -113,6 +113,12 @@ CREATE INDEX idx_files_checksum ON files(checksum);
   content-addressed cover store — keeping a single portable, user-owned data directory.
 - Template resolution sanitizes path segments (filesystem-illegal characters, length
   limits) and resolves collisions deterministically so re-runs are idempotent.
+- **Interface** (#152): `toku file organize [<book>|--all]` builds a plan and applies it,
+  moving files by default (`--copy` to copy) and updating stored DB paths in a single
+  transaction. `--dry-run` previews the plan without touching disk or DB. Configuration
+  lives under `[files]` in `config.toml`: `library_root` (defaults to `<data_dir>/library`)
+  and `organize_template` (defaults to `{author}/{title}.{format}`). Supported tokens:
+  `{author}`, `{title}`, `{series}`, `{format}`, `{year}`.
 
 ### 5. Format conversion — optional Calibre shell-out
 

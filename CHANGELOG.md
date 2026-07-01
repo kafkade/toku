@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Disk organization: `toku file organize [<book>|--all]` moves (or `--copy`) associated
+  ebook files into a managed library laid out by a configurable path template, updating the
+  stored DB paths in a single transaction. `--dry-run` previews the plan without touching
+  disk or the database; re-running is idempotent, and colliding targets get a deterministic
+  numeric suffix (e.g. `Title (2).epub`). Template tokens `{author}`, `{title}`, `{series}`,
+  `{format}`, `{year}` are
+  sanitized for cross-platform (Linux/macOS/Windows) safety. Configured via a new `[files]`
+  section in `config.toml` — `library_root` (defaults to `<data_dir>/library`) and
+  `organize_template` (defaults to `{author}/{title}.{format}`). Supports
+  `--format table|json|csv` (#152)
 - Inline manual-merge editor for sync conflicts: the web conflicts page now offers a
   "Merge manually" action alongside keep-local/keep-remote, revealing an editable field
   (textarea for note/review content, 0–10 number input for review ratings) pre-filled with

@@ -125,6 +125,15 @@ impl<'a> FileRepository<'a> {
             .execute("DELETE FROM files WHERE id = ?1", params![id.to_string()])?;
         Ok(())
     }
+
+    /// Update the stored on-disk path of a file record and bump `updated_at`.
+    pub fn update_path(&self, id: &Uuid, new_path: &str) -> Result<(), FileError> {
+        self.db.conn.execute(
+            "UPDATE files SET path = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id.to_string(), new_path, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_file(row: &rusqlite::Row<'_>) -> Result<EbookFile, String> {

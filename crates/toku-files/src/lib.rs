@@ -12,9 +12,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod organize;
 mod repo;
+mod template;
 
+pub use organize::{
+    OrganizeOutcome, OrganizeSummary, PlanAction, PlannedMove, apply_plan, plan_organize,
+};
 pub use repo::FileRepository;
+pub use template::{
+    PathTemplate, TemplateContext, UNKNOWN_AUTHOR, UNKNOWN_SERIES, UNKNOWN_YEAR, sanitize_segment,
+};
 
 /// Supported ebook file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +143,12 @@ pub enum FileError {
 
     #[error("I/O error: {0}")]
     Io(String),
+
+    #[error("invalid path template: {0}")]
+    Template(String),
+
+    #[error("organize failed: {0}")]
+    Organize(String),
 
     #[error("database error: {0}")]
     Db(#[from] toku_db::DbError),

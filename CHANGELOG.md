@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   format from the extension, recording size, and storing a SHA-256 checksum (with
   duplicate-checksum detection). Supports `--format table|json|csv` and `NO_COLOR`;
   `remove` takes a format or path and an optional `--delete-file`. Backed by a new
-  local-only `files` table and `toku-files` crate (#148)
+  local-only `files` table and `toku-files` crate (#148). The `files` table tracks
+  provenance (`source` + optional `source_ref`) so importer-created file records are
+  distinguishable from user-added ones (#153)
 - One-time `toku sync migrate` upgrade path from the legacy relay model to the account
   model (#126): generates a Secret Key + account, makes the first account the admin and
   adopts all pre-existing relay libraries/devices, re-keys every server op and snapshot from

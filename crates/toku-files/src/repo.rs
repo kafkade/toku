@@ -28,8 +28,8 @@ impl<'a> FileRepository<'a> {
         }
         self.db.conn.execute(
             "INSERT INTO files (id, book_id, path, format, size_bytes, checksum,
-             created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             source, source_ref, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 file.id.to_string(),
                 file.book_id.to_string(),
@@ -37,6 +37,8 @@ impl<'a> FileRepository<'a> {
                 file.format.as_str(),
                 file.size_bytes,
                 file.checksum,
+                file.source,
+                file.source_ref,
                 file.created_at.to_rfc3339(),
                 file.updated_at.to_rfc3339(),
             ],
@@ -47,7 +49,7 @@ impl<'a> FileRepository<'a> {
     /// List all files associated with a book, ordered by format.
     pub fn list_files(&self, book_id: &Uuid) -> Result<Vec<EbookFile>, FileError> {
         let mut stmt = self.db.conn.prepare(
-            "SELECT id, book_id, path, format, size_bytes, checksum, created_at, updated_at
+            "SELECT id, book_id, path, format, size_bytes, checksum, source, source_ref, created_at, updated_at
              FROM files WHERE book_id = ?1 ORDER BY format",
         )?;
         let files = stmt
@@ -65,7 +67,7 @@ impl<'a> FileRepository<'a> {
         checksum: &str,
     ) -> Result<Option<EbookFile>, FileError> {
         let mut stmt = self.db.conn.prepare(
-            "SELECT id, book_id, path, format, size_bytes, checksum, created_at, updated_at
+            "SELECT id, book_id, path, format, size_bytes, checksum, source, source_ref, created_at, updated_at
              FROM files WHERE book_id = ?1 AND checksum = ?2",
         )?;
         let mut rows = stmt
@@ -129,8 +131,8 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> Result<EbookFile, String> {
     let id_str: String = row.get(0).map_err(|e| e.to_string())?;
     let book_id_str: String = row.get(1).map_err(|e| e.to_string())?;
     let format_str: String = row.get(3).map_err(|e| e.to_string())?;
-    let created_str: String = row.get(6).map_err(|e| e.to_string())?;
-    let updated_str: String = row.get(7).map_err(|e| e.to_string())?;
+    let created_str: String = row.get(8).map_err(|e| e.to_string())?;
+    let updated_str: String = row.get(9).map_err(|e| e.to_string())?;
     Ok(EbookFile {
         id: Uuid::parse_str(&id_str).map_err(|e| e.to_string())?,
         book_id: Uuid::parse_str(&book_id_str).map_err(|e| e.to_string())?,
@@ -140,6 +142,8 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> Result<EbookFile, String> {
             .map_err(|_| format!("bad format: {format_str}"))?,
         size_bytes: row.get(4).map_err(|e| e.to_string())?,
         checksum: row.get(5).map_err(|e| e.to_string())?,
+        source: row.get(6).map_err(|e| e.to_string())?,
+        source_ref: row.get(7).map_err(|e| e.to_string())?,
         created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
             .map_err(|e| e.to_string())?
             .with_timezone(&Utc),

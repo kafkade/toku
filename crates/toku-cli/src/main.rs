@@ -12,7 +12,10 @@ use toku_core::{
     TokuConfig, compute_stats, parse_duration_to_minutes,
 };
 use toku_db::{BookRepository, Database};
-use toku_files::{EbookFile, FileFormat, FileRepository, sha256_file};
+use toku_files::{
+    Converter, EbookFile, FileFormat, FileRepository, UsageTotals, VerifyStatus, sha256_file,
+    usage_by_key, usage_totals, verify_file,
+};
 mod account;
 mod import_ui;
 mod sync;
@@ -196,6 +199,29 @@ enum Commands {
     File {
         #[command(subcommand)]
         action: FileAction,
+    },
+
+    /// Convert an associated ebook to another format (optional; needs Calibre)
+    ///
+    /// Shells out to Calibre's `ebook-convert`. The resulting file is written
+    /// next to the source file and auto-associated with the book. Requires
+    /// Calibre on your PATH (https://calibre-ebook.com/download); it is never a
+    /// hard dependency. DRM-free files only — no DRM stripping.
+    Convert {
+        /// Book title (or id) whose file should be converted
+        book: String,
+
+        /// Target format to convert to (epub/pdf/mobi/azw3)
+        #[arg(long)]
+        to: String,
+
+        /// Source format to convert from (auto-detected when the book has one file)
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Overwrite the output file if it already exists on disk
+        #[arg(long)]
+        force: bool,
     },
 
     /// Export your library (csv, json, markdown, backup)
@@ -445,6 +471,50 @@ enum FileAction {
         /// Also delete the file from disk (default: only drop the DB record)
         #[arg(long)]
         delete_file: bool,
+    },
+
+    /// Organize associated files on disk using the configured path template
+    Organize {
+        /// Book title to organize (omit and use --all to organize everything)
+        book: Option<String>,
+
+        /// Organize files for every book in the library
+        #[arg(long)]
+        all: bool,
+
+        /// Preview the planned moves without touching disk or the database
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Copy files into the library instead of moving them
+        #[arg(long)]
+        copy: bool,
+    },
+
+    /// Verify file integrity by recomputing SHA-256 checksums
+    ///
+    /// Streams each associated file to recompute its checksum and compares it to
+    /// the value stored when the file was linked. Flags files whose contents
+    /// changed (mismatch) or that are no longer on disk (missing). Exits with a
+    /// non-zero status if any problem is found, for use in scripts.
+    Verify {
+        /// Book title to verify (omit and use --all to verify everything)
+        book: Option<String>,
+
+        /// Verify files for every book in the library
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Report disk usage of associated files, with an optional breakdown
+    ///
+    /// Totals reflect the catalog's recorded file sizes. Use --by to group the
+    /// breakdown by format (default), author, or shelf. A file linked to
+    /// multiple authors or shelves is counted under each of them.
+    Usage {
+        /// Group the breakdown by: format (default), author, or shelf
+        #[arg(long, value_name = "DIMENSION")]
+        by: Option<String>,
     },
 }
 
@@ -802,14 +872,18 @@ enum ConflictAction {
         id: String,
     },
 
-    /// Resolve a single conflict by keeping the local or remote value
+    /// Resolve a single conflict, keeping one side or a custom merged value
     Resolve {
         /// Conflict ID
         id: String,
 
-        /// Which side to keep
-        #[arg(long, value_enum)]
-        keep: KeepArg,
+        /// Which side to keep (mutually exclusive with --value)
+        #[arg(long, value_enum, group = "resolution")]
+        keep: Option<KeepArg>,
+
+        /// Resolve with a custom merged value (mutually exclusive with --keep)
+        #[arg(long, group = "resolution")]
+        value: Option<String>,
     },
 
     /// Resolve every unresolved conflict the same way
@@ -973,7 +1047,13 @@ fn main() -> Result<()> {
         Commands::Lookup { query, limit } => cmd_lookup(&query, limit, &cli.format),
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
-        Commands::File { action } => cmd_file(&db, &repo, action, &cli.format),
+        Commands::File { action } => cmd_file(&db, &repo, action, &data_dir, &cli.format),
+        Commands::Convert {
+            book,
+            to,
+            from,
+            force,
+        } => cmd_convert(&db, &repo, &book, &to, from.as_deref(), force),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
         Commands::Bulk { action } => cmd_bulk(&db, &repo, action),
         Commands::Stats {
@@ -2282,6 +2362,7 @@ fn cmd_file(
     db: &Database,
     repo: &BookRepository,
     action: FileAction,
+    data_dir: &Path,
     output_format: &OutputFormat,
 ) -> Result<()> {
     let files = FileRepository::new(db);
@@ -2401,6 +2482,599 @@ fn cmd_file(
                 }
                 None => anyhow::bail!("no file matching \"{target}\" linked to \"{}\"", book.title),
             }
+        }
+        FileAction::Organize {
+            book,
+            all,
+            dry_run,
+            copy,
+        } => cmd_file_organize(db, repo, data_dir, book, all, dry_run, copy, output_format),
+        FileAction::Verify { book, all } => cmd_file_verify(db, repo, book, all, output_format),
+        FileAction::Usage { by } => cmd_file_usage(db, repo, by.as_deref(), output_format),
+    }
+}
+
+/// Recompute SHA-256 for associated files and report integrity problems.
+///
+/// Verifies a single book's files, or the whole library with `--all`. Prints a
+/// per-file status plus a summary, and exits non-zero when any file is missing
+/// or its contents no longer match the stored checksum.
+fn cmd_file_verify(
+    db: &Database,
+    repo: &BookRepository,
+    book: Option<String>,
+    all: bool,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    let files = FileRepository::new(db);
+
+    let targets: Vec<EbookFile> = match (&book, all) {
+        (Some(_), true) => anyhow::bail!("pass either a book title or --all, not both"),
+        (None, false) => anyhow::bail!("specify a book title, or use --all to verify everything"),
+        (Some(title), false) => {
+            let book = resolve_book(repo, title)?;
+            files
+                .list_files(&book.id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        (None, true) => files.list_all_files().map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
+
+    if targets.is_empty() {
+        eprintln!("No files to verify. Link some with: toku file add");
+        return Ok(());
+    }
+
+    let outcomes: Vec<toku_files::VerifyOutcome> = targets
+        .iter()
+        .map(verify_file)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mismatches = outcomes
+        .iter()
+        .filter(|o| o.status == VerifyStatus::Mismatch)
+        .count();
+    let missing = outcomes
+        .iter()
+        .filter(|o| o.status == VerifyStatus::Missing)
+        .count();
+    let ok = outcomes.len() - mismatches - missing;
+
+    match output_format {
+        OutputFormat::Json => {
+            #[derive(serde::Serialize)]
+            struct Row {
+                status: String,
+                format: String,
+                path: String,
+                stored_checksum: String,
+                computed_checksum: Option<String>,
+            }
+            let rows: Vec<Row> = outcomes
+                .iter()
+                .map(|o| Row {
+                    status: o.status.as_str().to_string(),
+                    format: o.file.format.to_string(),
+                    path: o.file.path.clone(),
+                    stored_checksum: o.file.checksum.clone(),
+                    computed_checksum: o.computed.clone(),
+                })
+                .collect();
+            #[derive(serde::Serialize)]
+            struct Report<'a> {
+                ok: usize,
+                mismatch: usize,
+                missing: usize,
+                files: &'a [Row],
+            }
+            let report = Report {
+                ok,
+                mismatch: mismatches,
+                missing,
+                files: &rows,
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Csv => {
+            println!("status,format,path,stored_checksum,computed_checksum");
+            for o in &outcomes {
+                println!(
+                    "{},{},\"{}\",{},{}",
+                    o.status,
+                    o.file.format,
+                    o.file.path.replace('"', "\"\""),
+                    o.file.checksum,
+                    o.computed.as_deref().unwrap_or("")
+                );
+            }
+        }
+        OutputFormat::Table => {
+            use tabled::{Table, Tabled};
+
+            #[derive(Tabled)]
+            struct Row {
+                #[tabled(rename = "Status")]
+                status: String,
+                #[tabled(rename = "Format")]
+                format: String,
+                #[tabled(rename = "Path")]
+                path: String,
+            }
+            let rows: Vec<Row> = outcomes
+                .iter()
+                .map(|o| Row {
+                    status: match o.status {
+                        VerifyStatus::Ok => "ok",
+                        VerifyStatus::Mismatch => "MISMATCH",
+                        VerifyStatus::Missing => "MISSING",
+                    }
+                    .to_string(),
+                    format: o.file.format.to_string(),
+                    path: o.file.path.clone(),
+                })
+                .collect();
+            println!("{}", Table::new(rows));
+        }
+    }
+
+    eprintln!(
+        "\n{} ok, {} mismatch, {} missing ({} file(s) checked)",
+        ok,
+        mismatches,
+        missing,
+        outcomes.len()
+    );
+
+    if mismatches + missing > 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Report total disk usage of associated files with an optional breakdown.
+///
+/// Totals are computed from the recorded file sizes in the catalog. The
+/// breakdown groups by format (default), author, or shelf; a file linked to
+/// multiple authors or shelves contributes to each bucket, while books with
+/// none fall into an `(unassigned)` bucket.
+fn cmd_file_usage(
+    db: &Database,
+    repo: &BookRepository,
+    by: Option<&str>,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    let files = FileRepository::new(db);
+    let all_files = files.list_all_files().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let dimension = by.unwrap_or("format").to_lowercase();
+    if !matches!(dimension.as_str(), "format" | "author" | "shelf") {
+        anyhow::bail!("unknown --by value \"{dimension}\" (expected format, author, or shelf)");
+    }
+
+    let totals = usage_totals(&all_files);
+
+    // Build the grouped breakdown. Author/shelf require joins through the book
+    // repository; a file with no authors/shelves is bucketed as "(unassigned)".
+    const UNASSIGNED: &str = "(unassigned)";
+    let grouped: std::collections::BTreeMap<String, UsageTotals> = match dimension.as_str() {
+        "format" => usage_by_key(&all_files, |f| vec![f.format.to_string()]),
+        "author" => usage_by_key(&all_files, |f| {
+            let names: Vec<String> = repo
+                .get_book_authors(&f.book_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(a, _)| a.name)
+                .collect();
+            if names.is_empty() {
+                vec![UNASSIGNED.to_string()]
+            } else {
+                names
+            }
+        }),
+        "shelf" => usage_by_key(&all_files, |f| {
+            let names: Vec<String> = repo
+                .get_book_shelves(&f.book_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            if names.is_empty() {
+                vec![UNASSIGNED.to_string()]
+            } else {
+                names
+            }
+        }),
+        _ => unreachable!(),
+    };
+
+    // Sort breakdown rows by descending size for human-facing output.
+    let mut rows: Vec<(String, UsageTotals)> = grouped.into_iter().collect();
+    rows.sort_by(|a, b| {
+        b.1.total_bytes
+            .cmp(&a.1.total_bytes)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    match output_format {
+        OutputFormat::Json => {
+            #[derive(serde::Serialize)]
+            struct Group {
+                key: String,
+                file_count: u64,
+                size_bytes: i64,
+            }
+            #[derive(serde::Serialize)]
+            struct Report {
+                dimension: String,
+                total_files: u64,
+                total_bytes: i64,
+                breakdown: Vec<Group>,
+            }
+            let report = Report {
+                dimension: dimension.clone(),
+                total_files: totals.file_count,
+                total_bytes: totals.total_bytes,
+                breakdown: rows
+                    .iter()
+                    .map(|(k, v)| Group {
+                        key: k.clone(),
+                        file_count: v.file_count,
+                        size_bytes: v.total_bytes,
+                    })
+                    .collect(),
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputFormat::Csv => {
+            println!("{dimension},file_count,size_bytes");
+            for (k, v) in &rows {
+                println!(
+                    "\"{}\",{},{}",
+                    k.replace('"', "\"\""),
+                    v.file_count,
+                    v.total_bytes
+                );
+            }
+            println!("\"TOTAL\",{},{}", totals.file_count, totals.total_bytes);
+        }
+        OutputFormat::Table => {
+            use tabled::{Table, Tabled};
+
+            #[derive(Tabled)]
+            struct Row {
+                #[tabled(rename = "Group")]
+                key: String,
+                #[tabled(rename = "Files")]
+                files: u64,
+                #[tabled(rename = "Size")]
+                size: String,
+            }
+            let table_rows: Vec<Row> = rows
+                .iter()
+                .map(|(k, v)| Row {
+                    key: k.clone(),
+                    files: v.file_count,
+                    size: human_size(v.total_bytes),
+                })
+                .collect();
+            let header = match dimension.as_str() {
+                "author" => "By author",
+                "shelf" => "By shelf",
+                _ => "By format",
+            };
+            println!("{header}:");
+            println!("{}", Table::new(table_rows));
+            println!(
+                "\nTotal: {} across {} file(s)",
+                human_size(totals.total_bytes),
+                totals.file_count
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Convert an associated ebook file to another format via Calibre's
+/// `ebook-convert`, writing the output next to the source file and
+/// auto-associating it with the book.
+fn cmd_convert(
+    db: &Database,
+    repo: &BookRepository,
+    book_query: &str,
+    to: &str,
+    from: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let book = resolve_book(repo, book_query)?;
+    let target_format: FileFormat = to.parse().map_err(|_| {
+        anyhow::anyhow!("unsupported target format \"{to}\" (expected epub, pdf, mobi, or azw3)")
+    })?;
+
+    let files = FileRepository::new(db);
+    let associated = files
+        .list_files(&book.id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if associated.is_empty() {
+        anyhow::bail!(
+            "No files linked to \"{}\". Add one first with: toku file add \"{}\" <path>",
+            book.title,
+            book.title
+        );
+    }
+
+    // Pick the source file: honour --from, else auto-pick a single file, else
+    // bail asking the user to disambiguate.
+    let source = match from {
+        Some(f) => {
+            let fmt: FileFormat = f.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "unsupported source format \"{f}\" (expected epub, pdf, mobi, or azw3)"
+                )
+            })?;
+            associated
+                .iter()
+                .find(|file| file.format == fmt)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no {fmt} file linked to \"{}\"", book.title))?
+        }
+        None => {
+            if associated.len() == 1 {
+                associated[0].clone()
+            } else {
+                let formats = associated
+                    .iter()
+                    .map(|f| f.format.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "\"{}\" has multiple files ({formats}). Choose one with --from <format>",
+                    book.title
+                );
+            }
+        }
+    };
+
+    if source.format == target_format {
+        anyhow::bail!("source is already {target_format}; nothing to convert");
+    }
+
+    let src_path = PathBuf::from(&source.path);
+    if !src_path.is_file() {
+        anyhow::bail!(
+            "source file is missing on disk: {}\nRe-add it with: toku file add",
+            source.path
+        );
+    }
+
+    // Write the output next to the source: same stem, new extension.
+    let dst_path = src_path.with_extension(target_format.as_str());
+    if dst_path == src_path {
+        anyhow::bail!(
+            "source and output paths are identical: {}",
+            src_path.display()
+        );
+    }
+    if dst_path.exists() && !force {
+        anyhow::bail!(
+            "output already exists: {}\nPass --force to overwrite.",
+            dst_path.display()
+        );
+    }
+
+    let converter = Converter::new();
+    // Optional dependency: fail cleanly (non-zero) with install guidance if absent.
+    converter
+        .ensure_available()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    eprintln!(
+        "Converting {} → {} via ebook-convert…",
+        source.format, target_format
+    );
+    converter
+        .convert(&src_path, &dst_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !dst_path.is_file() {
+        anyhow::bail!(
+            "ebook-convert reported success but produced no output at {}",
+            dst_path.display()
+        );
+    }
+
+    let size_bytes = std::fs::metadata(&dst_path)
+        .with_context(|| format!("reading {}", dst_path.display()))?
+        .len() as i64;
+    let checksum = sha256_file(&dst_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stored = dst_path
+        .canonicalize()
+        .unwrap_or_else(|_| dst_path.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let file = EbookFile::new(book.id, stored, target_format, size_bytes, checksum)
+        .with_source("calibre-convert", Some(source.path.clone()));
+
+    match files.add_file(&file) {
+        Ok(()) => {
+            eprintln!(
+                "✓ Converted to {} ({}) and linked to \"{}\"\n  {}",
+                target_format,
+                human_size(size_bytes),
+                book.title,
+                dst_path.display()
+            );
+            Ok(())
+        }
+        // The output already matched an existing association for this book.
+        Err(toku_files::FileError::Duplicate(_)) => {
+            eprintln!(
+                "✓ Converted to {} at {} (already linked to \"{}\")",
+                target_format,
+                dst_path.display(),
+                book.title
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_file_organize(
+    db: &Database,
+    repo: &BookRepository,
+    data_dir: &Path,
+    book: Option<String>,
+    all: bool,
+    dry_run: bool,
+    copy: bool,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    use toku_files::{PathTemplate, PlanAction, apply_plan, plan_organize};
+
+    // Exactly one of <book> or --all.
+    if book.is_some() && all {
+        anyhow::bail!("specify either a book or --all, not both");
+    }
+    if book.is_none() && !all {
+        anyhow::bail!("specify a book to organize, or --all for the whole library");
+    }
+
+    let config = TokuConfig::load(data_dir).context("failed to load config")?;
+    let root = match &config.files.library_root {
+        Some(dir) => PathBuf::from(dir),
+        None => data_dir.join("library"),
+    };
+    let template =
+        PathTemplate::parse(&config.files.organize_template).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Which books to organize.
+    let book_ids: Vec<uuid::Uuid> = match &book {
+        Some(query) => vec![resolve_book(repo, query)?.id],
+        None => repo.list_books()?.into_iter().map(|b| b.id).collect(),
+    };
+
+    let plan =
+        plan_organize(db, &book_ids, &root, &template, copy).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if plan.is_empty() {
+        eprintln!("No associated files to organize.");
+        return Ok(());
+    }
+
+    render_organize_plan(&plan, dry_run, output_format);
+
+    let actionable = plan
+        .iter()
+        .filter(|p| matches!(p.action, PlanAction::Move | PlanAction::Copy))
+        .count();
+
+    if dry_run {
+        eprintln!(
+            "\nDry run: {} file(s) would be {}, {} skipped. Nothing changed.",
+            actionable,
+            if copy { "copied" } else { "moved" },
+            plan.len() - actionable,
+        );
+        return Ok(());
+    }
+
+    if actionable == 0 {
+        eprintln!("\nEverything is already organized. Nothing to do.");
+        return Ok(());
+    }
+
+    let summary = apply_plan(db, &plan).map_err(|e| anyhow::anyhow!("{e}"))?;
+    eprintln!(
+        "\n✓ Organized library at {}: {} moved, {} copied, {} skipped.",
+        root.display(),
+        summary.moved,
+        summary.copied,
+        summary.skipped,
+    );
+    Ok(())
+}
+
+fn render_organize_plan(
+    plan: &[toku_files::PlannedMove],
+    dry_run: bool,
+    output_format: &OutputFormat,
+) {
+    use toku_files::PlanAction;
+
+    let action_label = |a: &PlanAction| -> String {
+        match a {
+            PlanAction::Move => "move".to_string(),
+            PlanAction::Copy => "copy".to_string(),
+            PlanAction::Skip { reason } => format!("skip ({reason})"),
+        }
+    };
+
+    match output_format {
+        OutputFormat::Json => {
+            let items: Vec<serde_json::Value> = plan
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "book": p.book_title,
+                        "format": p.format,
+                        "action": action_label(&p.action),
+                        "from": p.from.to_string_lossy(),
+                        "to": p.to.to_string_lossy(),
+                    })
+                })
+                .collect();
+            if let Ok(s) = serde_json::to_string_pretty(&items) {
+                println!("{s}");
+            }
+        }
+        OutputFormat::Csv => {
+            println!("action,book,format,from,to");
+            for p in plan {
+                println!(
+                    "{},\"{}\",{},\"{}\",\"{}\"",
+                    action_label(&p.action),
+                    p.book_title.replace('"', "\"\""),
+                    p.format,
+                    p.from.to_string_lossy().replace('"', "\"\""),
+                    p.to.to_string_lossy().replace('"', "\"\""),
+                );
+            }
+        }
+        OutputFormat::Table => {
+            use tabled::{Table, Tabled};
+
+            #[derive(Tabled)]
+            struct Row {
+                #[tabled(rename = "Action")]
+                action: String,
+                #[tabled(rename = "Book")]
+                book: String,
+                #[tabled(rename = "Format")]
+                format: String,
+                #[tabled(rename = "Target")]
+                to: String,
+            }
+            let rows: Vec<Row> = plan
+                .iter()
+                .map(|p| Row {
+                    action: action_label(&p.action),
+                    book: p.book_title.clone(),
+                    format: p.format.clone(),
+                    to: p.to.to_string_lossy().to_string(),
+                })
+                .collect();
+            let heading = if dry_run {
+                "Planned changes (dry run):"
+            } else {
+                "Planned changes:"
+            };
+            eprintln!("{heading}");
+            println!("{}", Table::new(rows));
         }
     }
 }
@@ -4448,7 +5122,7 @@ fn print_conflict_human(c: &toku_db::SyncConflict) {
     eprintln!("  Local  [{}]: {local}", c.local_hlc);
     eprintln!("  Remote [{}]: {remote}", c.remote_hlc);
     eprintln!(
-        "  Resolve: toku sync conflicts resolve {} --keep local|remote",
+        "  Resolve: toku sync conflicts resolve {} --keep local|remote  (or --value \"...\")",
         c.id
     );
 }
@@ -4524,15 +5198,24 @@ fn cmd_sync_conflicts(
             Ok(())
         }
 
-        ConflictAction::Resolve { id, keep } => {
-            let resolved = sync::orchestrator::resolve_conflict(data_dir, &id, keep.into())?;
+        ConflictAction::Resolve { id, keep, value } => {
+            let (resolved, kept) = if let Some(value) = value {
+                let resolved =
+                    sync::orchestrator::resolve_conflict_with_value(data_dir, &id, Some(&value))?;
+                (resolved, "custom".to_string())
+            } else if let Some(keep) = keep {
+                let resolved = sync::orchestrator::resolve_conflict(data_dir, &id, keep.into())?;
+                let kept = match keep {
+                    KeepArg::Local => "local",
+                    KeepArg::Remote => "remote",
+                };
+                (resolved, kept.to_string())
+            } else {
+                anyhow::bail!("provide either --keep local|remote or --value \"...\"");
+            };
             if !resolved {
                 anyhow::bail!("no unresolved conflict found with id {id}");
             }
-            let kept = match keep {
-                KeepArg::Local => "local",
-                KeepArg::Remote => "remote",
-            };
             match output_format {
                 OutputFormat::Json => {
                     println!(

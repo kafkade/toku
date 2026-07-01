@@ -12,9 +12,23 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod convert;
+mod organize;
 mod repo;
+mod template;
+mod usage;
+mod verify;
 
+pub use convert::{ConvertError, Converter, DEFAULT_BINARY};
+pub use organize::{
+    OrganizeOutcome, OrganizeSummary, PlanAction, PlannedMove, apply_plan, plan_organize,
+};
 pub use repo::FileRepository;
+pub use template::{
+    PathTemplate, TemplateContext, UNKNOWN_AUTHOR, UNKNOWN_SERIES, UNKNOWN_YEAR, sanitize_segment,
+};
+pub use usage::{UsageTotals, usage_by_format, usage_by_format_typed, usage_by_key, usage_totals};
+pub use verify::{VerifyOutcome, VerifyStatus, verify_file};
 
 /// Supported ebook file formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +80,9 @@ impl std::str::FromStr for FileFormat {
     }
 }
 
+/// Default provenance for a file record: added directly by the user.
+pub const SOURCE_USER: &str = "user";
+
 /// An ebook file associated with a book.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EbookFile {
@@ -76,6 +93,11 @@ pub struct EbookFile {
     pub size_bytes: i64,
     /// SHA-256 checksum, hex-encoded.
     pub checksum: String,
+    /// Provenance of this file association (e.g. `user`, `calibre`, `goodreads`).
+    pub source: String,
+    /// Optional external reference from the source (e.g. an import id or the
+    /// original path in the source library). `None` for user-added files.
+    pub source_ref: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -96,9 +118,20 @@ impl EbookFile {
             format,
             size_bytes,
             checksum,
+            source: SOURCE_USER.to_string(),
+            source_ref: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// Set the provenance of this file record. Use for importer-created records
+    /// (e.g. `with_source("calibre", Some(original_path))`).
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<String>, source_ref: Option<String>) -> Self {
+        self.source = source.into();
+        self.source_ref = source_ref;
+        self
     }
 }
 
@@ -116,6 +149,12 @@ pub enum FileError {
 
     #[error("I/O error: {0}")]
     Io(String),
+
+    #[error("invalid path template: {0}")]
+    Template(String),
+
+    #[error("organize failed: {0}")]
+    Organize(String),
 
     #[error("database error: {0}")]
     Db(#[from] toku_db::DbError),

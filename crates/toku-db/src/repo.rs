@@ -1,8 +1,8 @@
 use rusqlite::{OptionalExtension, params};
 use toku_core::{
-    Author, AuthorCount, Book, BookAuthor, ContributorRole, FilterCondition, FilterExpr,
-    FilterField, PaceRating, ReadingProgress, ReadingSession, ReadingStatus, Shelf, SmartFilter,
-    Tag, TagCount, TagType, Work,
+    Author, AuthorCount, Book, BookAuthor, BookSeries, ContributorRole, FilterCondition,
+    FilterExpr, FilterField, PaceRating, ReadingProgress, ReadingSession, ReadingStatus, Series,
+    Shelf, SmartFilter, Tag, TagCount, TagType, Work,
 };
 use uuid::Uuid;
 
@@ -281,6 +281,43 @@ impl<'a> BookRepository<'a> {
                 };
 
                 Ok((author, book_author))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get all series a book belongs to, with its position in each.
+    /// Ordered by series name for deterministic results.
+    pub fn get_book_series(&self, book_id: &Uuid) -> Result<Vec<(Series, BookSeries)>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT s.id, s.name, s.total_books, bs.position
+             FROM book_series bs
+             JOIN series s ON s.id = bs.series_id
+             WHERE bs.book_id = ?1
+             ORDER BY s.name",
+        )?;
+
+        let results = stmt
+            .query_map(params![book_id.to_string()], |row| {
+                let series_id: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let total_books: Option<i32> = row.get(2)?;
+                let position: Option<String> = row.get(3)?;
+
+                let sid = Uuid::parse_str(&series_id).unwrap_or_default();
+                let series = Series {
+                    id: sid,
+                    name,
+                    total_books,
+                };
+                let book_series = BookSeries {
+                    book_id: *book_id,
+                    series_id: sid,
+                    position,
+                };
+                Ok((series, book_series))
             })?
             .filter_map(|r| r.ok())
             .collect();

@@ -12,7 +12,7 @@ use toku_core::{
     TokuConfig, compute_stats, parse_duration_to_minutes,
 };
 use toku_db::{BookRepository, Database};
-use toku_files::{EbookFile, FileFormat, FileRepository, sha256_file};
+use toku_files::{Converter, EbookFile, FileFormat, FileRepository, sha256_file};
 mod account;
 mod import_ui;
 mod sync;
@@ -196,6 +196,29 @@ enum Commands {
     File {
         #[command(subcommand)]
         action: FileAction,
+    },
+
+    /// Convert an associated ebook to another format (optional; needs Calibre)
+    ///
+    /// Shells out to Calibre's `ebook-convert`. The resulting file is written
+    /// next to the source file and auto-associated with the book. Requires
+    /// Calibre on your PATH (https://calibre-ebook.com/download); it is never a
+    /// hard dependency. DRM-free files only — no DRM stripping.
+    Convert {
+        /// Book title (or id) whose file should be converted
+        book: String,
+
+        /// Target format to convert to (epub/pdf/mobi/azw3)
+        #[arg(long)]
+        to: String,
+
+        /// Source format to convert from (auto-detected when the book has one file)
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Overwrite the output file if it already exists on disk
+        #[arg(long)]
+        force: bool,
     },
 
     /// Export your library (csv, json, markdown, backup)
@@ -996,6 +1019,12 @@ fn main() -> Result<()> {
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
         Commands::File { action } => cmd_file(&db, &repo, action, &data_dir, &cli.format),
+        Commands::Convert {
+            book,
+            to,
+            from,
+            force,
+        } => cmd_convert(&db, &repo, &book, &to, from.as_deref(), force),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
         Commands::Bulk { action } => cmd_bulk(&db, &repo, action),
         Commands::Stats {
@@ -2431,6 +2460,152 @@ fn cmd_file(
             dry_run,
             copy,
         } => cmd_file_organize(db, repo, data_dir, book, all, dry_run, copy, output_format),
+    }
+}
+
+/// Convert an associated ebook file to another format via Calibre's
+/// `ebook-convert`, writing the output next to the source file and
+/// auto-associating it with the book.
+fn cmd_convert(
+    db: &Database,
+    repo: &BookRepository,
+    book_query: &str,
+    to: &str,
+    from: Option<&str>,
+    force: bool,
+) -> Result<()> {
+    let book = resolve_book(repo, book_query)?;
+    let target_format: FileFormat = to.parse().map_err(|_| {
+        anyhow::anyhow!("unsupported target format \"{to}\" (expected epub, pdf, mobi, or azw3)")
+    })?;
+
+    let files = FileRepository::new(db);
+    let associated = files
+        .list_files(&book.id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if associated.is_empty() {
+        anyhow::bail!(
+            "No files linked to \"{}\". Add one first with: toku file add \"{}\" <path>",
+            book.title,
+            book.title
+        );
+    }
+
+    // Pick the source file: honour --from, else auto-pick a single file, else
+    // bail asking the user to disambiguate.
+    let source = match from {
+        Some(f) => {
+            let fmt: FileFormat = f.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "unsupported source format \"{f}\" (expected epub, pdf, mobi, or azw3)"
+                )
+            })?;
+            associated
+                .iter()
+                .find(|file| file.format == fmt)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no {fmt} file linked to \"{}\"", book.title))?
+        }
+        None => {
+            if associated.len() == 1 {
+                associated[0].clone()
+            } else {
+                let formats = associated
+                    .iter()
+                    .map(|f| f.format.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "\"{}\" has multiple files ({formats}). Choose one with --from <format>",
+                    book.title
+                );
+            }
+        }
+    };
+
+    if source.format == target_format {
+        anyhow::bail!("source is already {target_format}; nothing to convert");
+    }
+
+    let src_path = PathBuf::from(&source.path);
+    if !src_path.is_file() {
+        anyhow::bail!(
+            "source file is missing on disk: {}\nRe-add it with: toku file add",
+            source.path
+        );
+    }
+
+    // Write the output next to the source: same stem, new extension.
+    let dst_path = src_path.with_extension(target_format.as_str());
+    if dst_path == src_path {
+        anyhow::bail!(
+            "source and output paths are identical: {}",
+            src_path.display()
+        );
+    }
+    if dst_path.exists() && !force {
+        anyhow::bail!(
+            "output already exists: {}\nPass --force to overwrite.",
+            dst_path.display()
+        );
+    }
+
+    let converter = Converter::new();
+    // Optional dependency: fail cleanly (non-zero) with install guidance if absent.
+    converter
+        .ensure_available()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    eprintln!(
+        "Converting {} → {} via ebook-convert…",
+        source.format, target_format
+    );
+    converter
+        .convert(&src_path, &dst_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if !dst_path.is_file() {
+        anyhow::bail!(
+            "ebook-convert reported success but produced no output at {}",
+            dst_path.display()
+        );
+    }
+
+    let size_bytes = std::fs::metadata(&dst_path)
+        .with_context(|| format!("reading {}", dst_path.display()))?
+        .len() as i64;
+    let checksum = sha256_file(&dst_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stored = dst_path
+        .canonicalize()
+        .unwrap_or_else(|_| dst_path.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let file = EbookFile::new(book.id, stored, target_format, size_bytes, checksum)
+        .with_source("calibre-convert", Some(source.path.clone()));
+
+    match files.add_file(&file) {
+        Ok(()) => {
+            eprintln!(
+                "✓ Converted to {} ({}) and linked to \"{}\"\n  {}",
+                target_format,
+                human_size(size_bytes),
+                book.title,
+                dst_path.display()
+            );
+            Ok(())
+        }
+        // The output already matched an existing association for this book.
+        Err(toku_files::FileError::Duplicate(_)) => {
+            eprintln!(
+                "✓ Converted to {} at {} (already linked to \"{}\")",
+                target_format,
+                dst_path.display(),
+                book.title
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("{e}")),
     }
 }
 

@@ -122,11 +122,20 @@ CREATE INDEX idx_files_checksum ON files(checksum);
 
 ### 5. Format conversion — optional Calibre shell-out
 
-- `toku convert` shells out to Calibre's `ebook-convert` CLI (#147). Building a converter
-  in Rust is a multi-month effort; Calibre's is mature, free, and battle-tested.
+- `toku convert <book> --to <format> [--from <format>] [--force]` shells out to Calibre's
+  `ebook-convert` CLI (#147). Building a converter in Rust is a multi-month effort; Calibre's
+  is mature, free, and battle-tested. The converter lives in `toku-files` (`Converter`), which
+  invokes the `ebook-convert` binary; the binary name is injectable so tests can substitute a
+  fake without a real Calibre install.
+- The output is written **next to the source file** (same stem, new extension) and
+  auto-associated with the book (provenance `calibre-convert`). When the book has a single
+  associated file, `--from` is inferred; with multiple files it is required. `--force` is
+  needed to overwrite an existing output file.
 - The dependency is **optional and never hard**: the command checks for `ebook-convert`
-  in `$PATH` and, if missing, prints installation guidance instead of failing the build or
-  blocking any other feature. Toku itself has no Calibre build/link dependency.
+  in `$PATH`   and, if missing, prints installation guidance (<https://calibre-ebook.com/download>)
+  and exits non-zero instead of failing the build or blocking any other feature. Toku itself
+  has no Calibre build/link dependency. Subprocess failures are surfaced with the captured
+  `ebook-convert` stderr.
 - **DRM-free files only.** Toku does not strip DRM and will not add DRM-removal tooling.
 
 ### 6. OPDS server — local-network-only by default

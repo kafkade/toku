@@ -83,6 +83,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Two-secret SRP verifier (ADR-010, #161)**: the SRP verifier now folds the account
+  **Secret Key** into its input alongside the password —
+  `SHA-256("toku/srp/verifier-input/v1" || Secret Key || password)` via the shared
+  `toku_core::srp_verifier_input` helper — at every create/verify site (CLI account
+  signup/login/enroll/migrate, device enrollment, and the hosted web dashboard). Previously
+  the verifier depended on the password only, so a stolen verifier (server-DB breach) was
+  offline-brute-forceable against the password alone and the Secret Key added no
+  authentication hardening (threat-model finding **F1**, HIGH). The hosted web `/login` form
+  now requires the Secret Key from your Emergency Kit. **Breaking:** this changes every stored
+  verifier — sync is pre-release, so existing accounts must re-run setup / re-enroll (no
+  migration). The single-secret library/passphrase `sync init` path routes through the same
+  domain-separated derivation with no second secret.
 - Hardened the self-host sync and web tiers following the threat-model review (#160,
   findings F2–F11 from #125):
   - **Web security headers** (`toku serve`): every response now carries a

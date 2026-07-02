@@ -238,8 +238,11 @@ pub fn init(
                 let mut srp_salt = [0u8; 16];
                 rand::rng().fill(&mut srp_salt);
                 let srp_salt_hex = hex::encode(srp_salt);
+                // Library/passphrase path is single-secret (no Secret Key); route
+                // through the same domain-separated derivation for consistency.
+                let verifier_input = toku_core::srp_verifier_input(None, pass);
                 let verifier_bytes =
-                    srp_client.compute_verifier(library_id.as_bytes(), pass.as_bytes(), &srp_salt);
+                    srp_client.compute_verifier(library_id.as_bytes(), &verifier_input, &srp_salt);
                 let srp_verifier_hex = hex::encode(&verifier_bytes);
 
                 let enc_salt_raw = toku_core::SyncKey::generate_salt()?;
@@ -275,7 +278,7 @@ pub fn init(
                 .process_reply(
                     &a,
                     library_id.as_bytes(),
-                    pass.as_bytes(),
+                    &toku_core::srp_verifier_input(None, pass),
                     &server_srp_salt_bytes,
                     &b_pub_bytes,
                 )
@@ -698,6 +701,7 @@ fn account_srp_login(
     client: &SyncClient,
     email: &str,
     password: &str,
+    secret_key: &toku_core::SecretKey,
 ) -> anyhow::Result<crate::client::AccountVerifyResult> {
     use rand::RngExt;
     use sha2::Sha256;
@@ -716,11 +720,14 @@ fn account_srp_login(
     let srp_salt_bytes =
         hex::decode(&challenge.srp_salt).context("server returned invalid hex for srp_salt")?;
 
+    // Fold the Secret Key into the SRP password input so the verifier depends on
+    // both secrets (ADR-010); must match the derivation used at signup.
+    let verifier_input = toku_core::srp_verifier_input(Some(secret_key.as_bytes()), password);
     let client_verifier = srp_client
         .process_reply(
             &a,
             email.as_bytes(),
-            password.as_bytes(),
+            &verifier_input,
             &srp_salt_bytes,
             &b_pub_bytes,
         )
@@ -849,13 +856,14 @@ pub fn signup(
     let wrapped_data_key = serde_json::to_string(&account_keys.wrapped_data_key)
         .context("failed to serialize wrapped_data_key")?;
 
-    // ── SRP verifier (identity = email) ──────────────────────────────────────
+    // ── SRP verifier (identity = email, folds in the Secret Key per ADR-010) ──
     let srp_client = ClientG2048::<Sha256>::new();
     let mut srp_salt = [0u8; 16];
     rand::rng().fill(&mut srp_salt);
     let srp_salt_hex = hex::encode(srp_salt);
+    let verifier_input = toku_core::srp_verifier_input(Some(secret_key.as_bytes()), password);
     let srp_verifier_hex =
-        hex::encode(srp_client.compute_verifier(email.as_bytes(), password.as_bytes(), &srp_salt));
+        hex::encode(srp_client.compute_verifier(email.as_bytes(), &verifier_input, &srp_salt));
 
     let signup = rt.block_on(client.account_signup(
         email,
@@ -868,7 +876,7 @@ pub fn signup(
     ))?;
 
     // ── Log in (user session) then enroll this device ────────────────────────
-    let verify = account_srp_login(&rt, &client, email, password)?;
+    let verify = account_srp_login(&rt, &client, email, password, secret_key)?;
     token_store.store_user_session(server, &verify.session_token, &verify.expires_at)?;
 
     let enroll =
@@ -915,7 +923,7 @@ pub fn login(
     let token_store = TokenStore::new(data_dir);
     let client = SyncClient::new(server)?;
 
-    let verify = account_srp_login(&rt, &client, email, password)?;
+    let verify = account_srp_login(&rt, &client, email, password, secret_key)?;
     token_store.store_user_session(server, &verify.session_token, &verify.expires_at)?;
 
     // Unwrap and store the leaf data key. Requires the #143 endpoint; when it is
@@ -981,7 +989,7 @@ pub fn enroll(
     let client = SyncClient::new(server)?;
     let device_name = device_name.unwrap_or_else(default_device_name);
 
-    let verify = account_srp_login(&rt, &client, email, password)?;
+    let verify = account_srp_login(&rt, &client, email, password, secret_key)?;
     token_store.store_user_session(server, &verify.session_token, &verify.expires_at)?;
 
     // Recover the shared library data key the zero-knowledge way (#143).
@@ -1132,7 +1140,7 @@ pub fn migrate(
     let wrapped_data_key = serde_json::to_string(&account_keys.wrapped_data_key)
         .context("failed to serialize wrapped_data_key")?;
 
-    // SRP verifier (identity = email).
+    // SRP verifier (identity = email, folds in the Secret Key per ADR-010).
     let (srp_salt_hex, srp_verifier_hex) = {
         use rand::RngExt;
         use sha2::Sha256;
@@ -1140,9 +1148,10 @@ pub fn migrate(
         let srp_client = ClientG2048::<Sha256>::new();
         let mut salt = [0u8; 16];
         rand::rng().fill(&mut salt);
+        let verifier_input = toku_core::srp_verifier_input(Some(secret_key.as_bytes()), password);
         (
             hex::encode(salt),
-            hex::encode(srp_client.compute_verifier(email.as_bytes(), password.as_bytes(), &salt)),
+            hex::encode(srp_client.compute_verifier(email.as_bytes(), &verifier_input, &salt)),
         )
     };
 
@@ -1158,7 +1167,7 @@ pub fn migrate(
 
     // Account session, then a device session for this already-registered device
     // (now adopted under the admin account).
-    let verify = account_srp_login(&rt, &client, email, password)?;
+    let verify = account_srp_login(&rt, &client, email, password, secret_key)?;
     token_store.store_user_session(&server, &verify.session_token, &verify.expires_at)?;
     let device_session =
         rt.block_on(client.create_device_session(&verify.session_token, &device_id))?;

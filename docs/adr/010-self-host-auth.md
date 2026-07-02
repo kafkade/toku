@@ -57,15 +57,33 @@ Users authenticate with two secrets that are never transmitted to the server:
    The checksum lets typos be caught before the key is used. See `docs/recovery.md`.
 
 Authentication uses **SRP (Secure Remote Password, RFC 5054)**. The SRP verifier stored on
-the server is derived from both the password and the Secret Key:
+the server is derived from both the password and the Secret Key via a domain-separated hash:
 
 ```text
-verifier_input = hash(Secret Key || account_password)
+verifier_input = SHA-256(domain_sep || Secret Key || account_password)
 SRP verifier   = srp::generate_verifier(verifier_input)
 ```
 
-The server stores only the SRP verifier — it cannot derive the password, the Secret Key,
-or any encryption key from it.
+`domain_sep` is a fixed tag (`toku/srp/verifier-input/v1`) and the Secret Key is
+length-prefixed so the key/password boundary is unambiguous. This derivation lives in one
+place — `toku_core::srp_verifier_input(secret_key, password)` — and every verifier
+create/verify site (CLI account signup/login/migrate, device enrollment, and the hosted
+web dashboard login/setup) routes through it so the two auth tiers stay interoperable.
+
+Because the verifier depends on both secrets, a stolen verifier (server DB breach) is not
+brute-forceable against the password alone: an attacker must also guess the 128-bit Secret
+Key. The server stores only the SRP verifier — it cannot derive the password, the Secret
+Key, or any encryption key from it.
+
+> **Single-secret library/passphrase path.** The legacy `toku sync init` passphrase flow
+> (identity = `library_id`, no separate Secret Key) routes through the same helper with
+> `secret_key = None`, i.e. `SHA-256(domain_sep || passphrase)`. This keeps the derivation
+> path uniform but adds no entropy — there is only one secret to fold in.
+>
+> **Verifier scheme is versioned by the domain tag, not migrated.** Folding the Secret Key
+> changes every stored verifier. Sync is a pre-release phase with no deployed accounts, so
+> this ships as a clean break: any account enrolled before this change must re-run setup /
+> re-enroll. A future scheme change bumps the `…/v1` tag rather than migrating verifiers.
 
 ### Key Hierarchy
 
@@ -185,7 +203,7 @@ exposure is documented in `docs/sync-server.md`.
 | Server compromise | Attacker reads plaintext ops (if no passphrase) or encrypted blobs | Attacker gets only encrypted blobs, SRP verifiers, wrapped keys — cannot read any data |
 | Network interception | Password sent in plaintext (or no auth at all) | SRP: password/Secret Key never cross the wire |
 | Unauthorized device registration | Anyone with a `library_id` can register | Requires Secret Key — no server-side path exists |
-| Credential brute-force | No server-side credential | SRP verifier is memory-hard (Argon2id); Secret Key adds 128 bits of entropy |
+| Credential brute-force | No server-side credential | SRP verifier folds password **and** the 128-bit Secret Key (`srp_verifier_input`); a stolen verifier is not brute-forceable against the password alone |
 | Lost device | Deregister device; all data still readable if encryption was optional | Deregister device; Library Key unreachable from deregistered device's key |
 | Passphrase/key forgotten | Server data unrecoverable; local SQLite is recovery | Same: local SQLite is recovery |
 

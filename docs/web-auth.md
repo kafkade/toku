@@ -49,6 +49,9 @@ form asks for an email and a password and then:
 1. generates a **Secret Key** and derives the account key hierarchy (per
    [ADR-010](./adr/010-self-host-auth.md)), and
 2. stores an SRP verifier (not the password) plus the wrapped keys as the `admin` account.
+   The verifier folds in **both** the password and the Secret Key
+   (`SHA-256(domain_sep || Secret Key || password)`), so a stolen verifier cannot be
+   brute-forced against the password alone.
 
 The **Emergency Kit** (your email + Secret Key) is shown **once**, immediately after setup. Save
 it — print it or store it in a password manager. It cannot be recovered: if you lose both your
@@ -59,13 +62,16 @@ it.
 
 ### Login, sessions, and lockout
 
-`/login` accepts the admin email and password over TLS. The server recomputes the SRP verifier
+`/login` accepts the admin email, password, and **Secret Key** over TLS. The Secret Key (from
+your Emergency Kit) is required because it is folded into the SRP verifier — logging in needs
+both secrets, so a leaked password alone is not enough. The server recomputes the SRP verifier
 and compares it to the stored verifier in constant time. On success it mints a **fresh** session
 token (so a pre-authentication cookie is never reused — session-fixation safe) and sets an
 `HttpOnly`, `SameSite=Lax` session cookie. Sessions last 24 hours.
 
-After 5 failed attempts the account locks for 15 minutes; correct credentials are refused with a
-lockout message until the window passes.
+A wrong or malformed Secret Key is rejected exactly like a wrong password (same message, same
+timing). After 5 failed attempts the account locks for 15 minutes; correct credentials are
+refused with a lockout message until the window passes.
 
 Sign out from the header link (or `POST /logout`), which deletes the session server-side and
 clears the cookie.
@@ -85,7 +91,9 @@ are rejected with `403`. The `SameSite=Lax` session cookie is an additional CSRF
 
 > **Important.** In hosted mode the dashboard renders **server-side HTML from your decrypted
 > local library**, so the server process necessarily holds plaintext, and login sends your
-> password to the server (over TLS) to be verified.
+> password **and Secret Key** to the server (over TLS) to be verified. This is unavoidable in
+> the trusted-server posture: unlike the zero-knowledge sync relay, the dashboard decrypts and
+> renders your library, so it must receive both secrets.
 
 This is the **trusted-server** posture. The zero-knowledge guarantees of
 [ADR-010](./adr/010-self-host-auth.md) apply to the `toku-sync` *relay* (which only ever sees

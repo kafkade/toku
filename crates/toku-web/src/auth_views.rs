@@ -93,6 +93,11 @@ pub fn login_page(csrf: &str, error: Option<&str>) -> Markup {
                     input id="email" type="email" name="email" required autofocus;
                     label for="password" { "Password" }
                     input id="password" type="password" name="password" required;
+                    label for="secret_key" { "Secret Key" }
+                    input id="secret_key" type="text" name="secret_key"
+                          autocomplete="off" autocapitalize="off" spellcheck="false"
+                          placeholder="TK-XXXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XX" required;
+                    p.muted { "From your Emergency Kit, shown once at setup." }
                     button.btn type="submit" { "Sign in" }
                 }
             }

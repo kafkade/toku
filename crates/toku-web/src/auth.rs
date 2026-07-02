@@ -135,12 +135,15 @@ fn generate_salt_hex() -> String {
 
 /// Compute the hex-encoded SRP-6a verifier for an account.
 ///
-/// The SRP identity is the account email and the password is the account
-/// password — matching toku-sync's account flow so the two tiers stay
-/// interoperable. Deterministic for a given (email, password, salt).
-fn compute_verifier_hex(email: &str, password: &str, salt: &[u8]) -> String {
+/// The SRP identity is the account email; the SRP password input folds in the
+/// account Secret Key (ADR-010 two-secret auth) via
+/// [`toku_core::srp_verifier_input`] — matching toku-sync's account flow so the
+/// two tiers stay interoperable. Deterministic for a given
+/// (email, password, secret_key, salt).
+fn compute_verifier_hex(email: &str, password: &str, secret_key: &[u8], salt: &[u8]) -> String {
     let client = ClientG2048::<Sha256>::new();
-    hex::encode(client.compute_verifier(email.as_bytes(), password.as_bytes(), salt))
+    let verifier_input = toku_core::srp_verifier_input(Some(secret_key), password);
+    hex::encode(client.compute_verifier(email.as_bytes(), &verifier_input, salt))
 }
 
 // ── Account / session persistence (blocking; call via spawn_blocking) ─────────
@@ -187,7 +190,7 @@ pub fn create_admin(db_path: &Path, email: &str, password: &str) -> Result<Admin
 
     let salt_hex = generate_salt_hex();
     let salt_bytes = hex::decode(&salt_hex).map_err(|e| e.to_string())?;
-    let verifier_hex = compute_verifier_hex(email, password, &salt_bytes);
+    let verifier_hex = compute_verifier_hex(email, password, secret_key.as_bytes(), &salt_bytes);
 
     let wrapped_private_key =
         serde_json::to_string(&account_keys.wrapped_private_key).map_err(|e| e.to_string())?;
@@ -247,12 +250,23 @@ pub enum LoginOutcome {
 /// Verify credentials and, on success, issue a new session (session fixation is
 /// avoided because a brand-new token is always minted here).
 ///
+/// The SRP verifier folds in the account Secret Key (ADR-010 two-secret auth),
+/// so `secret_key` is the raw user-entered key string (`TK-…`). A malformed
+/// Secret Key is treated as invalid credentials, but the verifier computation
+/// still runs (with placeholder key bytes) so timing does not distinguish a
+/// bad key from a bad password.
+///
 /// Anti-enumeration (threat model #125, finding F5): an unknown email and an
 /// inactive account are processed down the *same* path as a real account with a
 /// wrong password — a verifier is always computed and compared in constant time
 /// against a fixed dummy verifier — so response content and timing do not reveal
 /// whether the email exists.
-pub fn login(db_path: &Path, email: &str, password: &str) -> Result<LoginOutcome, String> {
+pub fn login(
+    db_path: &Path,
+    email: &str,
+    password: &str,
+    secret_key: &str,
+) -> Result<LoginOutcome, String> {
     // A fixed dummy salt/verifier pair used when the account is absent or
     // inactive, so the SRP verifier computation always runs (uniform timing).
     // The verifier is 256 bytes (2048-bit group) of zero → never matches a real
@@ -260,6 +274,16 @@ pub fn login(db_path: &Path, email: &str, password: &str) -> Result<LoginOutcome
     // compare that does not short-circuit on length.
     const DUMMY_SALT_HEX: &str = "00000000000000000000000000000000";
     const DUMMY_VERIFIER_HEX: &str = "0"; // expanded to full width below
+
+    // Parse the Secret Key up front. A malformed key never authenticates, but we
+    // still run the full verifier computation below (with placeholder bytes) so
+    // the timing/response is identical to a wrong-password attempt.
+    let parsed_key = toku_core::SecretKey::parse(secret_key.trim()).ok();
+    let secret_key_bytes: [u8; 16] = parsed_key
+        .as_ref()
+        .map(|k| *k.as_bytes())
+        .unwrap_or([0u8; 16]);
+    let secret_key_valid = parsed_key.is_some();
 
     let email = email.trim();
     let db = open(db_path)?;
@@ -321,10 +345,10 @@ pub fn login(db_path: &Path, email: &str, password: &str) -> Result<LoginOutcome
     }
 
     let salt_bytes = hex::decode(&salt_hex).map_err(|e| e.to_string())?;
-    let expected = compute_verifier_hex(email, password, &salt_bytes);
+    let expected = compute_verifier_hex(email, password, &secret_key_bytes, &salt_bytes);
 
     let matches: bool = expected.as_bytes().ct_eq(verifier_hex.as_bytes()).into();
-    if !matches || !real_active {
+    if !matches || !real_active || !secret_key_valid {
         // Only real, active accounts accrue lockout state.
         if let Some(user_id) = &user_id {
             record_failure(&db, user_id, failed_attempts)?;

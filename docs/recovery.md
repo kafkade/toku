@@ -75,6 +75,38 @@ A new device is enrolled by entering your **account email + password + Secret Ke
 device performs SRP authentication, derives the account unlock key, and unwraps your keys
 locally. The server never receives the secrets and cannot enroll a device on its own.
 
+## Token storage
+
+After you authenticate, the client keeps a **session token** (and, for hosted accounts, the
+derived sync key) so you don't re-enter credentials on every command. Where these live
+depends on the platform:
+
+- **OS keychain (preferred).** On macOS (Keychain), Windows (Credential Manager), and Linux
+  desktops running a Secret Service provider (GNOME Keyring, KWallet), the token is stored
+  in the native credential store, protected by your OS login session.
+- **Encrypted-at-rest file fallback.** When no keychain is available — common on **headless
+  Linux servers**, containers, and CI — the client falls back to a JSON file at
+  `<data_dir>/sync/tokens.json`. On Unix this file is created with `0600` permissions
+  (owner read/write only). The client prints a `warning: … using file fallback` when this
+  happens. You can force this path with `TOKU_TOKEN_STORE=file` (or
+  `TOKU_DISABLE_KEYCHAIN=1`).
+
+> **Tradeoff — the file fallback is plaintext at rest.** The fallback file is protected by
+> filesystem permissions (`0600` on Unix), **not** by encryption. Anyone who can read that
+> file as your user — or who obtains the disk/backup — can read a live session token. This
+> is an intentional, documented tradeoff so headless clients keep working without a
+> keychain. To harden a headless or shared host:
+>
+> - Keep the token on an **encrypted filesystem** (LUKS or equivalent), so an offline disk
+>   or a stolen backup does not expose it.
+> - Ensure the `<data_dir>` and its `sync/` subdirectory are owner-only (`chmod 700`).
+> - On Windows there is no `0600` equivalent for the fallback file; rely on user-profile
+>   isolation and prefer the Credential Manager path (the default).
+> - Tokens are session credentials, not your secrets. A leaked session can be revoked
+>   server-side via the logout endpoints (`POST /api/v1/auth/logout` for a device session,
+>   `POST /api/v1/account/logout` for an account session), or by an admin disabling the
+>   account — both delete the server-side session so the token can no longer be used.
+
 ## The ultimate safety net: local-first
 
 Your **local SQLite library is always the ultimate recovery.** Even if the server is gone,

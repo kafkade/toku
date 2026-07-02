@@ -29,9 +29,11 @@ hex = "0.4"
 base64 = "0.22"
 rand = "0.10"
 form_urlencoded = "1"
-# SRP-6a (RFC 5054) verifier check for hosted-mode login — flagged for
-# dependency review (RC). Same crate/version as toku-sync.
-srp = { version = "0.7.0-rc.3", features = ["getrandom"] }
+# SRP-6a (RFC 5054) verifier check for hosted-mode login.
+# Pinned to 0.7.0-rc.3 deliberately (F3, issue #160) — see the note in
+# crates/toku-sync/Cargo.toml. Same crate/version as toku-sync; keep the exact
+# `=` pin and revisit when 0.7.0 stable ships.
+srp = { version = "=0.7.0-rc.3", features = ["getrandom"] }
 subtle = "2"
 time = "0.3"
 

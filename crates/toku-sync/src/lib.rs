@@ -12,6 +12,7 @@ pub mod error;
 pub mod handlers;
 pub mod models;
 pub mod protocol;
+pub mod security;
 
 use std::path::PathBuf;
 
@@ -36,6 +37,7 @@ pub fn build_router(db_path: PathBuf) -> Router {
         .route("/api/v1/snapshot", get(handlers::download_snapshot))
         .route("/api/v1/snapshot", post(handlers::upload_snapshot))
         .route("/api/v1/rekey", post(handlers::rekey))
+        .route("/api/v1/auth/logout", post(handlers::device_logout))
         .layer(middleware::from_fn_with_state(
             db_path.clone(),
             auth::require_auth,
@@ -76,13 +78,17 @@ pub fn build_router(db_path: PathBuf) -> Router {
         )
         // Zero-knowledge account key bundle for multi-device recovery (#143).
         .route("/api/v1/account/keys", get(handlers::account_keys))
+        .route("/api/v1/account/logout", post(handlers::account_logout))
         .layer(middleware::from_fn_with_state(
             db_path.clone(),
             auth::require_user_auth,
         ));
 
     // Everything except /health is gated on protocol version (#126).
-    let gated = Router::new()
+    // The authentication endpoints additionally sit behind an app-level rate
+    // limiter (F8); one limiter instance per router keeps it isolated.
+    let limiter = std::sync::Arc::new(security::RateLimiter::default());
+    let auth_endpoints = Router::new()
         // Legacy passwordless registration
         .route("/api/v1/register", post(handlers::register))
         // SRP-6a authentication endpoints
@@ -93,6 +99,12 @@ pub fn build_router(db_path: PathBuf) -> Router {
         .route("/api/v1/account/signup", post(auth::account_signup))
         .route("/api/v1/account/challenge", post(auth::account_challenge))
         .route("/api/v1/account/verify", post(auth::account_verify))
+        .layer(middleware::from_fn(move |req, next| {
+            let limiter = limiter.clone();
+            async move { security::rate_limit(limiter, req, next).await }
+        }));
+
+    let gated = auth_endpoints
         .merge(authenticated)
         .merge(user_authenticated)
         .layer(middleware::from_fn_with_state(

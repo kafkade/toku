@@ -147,6 +147,15 @@ curl -X PUT https://sync.example.com/api/v1/admin/device-approvals \
   -d '{"required": true}'
 ```
 
+> **Recommended for multi-user and internet-facing deployments.** Device approvals are
+> off by default to keep single-user, single-device setups frictionless. On any instance
+> that serves more than one person — or is reachable from the public internet — you should
+> turn them **on**. With approvals off, anyone who obtains a valid account credential can
+> silently enrol an additional device; with approvals on, that enrolment is held `pending`
+> and must be confirmed from an already-trusted device, giving you a visible chokepoint
+> against credential theft. The tradeoff is one extra confirmation step when you
+> legitimately add a device.
+
 ## Zero-knowledge guarantee
 
 In hosted mode the server is **zero-knowledge**: it can never read your library content.
@@ -360,6 +369,45 @@ server {
 
 Obtain certificates with [certbot](https://certbot.eff.org/) (`certbot --nginx`) or your preferred
 ACME client, then reload nginx.
+
+## Security hardening & operator responsibilities
+
+The server ships with sane defaults and several built-in protections (encrypted-at-source
+payloads, SRP-6a authentication, uniform anti-enumeration responses, session revocation,
+audit logging, and an app-level rate limiter). A handful of controls are inherently the
+**operator's** responsibility because they live outside the process. For any multi-user or
+internet-facing deployment, treat the following as mandatory:
+
+- **Terminate TLS.** The server speaks plain HTTP and sends session tokens as bearer
+  credentials. Always front it with an HTTPS reverse proxy (see
+  [HTTPS with a reverse proxy](#https-with-a-reverse-proxy)). Never expose port `8080`
+  directly to the internet.
+- **Protect the database file.** All state — accounts, verifiers, sessions, audit log —
+  lives in `sync.db`. Restrict it to the service user with `0600` permissions
+  (`chmod 600 sync.db`) and keep the containing directory `0700`. The image already runs
+  as a non-root user (uid `65532`); on bare-metal installs, run the binary under a
+  dedicated unprivileged account.
+- **Encrypt the volume at rest.** Zero-knowledge encryption protects *library content*,
+  but account metadata, email addresses, SRP verifiers, and the audit log are stored
+  server-side. Host the data volume on an encrypted filesystem (LUKS, cloud provider
+  volume encryption, etc.) so a stolen disk does not leak this metadata.
+- **Keep the clock synchronised.** SRP challenge expiry, session lifetimes, HLC ordering,
+  and audit timestamps all assume an accurate clock. Run NTP (e.g. `chrony` or
+  `systemd-timesyncd`) on the host. A badly skewed clock can prematurely expire challenges
+  or accept stale ones.
+- **Rate-limit at the edge too.** The server enforces a per-IP and global request cap on
+  the authentication endpoints (returning HTTP `429`) as defence-in-depth, and honours the
+  first hop of `X-Forwarded-For` when behind a proxy — so make sure your proxy sets that
+  header (the nginx example above does). This in-process limiter is deliberately coarse;
+  for serious exposure, add a rate-limiting rule at the reverse proxy as the primary
+  control (e.g. nginx `limit_req`, Caddy `rate_limit`, or a WAF).
+- **Require device approvals** on shared instances — see
+  [Require device approval](#3-optional-require-device-approval).
+
+> **Token storage on the client.** Clients prefer the OS keychain for the session token and
+> fall back to a `0600` plaintext file only when no keychain is available (e.g. some
+> headless Linux hosts). See [`recovery.md`](./recovery.md#token-storage) for the tradeoff
+> and how to harden headless clients.
 
 ## Building the image locally
 

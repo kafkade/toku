@@ -242,7 +242,7 @@ pub fn init(
                     srp_client.compute_verifier(library_id.as_bytes(), pass.as_bytes(), &srp_salt);
                 let srp_verifier_hex = hex::encode(&verifier_bytes);
 
-                let enc_salt_raw = toku_core::SyncKey::generate_salt();
+                let enc_salt_raw = toku_core::SyncKey::generate_salt()?;
                 let enc_salt_b64 = base64::engine::general_purpose::STANDARD.encode(enc_salt_raw);
 
                 match rt.block_on(client.enroll(
@@ -314,14 +314,17 @@ pub fn init(
             // ── Encryption key ───────────────────────────────────────────
             // Fetch the authoritative encryption salt from the server; fall back
             // to the candidate we submitted during enroll (first-writer-wins).
-            let enc_salt_b64 = rt
+            let enc_salt_b64 = match rt
                 .block_on(client.get_salt(&verify_resp.session_token))?
                 .salt
-                .unwrap_or_else(|| {
+            {
+                Some(salt) => salt,
+                None => {
                     // Should only happen if server lost the salt — regenerate safely.
-                    let raw = toku_core::SyncKey::generate_salt();
+                    let raw = toku_core::SyncKey::generate_salt()?;
                     base64::engine::general_purpose::STANDARD.encode(raw)
-                });
+                }
+            };
             let enc_salt_bytes = base64::engine::general_purpose::STANDARD
                 .decode(&enc_salt_b64)
                 .context("invalid base64 encryption salt from server")?;
@@ -1165,7 +1168,7 @@ pub fn migrate(
     // Rekey all server ops + snapshot under the fresh data key.
     let (ops_reencrypted, ops_replaced) = rt.block_on(async {
         let pull = client.pull_all_ops(&token).await?;
-        let new_salt = SyncKey::generate_salt();
+        let new_salt = SyncKey::generate_salt()?;
         let new_salt_b64 = base64::engine::general_purpose::STANDARD.encode(new_salt);
         let mut reencrypted = Vec::with_capacity(pull.ops.len());
         for wire_op in &pull.ops {

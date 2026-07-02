@@ -6111,6 +6111,7 @@ dependencies = [
  "tokio-stream",
  "toku-core",
  "toku-db",
+ "toku-files",
  "toku-import",
  "tower",
  "urlencoding",

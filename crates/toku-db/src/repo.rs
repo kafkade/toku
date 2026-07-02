@@ -325,6 +325,63 @@ impl<'a> BookRepository<'a> {
         Ok(results)
     }
 
+    /// List every series that has at least one (non-deleted) book, with the
+    /// number of books in each. Ordered by series name.
+    pub fn list_series(&self) -> Result<Vec<(Series, usize)>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT s.id, s.name, s.total_books, COUNT(DISTINCT b.id) AS cnt
+             FROM series s
+             JOIN book_series bs ON bs.series_id = s.id
+             JOIN books b ON b.id = bs.book_id AND b.deleted_at IS NULL
+             GROUP BY s.id, s.name, s.total_books
+             HAVING cnt > 0
+             ORDER BY s.name COLLATE NOCASE",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let total_books: Option<i32> = row.get(2)?;
+                let count: i64 = row.get(3)?;
+                Ok((
+                    Series {
+                        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+                        name,
+                        total_books,
+                    },
+                    count as usize,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// List all (non-deleted) books in a series, matched case-insensitively by
+    /// series name. Ordered by reading position when available, then title.
+    pub fn list_books_in_series(&self, series_name: &str) -> Result<Vec<Book>, DbError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT b.id, b.title, b.subtitle, b.description, b.page_count, b.pub_date,
+                    b.language, b.format, b.duration_minutes, b.cover_hash, b.work_id,
+                    b.status, b.rating, b.created_at, b.updated_at
+             FROM books b
+             JOIN book_series bs ON bs.book_id = b.id
+             JOIN series s ON s.id = bs.series_id
+             WHERE LOWER(s.name) = LOWER(?1) AND b.deleted_at IS NULL
+             ORDER BY CAST(bs.position AS REAL), b.title COLLATE NOCASE",
+        )?;
+
+        let books = stmt
+            .query_map(params![series_name], |row| Ok(row_to_book(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(books)
+    }
+
     /// Store an ISBN linked to a book.
     pub fn add_isbn(&self, isbn: &str, book_id: &Uuid) -> Result<(), DbError> {
         self.db.conn.execute(
@@ -2189,6 +2246,50 @@ mod tests {
         assert_eq!(books.len(), 2);
         assert_eq!(books[0].title, "Dune");
         assert_eq!(books[1].title, "Neuromancer");
+    }
+
+    #[test]
+    fn lists_series_and_books_in_series() {
+        let db = test_db();
+        let repo = BookRepository::new(&db);
+
+        let mut b1 = Book::new("Dune Messiah");
+        b1.id = Uuid::now_v7();
+        let mut b2 = Book::new("Dune");
+        b2.id = Uuid::now_v7();
+        repo.create_book(&b1).unwrap();
+        repo.create_book(&b2).unwrap();
+
+        let series_id = Uuid::now_v7();
+        db.conn
+            .execute(
+                "INSERT INTO series (id, name, total_books) VALUES (?1, ?2, ?3)",
+                params![series_id.to_string(), "Dune", 2],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO book_series (book_id, series_id, position) VALUES (?1, ?2, ?3)",
+                params![b1.id.to_string(), series_id.to_string(), "2"],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO book_series (book_id, series_id, position) VALUES (?1, ?2, ?3)",
+                params![b2.id.to_string(), series_id.to_string(), "1"],
+            )
+            .unwrap();
+
+        let series = repo.list_series().unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].0.name, "Dune");
+        assert_eq!(series[0].1, 2);
+
+        // Ordered by numeric position: Dune (1) before Dune Messiah (2).
+        let books = repo.list_books_in_series("dune").unwrap();
+        assert_eq!(books.len(), 2);
+        assert_eq!(books[0].title, "Dune");
+        assert_eq!(books[1].title, "Dune Messiah");
     }
 
     #[test]

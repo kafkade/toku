@@ -11,6 +11,7 @@ repository.workspace = true
 toku-core.workspace = true
 toku-db.workspace = true
 toku-import.workspace = true
+toku-files.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 serde.workspace = true

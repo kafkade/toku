@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- OPDS server: `toku opds serve [--host <addr>] [--port <n>]` serves the library as an
+  OPDS 1.2 (Atom) catalog so e-reader apps (KOReader, Moon+ Reader, etc.) can browse and
+  download associated ebook files. Provides a root navigation feed with browse-by-author,
+  browse-by-series, and browse-by-shelf sub-catalogs, an "All Books" acquisition feed, and
+  OpenSearch-powered search (`/opds/search?q=`). Acquisition feeds list only books that have
+  associated files (honoring `toku file add`); each entry carries per-format download links,
+  cover/thumbnail links, and metadata (author, ISBN, language, description). Downloads stream
+  the exact on-disk file recorded for that association. Local-first (no external calls) and
+  LAN-facing by default (binds `0.0.0.0` so e-readers on your network can reach it; use
+  `--host 127.0.0.1` to restrict to this machine). Optional HTTP Basic auth is gated by a new
+  `[opds]` config section: `toku opds set-password <username>` prompts for a password and
+  stores a salted hash; `toku opds disable` clears it (#150)
 - File integrity & disk usage: `toku file verify [<book>|--all]` recomputes each associated
   file's SHA-256 by streaming its contents (constant memory, even for multi-GB files) and
   flags files whose contents changed (`mismatch`) or that are gone from disk (`missing`).

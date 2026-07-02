@@ -70,6 +70,8 @@ their ever-growing libraries.
 - 🌐 Web dashboard (`toku serve`) with statistics, import wizard, library views, and dark mode
   — loopback-only by default, or run authenticated for network access
   ([hosted mode & auth](docs/web-auth.md))
+- 📚 OPDS catalog server (`toku opds serve`) so e-readers (KOReader, Moon+ Reader, etc.) can
+  browse and download your associated ebook files over the local network — optional HTTP Basic auth
 - 🍎 macOS app (SwiftUI) with sidebar navigation, sortable table/grid views, and Swift Charts
 - 📱 iOS app (iPhone + iPad) with cover grid, barcode scanner, and reading progress updates
 - 🪟 Windows desktop app (Tauri v2) wrapping the web UI in a native window with system tray

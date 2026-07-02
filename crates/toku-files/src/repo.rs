@@ -77,6 +77,21 @@ impl<'a> FileRepository<'a> {
         Ok(files)
     }
 
+    /// Find a file association by its unique id. Returns `None` if no such
+    /// record exists. Used by the OPDS server to resolve an acquisition link
+    /// to the exact on-disk path stored for that file.
+    pub fn get_file(&self, id: &Uuid) -> Result<Option<EbookFile>, FileError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, book_id, path, format, size_bytes, checksum, source, source_ref, created_at, updated_at
+             FROM files WHERE id = ?1",
+        )?;
+        let mut rows = stmt
+            .query_map(params![id.to_string()], |row| Ok(row_to_file(row)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok());
+        Ok(rows.next())
+    }
+
     /// Find a file linked to a book by exact checksum.
     pub fn find_by_checksum(
         &self,

@@ -12,6 +12,8 @@ use crate::auth_views;
 pub struct LoginForm {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub secret_key: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -41,9 +43,11 @@ pub async fn login_submit(
     let db_path = state.db_path.clone();
     let email = form.email.clone();
     let password = form.password.clone();
+    let secret_key = form.secret_key.clone();
 
     let outcome =
-        tokio::task::spawn_blocking(move || auth::login(&db_path, &email, &password)).await;
+        tokio::task::spawn_blocking(move || auth::login(&db_path, &email, &password, &secret_key))
+            .await;
 
     match outcome {
         Ok(Ok(auth::LoginOutcome::Success { session_token })) => {

@@ -79,8 +79,8 @@ at login** in process memory — by design.
 
 | Threat | Mitigation | Residual |
 |--------|------------|----------|
-| Read user content | Mandatory E2E; payloads/snapshots are ciphertext; server holds no key | Cleartext metadata (entity/op type, timing); see F1 for verifier note |
-| Derive password / Secret Key | Server stores only SRP verifier + wrapped keys; never sees secrets | Offline brute-force of verifier — weaker than intended; **F1** |
+| Read user content | Mandatory E2E; payloads/snapshots are ciphertext; server holds no key | Cleartext metadata (entity/op type, timing) |
+| Derive password / Secret Key | Server stores only SRP verifier + wrapped keys; verifier folds password **and** Secret Key (**F1**, fixed); never sees secrets | Offline brute-force must guess password + 128-bit Secret Key |
 | Forge ops to a victim | Per-op AAD binds entity_type/entity_id/op_type; tampering breaks AEAD | None for content; metadata reorder possible |
 | Tamper key material | Wrapped keys authenticated (AES-256-GCM); unwrap fails on tamper | None |
 
@@ -103,7 +103,7 @@ at login** in process memory — by design.
 
 | Threat | Mitigation | Residual |
 |--------|------------|----------|
-| Log in / enroll device | Needs password too; password not in kit | **F1**: Secret Key not in verifier — kit alone never authenticates, but auth strength rests on password |
+| Log in / enroll device | Needs password too, and the verifier folds both secrets (**F1**, fixed) | Kit alone never authenticates; a stolen verifier now also resists brute-force without the password |
 
 ### Malicious admin (multi-user)
 
@@ -125,7 +125,8 @@ at login** in process memory — by design.
 
 - **SRP verifier non-reversibility** — RFC 5054 Group 14 (2048-bit), SHA-256. Server stores
   only salt + verifier; password/Secret Key never transmitted (SRP runs client-side in
-  `toku-sync-client`). **Caveat:** verifier input omits the Secret Key — see **F1**.
+  `toku-sync-client`). The verifier input folds both secrets —
+  `srp_verifier_input = SHA-256(domain_sep || Secret Key || password)` (**F1**, fixed).
 - **Ciphertext-only payloads** — all op payloads and snapshots are `{ev,alg,nonce,ciphertext,aad}`
   envelopes; nonces are 96-bit random (uniqueness asserted over 10k ops).
 - **Server-side enforcement** — `push`/`rekey`/`snapshot` reject anything that is not the exact
@@ -156,15 +157,15 @@ login that no longer reveals unknown vs inactive emails (**F5**, fixed). Remaini
 
 ## 8. Findings & triage
 
-F1 (HIGH) is tracked separately in [#161](https://github.com/kafkade/toku/issues/161). All
-remaining findings (F2–F11) were addressed under
-[#160](https://github.com/kafkade/toku/issues/160): the code-level ones are **fixed** and the
-operational/dependency ones are **documented**. Residual risks accepted for release are listed
-in [§9](#9-residual-risks-accepted).
+F1 (HIGH) is now **fixed** under [#161](https://github.com/kafkade/toku/issues/161): the SRP
+verifier input folds in the Secret Key via `toku_core::srp_verifier_input`. All other findings
+(F2–F11) were addressed under [#160](https://github.com/kafkade/toku/issues/160): the code-level
+ones are **fixed** and the operational/dependency ones are **documented**. Residual risks accepted
+for release are listed in [§9](#9-residual-risks-accepted).
 
 | ID | Finding | Sev | Disposition |
 |----|---------|-----|-------------|
-| F1 | SRP verifier input omits Secret Key (`orchestrator.rs:819`, `auth.rs:141/190/291`) — diverges from ADR-010 | HIGH | Bug; follow-up #161 |
+| F1 | SRP verifier input omits Secret Key — diverged from ADR-010 | HIGH | **Fixed** (#161): all verifier create/verify sites derive `SHA-256(domain_sep \|\| Secret Key \|\| password)` via `srp_verifier_input`; web login gained a Secret Key field. Verifier scheme changed — pre-release clean break, existing accounts re-enroll |
 | F4 | No web security headers (CSP, X-Frame-Options, nosniff, HSTS) | MED | **Fixed** (#160): `security_headers` middleware in `toku-web`; HSTS when `secure_cookies` |
 | F5 | Login/challenge account enumeration | MED | **Fixed** (#160): constant-time web login + phantom-account uniform sync challenge/verify (401) |
 | F6 | No token revocation/logout on sync server; user-disable keeps device sessions | MED | **Fixed** (#160): `/auth/logout` + `/account/logout`; disable now purges device `sessions` |
@@ -178,8 +179,6 @@ in [§9](#9-residual-risks-accepted).
 
 ## 9. Residual risks accepted
 
-- **F1**: until fixed, a stolen SRP verifier is offline-brute-forceable against the password
-  alone; the Secret Key's 128 bits do not harden authentication. Content stays zero-knowledge.
 - Cleartext op metadata (entity/op type, counts, timing) is visible to the server.
 - Web dashboard is trusted-server: holds plaintext password (login) and decrypted library.
 - Session token window before expiry: logout/disable now revoke server-side sessions (F6), but
@@ -199,8 +198,9 @@ in [§9](#9-residual-risks-accepted).
 The CLI/native sync path is **zero-knowledge**: no plaintext password, Secret Key, or library
 content reaches the `toku-sync` server — verified by client-side SRP, ciphertext-only payloads,
 and server-side 422 plaintext rejection. The hosted web dashboard is a documented
-**trusted-server** exception. The only divergence from ADR-010 (**F1**, verifier omits Secret
-Key) does not break the zero-knowledge content guarantee but weakens credential strength and is
-tracked for fix. The remaining findings (F2, F4–F11) have been resolved under #160 — code fixes
-for F2/F4/F5/F6/F7/F8 and documented operator/dependency guidance for F3/F9/F10/F11 — with the
-accepted residual risks recorded in [§9](#9-residual-risks-accepted).
+**trusted-server** exception. The former divergence from ADR-010 (**F1**, verifier omitted the
+Secret Key) has been resolved under #161 — the verifier now folds both secrets, restoring the
+128-bit Secret Key's contribution to credential strength. The remaining findings (F2, F4–F11)
+have been resolved under #160 — code fixes for F2/F4/F5/F6/F7/F8 and documented
+operator/dependency guidance for F3/F9/F10/F11 — with the accepted residual risks recorded in
+[§9](#9-residual-risks-accepted).

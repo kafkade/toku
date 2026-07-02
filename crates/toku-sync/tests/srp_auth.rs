@@ -82,11 +82,14 @@ fn srp_login(server: &TestServer, library_id: &str, pass: &str) -> (u16, serde_j
     let b_pub = hex::decode(server_b_hex).expect("decode B");
     let salt_bytes = hex::decode(srp_salt_hex).expect("decode srp_salt");
 
+    // Library/passphrase path folds the domain separator into the SRP password
+    // input (ADR-010), matching the orchestrator that enrolled this library.
+    let verifier_input = toku_core::srp_verifier_input(None, pass);
     let client_verifier = srp_client
         .process_reply(
             &a,
             library_id.as_bytes(),
-            pass.as_bytes(),
+            &verifier_input,
             &salt_bytes,
             &b_pub,
         )

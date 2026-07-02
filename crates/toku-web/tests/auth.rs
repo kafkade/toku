@@ -119,8 +119,9 @@ async fn fetch_csrf(router: &Router, uri: &str) -> (String, String) {
     (token, cookie_header)
 }
 
-/// Create the admin account through the real `/setup` POST flow.
-async fn create_admin(router: &Router, email: &str, password: &str) {
+/// Create the admin account through the real `/setup` POST flow, returning the
+/// `TK-…` Secret Key surfaced once on the Emergency Kit page (required to log in).
+async fn create_admin(router: &Router, email: &str, password: &str) -> String {
     let (token, cookie) = fetch_csrf(router, "/setup").await;
     let body = format!(
         "email={}&password={}&csrf_token={}",
@@ -139,6 +140,17 @@ async fn create_admin(router: &Router, email: &str, password: &str) {
         html.contains("TK-"),
         "emergency kit page should show the Secret Key"
     );
+    extract_secret_key(&html)
+}
+
+/// Pull the `TK-…` Secret Key out of the Emergency Kit HTML.
+fn extract_secret_key(html: &str) -> String {
+    let start = html
+        .find("TK-")
+        .expect("secret key present in emergency kit");
+    let rest = &html[start..];
+    let end = rest.find('<').unwrap_or(rest.len());
+    rest[..end].trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -198,11 +210,12 @@ async fn setup_rejects_second_admin() {
 async fn valid_login_sets_session_and_grants_access() {
     let env = setup_env();
     let router = hosted_router(&env);
-    create_admin(&router, "admin@example.com", "correct horse").await;
+    let secret_key = create_admin(&router, "admin@example.com", "correct horse").await;
 
     let (token, cookie) = fetch_csrf(&router, "/login").await;
     let body = format!(
-        "email=admin%40example.com&password=correct+horse&csrf_token={}",
+        "email=admin%40example.com&password=correct+horse&secret_key={}&csrf_token={}",
+        urlencoding::encode(&secret_key),
         urlencoding::encode(&token),
     );
     let resp = router
@@ -232,11 +245,62 @@ async fn valid_login_sets_session_and_grants_access() {
 async fn invalid_password_is_rejected() {
     let env = setup_env();
     let router = hosted_router(&env);
+    let secret_key = create_admin(&router, "admin@example.com", "correct horse").await;
+
+    let (token, cookie) = fetch_csrf(&router, "/login").await;
+    let body = format!(
+        "email=admin%40example.com&password=wrong+password&secret_key={}&csrf_token={}",
+        urlencoding::encode(&secret_key),
+        urlencoding::encode(&token),
+    );
+    let resp = router
+        .clone()
+        .oneshot(form_post("/login", Some(&cookie), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(cookie_value(&resp, "toku_session").is_none());
+    let html = body_string(resp).await;
+    assert!(html.contains("Invalid email or password"));
+}
+
+#[tokio::test]
+async fn invalid_secret_key_is_rejected() {
+    let env = setup_env();
+    let router = hosted_router(&env);
+    // Correct email + password, but a different (valid-format) Secret Key.
+    create_admin(&router, "admin@example.com", "correct horse").await;
+    let wrong_key = toku_core::SecretKey::generate().unwrap().format();
+
+    let (token, cookie) = fetch_csrf(&router, "/login").await;
+    let body = format!(
+        "email=admin%40example.com&password=correct+horse&secret_key={}&csrf_token={}",
+        urlencoding::encode(&wrong_key),
+        urlencoding::encode(&token),
+    );
+    let resp = router
+        .clone()
+        .oneshot(form_post("/login", Some(&cookie), body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        cookie_value(&resp, "toku_session").is_none(),
+        "a wrong Secret Key must not authenticate even with the right password"
+    );
+    let html = body_string(resp).await;
+    assert!(html.contains("Invalid email or password"));
+}
+
+#[tokio::test]
+async fn malformed_secret_key_is_rejected() {
+    let env = setup_env();
+    let router = hosted_router(&env);
     create_admin(&router, "admin@example.com", "correct horse").await;
 
     let (token, cookie) = fetch_csrf(&router, "/login").await;
     let body = format!(
-        "email=admin%40example.com&password=wrong+password&csrf_token={}",
+        "email=admin%40example.com&password=correct+horse&secret_key=not-a-valid-key&csrf_token={}",
         urlencoding::encode(&token),
     );
     let resp = router
@@ -254,7 +318,7 @@ async fn invalid_password_is_rejected() {
 async fn session_fixation_token_changes_on_login() {
     let env = setup_env();
     let router = hosted_router(&env);
-    create_admin(&router, "admin@example.com", "correct horse").await;
+    let secret_key = create_admin(&router, "admin@example.com", "correct horse").await;
 
     // Attacker-supplied session cookie value that is not a valid session.
     let planted = "attacker-fixed-token";
@@ -263,7 +327,8 @@ async fn session_fixation_token_changes_on_login() {
     // Send both the CSRF cookie and the planted session cookie.
     let cookie = format!("{csrf_cookie}; toku_session={planted}");
     let body = format!(
-        "email=admin%40example.com&password=correct+horse&csrf_token={}",
+        "email=admin%40example.com&password=correct+horse&secret_key={}&csrf_token={}",
+        urlencoding::encode(&secret_key),
         urlencoding::encode(&token),
     );
     let resp = router
@@ -317,13 +382,14 @@ async fn csrf_bad_token_is_forbidden() {
 async fn lockout_after_repeated_failures() {
     let env = setup_env();
     let router = hosted_router(&env);
-    create_admin(&router, "admin@example.com", "correct horse").await;
+    let secret_key = create_admin(&router, "admin@example.com", "correct horse").await;
 
     // Five wrong attempts trip the lockout threshold.
     for _ in 0..5 {
         let (token, cookie) = fetch_csrf(&router, "/login").await;
         let body = format!(
-            "email=admin%40example.com&password=wrong&csrf_token={}",
+            "email=admin%40example.com&password=wrong&secret_key={}&csrf_token={}",
+            urlencoding::encode(&secret_key),
             urlencoding::encode(&token),
         );
         let _ = router
@@ -336,7 +402,8 @@ async fn lockout_after_repeated_failures() {
     // Even the correct password is now refused with the lockout message.
     let (token, cookie) = fetch_csrf(&router, "/login").await;
     let body = format!(
-        "email=admin%40example.com&password=correct+horse&csrf_token={}",
+        "email=admin%40example.com&password=correct+horse&secret_key={}&csrf_token={}",
+        urlencoding::encode(&secret_key),
         urlencoding::encode(&token),
     );
     let resp = router
@@ -357,11 +424,12 @@ async fn lockout_after_repeated_failures() {
 async fn logout_clears_session() {
     let env = setup_env();
     let router = hosted_router(&env);
-    create_admin(&router, "admin@example.com", "correct horse").await;
+    let secret_key = create_admin(&router, "admin@example.com", "correct horse").await;
 
     let (token, cookie) = fetch_csrf(&router, "/login").await;
     let body = format!(
-        "email=admin%40example.com&password=correct+horse&csrf_token={}",
+        "email=admin%40example.com&password=correct+horse&secret_key={}&csrf_token={}",
+        urlencoding::encode(&secret_key),
         urlencoding::encode(&token),
     );
     let resp = router

@@ -4944,7 +4944,7 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                     anyhow::bail!("no ops on server");
                 }
 
-                let new_salt = toku_core::SyncKey::generate_salt();
+                let new_salt = toku_core::SyncKey::generate_salt()?;
                 let new_key = toku_core::SyncKey::derive(&new_passphrase, &new_salt)
                     .map_err(|e| anyhow::anyhow!("key derivation failed: {e}"))?;
                 let new_salt_b64 = base64::engine::general_purpose::STANDARD.encode(new_salt);

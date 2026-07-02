@@ -24,8 +24,12 @@ refinery = { version = "0.9", features = ["rusqlite"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-# SRP-6a (RFC 5054) authentication — flagged for dependency review (RC)
-srp = { version = "0.7.0-rc.3", features = ["getrandom"] }
+# SRP-6a (RFC 5054) authentication.
+# Pinned to the 0.7.0-rc.3 pre-release deliberately (F3, issue #160): crates.io
+# has no stable 0.7.x, and the newest stable (0.6.0) is an older, incompatible
+# API whose migration would risk a security regression. Keep the exact `=` pin so
+# the RC cannot silently change under us; revisit when 0.7.0 stable ships.
+srp = { version = "=0.7.0-rc.3", features = ["getrandom"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 tower-http = { version = "0.7", features = ["trace"] }
@@ -39,7 +43,7 @@ hex = "0.4"
 rand = "0.10"
 reqwest = { workspace = true, features = ["json", "blocking"] }
 sha2.workspace = true
-srp = { version = "0.7.0-rc.3", features = ["getrandom"] }
+srp = { version = "=0.7.0-rc.3", features = ["getrandom"] }
 tower = "0.5"
 toku-core.workspace = true
 toku-db.workspace = true

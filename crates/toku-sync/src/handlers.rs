@@ -596,6 +596,15 @@ pub async fn approve_device(
                 db.conn
                     .execute("DELETE FROM sessions WHERE device_id = ?1", [&target_id])?;
             }
+            crate::security::audit(
+                &db,
+                "device.approval",
+                Some(&user_id),
+                Some(&target_id),
+                "success",
+                Some(if approve { "approve" } else { "reject" }),
+                None,
+            );
 
             Ok(AccountDeviceSummary {
                 device_id: target_id,
@@ -1383,6 +1392,7 @@ pub async fn set_user_status(
     let summary = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
         let target_id = target_id.clone();
+        let actor_id = user.user_id.clone();
         move || -> Result<UserSummary, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
@@ -1416,11 +1426,28 @@ pub async fn set_user_status(
                     "UPDATE users SET status = ?1 WHERE id = ?2",
                     rusqlite::params![new_status, target_id],
                 )?;
-                // Revoke active sessions when disabling.
+                // Revoke active sessions when disabling: both the user-level
+                // account sessions AND every device sync session owned by the
+                // user (finding F6 — device `sessions` previously survived a
+                // disable, leaving a 24h window of continued sync access).
                 if new_status == "disabled" {
                     db.conn
                         .execute("DELETE FROM user_sessions WHERE user_id = ?1", [&target_id])?;
+                    db.conn.execute(
+                        "DELETE FROM sessions
+                         WHERE device_id IN (SELECT device_id FROM devices WHERE user_id = ?1)",
+                        [&target_id],
+                    )?;
                 }
+                crate::security::audit(
+                    &db,
+                    "user.status",
+                    Some(&actor_id),
+                    Some(&target_id),
+                    "success",
+                    Some(&new_status),
+                    None,
+                );
             }
 
             Ok(UserSummary {
@@ -1479,6 +1506,7 @@ pub async fn set_registration(
     let open = req.open;
     tokio::task::spawn_blocking({
         let db_path = db_path.clone();
+        let actor_id = user.user_id.clone();
         move || -> Result<(), SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
             db.conn.execute(
@@ -1487,6 +1515,15 @@ pub async fn set_registration(
                  WHERE id = 1",
                 [i64::from(open)],
             )?;
+            crate::security::audit(
+                &db,
+                "config.registration",
+                Some(&actor_id),
+                None,
+                "success",
+                Some(if open { "open" } else { "closed" }),
+                None,
+            );
             Ok(())
         }
     })
@@ -1541,6 +1578,7 @@ pub async fn set_device_approvals(
     let required = req.required;
     tokio::task::spawn_blocking({
         let db_path = db_path.clone();
+        let actor_id = user.user_id.clone();
         move || -> Result<(), SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
             db.conn.execute(
@@ -1549,6 +1587,15 @@ pub async fn set_device_approvals(
                  WHERE id = 1",
                 [i64::from(required)],
             )?;
+            crate::security::audit(
+                &db,
+                "config.device_approvals",
+                Some(&actor_id),
+                None,
+                "success",
+                Some(if required { "required" } else { "off" }),
+                None,
+            );
             Ok(())
         }
     })
@@ -1558,4 +1605,89 @@ pub async fn set_device_approvals(
     Ok(Json(DeviceApprovalsConfigResponse {
         device_approvals_required: required,
     }))
+}
+
+/// Extract and hash the bearer token from an `Authorization` header.
+fn bearer_token_hash(headers: &axum::http::HeaderMap) -> Result<String, SyncError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(SyncError::Unauthorized)?;
+    Ok(sha256_hex(token))
+}
+
+/// `POST /api/v1/auth/logout` — revoke the current device sync session.
+///
+/// Deletes the `sessions` row for the presented bearer token so the token can
+/// no longer authenticate (finding F6 — explicit session revocation). Requires
+/// a valid device session (mounted behind `require_auth`).
+pub async fn device_logout(
+    State(db_path): State<PathBuf>,
+    device: AuthDevice,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, SyncError> {
+    let token_hash = bearer_token_hash(&headers)?;
+    tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let device_id = device.device_id.clone();
+        move || -> Result<(), SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            db.conn.execute(
+                "DELETE FROM sessions WHERE session_token_hash = ?1",
+                [&token_hash],
+            )?;
+            crate::security::audit(
+                &db,
+                "session.logout",
+                Some(&device_id),
+                Some(&device_id),
+                "success",
+                Some("device"),
+                None,
+            );
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// `POST /api/v1/account/logout` — revoke the current user (account) session.
+///
+/// Deletes the `user_sessions` row for the presented bearer token (finding F6).
+/// Requires a valid user session (mounted behind `require_user_auth`).
+pub async fn account_logout(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, SyncError> {
+    let token_hash = bearer_token_hash(&headers)?;
+    tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let user_id = user.user_id.clone();
+        move || -> Result<(), SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            db.conn.execute(
+                "DELETE FROM user_sessions WHERE session_token_hash = ?1",
+                [&token_hash],
+            )?;
+            crate::security::audit(
+                &db,
+                "session.logout",
+                Some(&user_id),
+                Some(&user_id),
+                "success",
+                Some("account"),
+                None,
+            );
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }

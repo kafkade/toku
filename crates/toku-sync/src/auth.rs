@@ -643,6 +643,15 @@ pub async fn srp_verify(
                 Ok(v) => v,
                 Err(_) => {
                     record_failure(&db, &library_id, failed_attempts)?;
+                    crate::security::audit(
+                        &db,
+                        "login.failure",
+                        Some(&library_id),
+                        Some(&library_id),
+                        "failure",
+                        Some("bad SRP reply (library)"),
+                        None,
+                    );
                     return Err(SyncError::Unauthorized);
                 }
             };
@@ -650,6 +659,15 @@ pub async fn srp_verify(
             match server_verifier.verify_client(&m1_bytes) {
                 Ok(_) => {}
                 Err(_) => {
+                    crate::security::audit(
+                        &db,
+                        "login.failure",
+                        Some(&library_id),
+                        Some(&library_id),
+                        "failure",
+                        Some("bad password proof (library)"),
+                        None,
+                    );
                     return record_failure_and_err(&db, &library_id, failed_attempts);
                 }
             }
@@ -946,14 +964,12 @@ pub async fn account_challenge(
         move || -> Result<AccountChallengeResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
-            // SRP identity is the account email. Load credentials by email.
-            let (user_id, srp_salt_hex, srp_verifier_hex, status, locked_until): (
-                String,
-                String,
-                String,
-                String,
-                Option<String>,
-            ) = db
+            // Load the account by email. Unknown or disabled accounts fall
+            // through to a *phantom* challenge (deterministic pseudo salt +
+            // verifier) so the response is indistinguishable from a real one —
+            // the account only proves non-existence at the verify step, which
+            // fails uniformly with 401 (anti-enumeration, F5).
+            let account: Option<(String, String, String, String, Option<String>)> = db
                 .conn
                 .query_row(
                     "SELECT id, srp_salt, srp_verifier, status, locked_until
@@ -969,57 +985,76 @@ pub async fn account_challenge(
                         ))
                     },
                 )
-                .map_err(|_| SyncError::Unauthorized)?;
+                .ok();
 
-            if status != "active" {
-                return Err(SyncError::Forbidden("account is disabled".into()));
-            }
-
-            if let Some(until) = locked_until {
-                let still_locked: bool = db
-                    .conn
-                    .query_row("SELECT ?1 > datetime('now')", [&until], |row| row.get(0))
-                    .unwrap_or(false);
-                if still_locked {
-                    return Err(SyncError::AccountLocked { until });
-                }
-            }
-
-            let verifier_bytes = hex::decode(&srp_verifier_hex)
-                .map_err(|_| SyncError::Internal("stored verifier is corrupt".into()))?;
-
+            let server = ServerG2048::<Sha256>::new();
             let mut b = [0u8; 48];
             rand::RngExt::fill(&mut rand::rng(), &mut b);
 
-            let server = ServerG2048::<Sha256>::new();
-            let b_pub_bytes = server.compute_public_ephemeral(&b, &verifier_bytes);
+            match account {
+                Some((user_id, srp_salt_hex, srp_verifier_hex, status, locked_until))
+                    if status == "active" =>
+                {
+                    // Locked accounts still surface 423 (lockout inherently
+                    // reveals existence and is an accepted residual).
+                    if let Some(until) = locked_until {
+                        let still_locked: bool = db
+                            .conn
+                            .query_row("SELECT ?1 > datetime('now')", [&until], |row| row.get(0))
+                            .unwrap_or(false);
+                        if still_locked {
+                            return Err(SyncError::AccountLocked { until });
+                        }
+                    }
 
-            let server_ephemeral_hex = hex::encode(b);
-            let b_pub_hex = hex::encode(&b_pub_bytes);
+                    let verifier_bytes = hex::decode(&srp_verifier_hex)
+                        .map_err(|_| SyncError::Internal("stored verifier is corrupt".into()))?;
+                    let b_pub_bytes = server.compute_public_ephemeral(&b, &verifier_bytes);
+                    let server_ephemeral_hex = hex::encode(b);
+                    let b_pub_hex = hex::encode(&b_pub_bytes);
 
-            db.conn.execute(
-                "INSERT INTO user_srp_challenges
-                 (challenge_id, user_id, server_ephemeral_secret, client_public_a, created_at)
-                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-                rusqlite::params![
-                    challenge_id,
-                    user_id,
-                    server_ephemeral_hex,
-                    client_public_a_hex
-                ],
-            )?;
+                    db.conn.execute(
+                        "INSERT INTO user_srp_challenges
+                         (challenge_id, user_id, server_ephemeral_secret, client_public_a, created_at)
+                         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                        rusqlite::params![
+                            challenge_id,
+                            user_id,
+                            server_ephemeral_hex,
+                            client_public_a_hex
+                        ],
+                    )?;
 
-            let _ = db.conn.execute(
-                "DELETE FROM user_srp_challenges
-                 WHERE created_at < datetime('now', ?1)",
-                [format!("-{CHALLENGE_TTL_SECS} seconds")],
-            );
+                    let _ = db.conn.execute(
+                        "DELETE FROM user_srp_challenges
+                         WHERE created_at < datetime('now', ?1)",
+                        [format!("-{CHALLENGE_TTL_SECS} seconds")],
+                    );
 
-            Ok(AccountChallengeResponse {
-                challenge_id,
-                server_public_b: b_pub_hex,
-                srp_salt: srp_salt_hex,
-            })
+                    Ok(AccountChallengeResponse {
+                        challenge_id,
+                        server_public_b: b_pub_hex,
+                        srp_salt: srp_salt_hex,
+                    })
+                }
+                _ => {
+                    // Unknown or disabled: deterministic phantom credentials,
+                    // never persisted (verify will 401 uniformly).
+                    let secret = crate::security::server_secret(&db)?;
+                    let (phantom_salt_hex, phantom_verifier_hex) =
+                        crate::security::phantom_credentials(&secret, &email);
+                    let verifier_bytes = hex::decode(&phantom_verifier_hex)
+                        .map_err(|_| SyncError::Internal("phantom verifier is corrupt".into()))?;
+                    let b_pub_bytes = server.compute_public_ephemeral(&b, &verifier_bytes);
+                    let b_pub_hex = hex::encode(&b_pub_bytes);
+
+                    Ok(AccountChallengeResponse {
+                        challenge_id,
+                        server_public_b: b_pub_hex,
+                        srp_salt: phantom_salt_hex,
+                    })
+                }
+            }
         }
     })
     .await
@@ -1069,7 +1104,7 @@ pub async fn account_verify(
                     [&challenge_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
-                .map_err(|_| SyncError::BadRequest("challenge not found or already used".into()))?;
+                .map_err(|_| SyncError::Unauthorized)?;
 
             let expired: bool = db
                 .conn
@@ -1084,9 +1119,7 @@ pub async fn account_verify(
                     "DELETE FROM user_srp_challenges WHERE challenge_id = ?1",
                     [&challenge_id],
                 );
-                return Err(SyncError::BadRequest(
-                    "challenge has expired; request a new one".into(),
-                ));
+                return Err(SyncError::Unauthorized);
             }
 
             let (email, srp_salt_hex, srp_verifier_hex, role, status, failed_attempts, locked_until): (
@@ -1115,10 +1148,19 @@ pub async fn account_verify(
                         ))
                     },
                 )
-                .map_err(|_| SyncError::Internal("user disappeared".into()))?;
+                .map_err(|_| SyncError::Unauthorized)?;
 
             if status != "active" {
-                return Err(SyncError::Forbidden("account is disabled".into()));
+                crate::security::audit(
+                    &db,
+                    "login.failure",
+                    Some(&email),
+                    Some(&user_id),
+                    "failure",
+                    Some("account disabled"),
+                    None,
+                );
+                return Err(SyncError::Unauthorized);
             }
 
             if let Some(ref until) = locked_until {
@@ -1161,11 +1203,29 @@ pub async fn account_verify(
                 Ok(v) => v,
                 Err(_) => {
                     record_user_failure(&db, &user_id, failed_attempts)?;
+                    crate::security::audit(
+                        &db,
+                        "login.failure",
+                        Some(&email),
+                        Some(&user_id),
+                        "failure",
+                        Some("bad SRP reply"),
+                        None,
+                    );
                     return Err(SyncError::Unauthorized);
                 }
             };
 
             if server_verifier.verify_client(&m1_bytes).is_err() {
+                crate::security::audit(
+                    &db,
+                    "login.failure",
+                    Some(&email),
+                    Some(&user_id),
+                    "failure",
+                    Some("bad password proof"),
+                    None,
+                );
                 return record_user_failure_and_err(&db, &user_id, failed_attempts);
             }
 
@@ -1192,7 +1252,16 @@ pub async fn account_verify(
                 rusqlite::params![token_hash, user_id, expires_at],
             )?;
 
-            let _ = email; // email reserved for future audit logging
+            let _ = email; // referenced by audit calls above
+            crate::security::audit(
+                &db,
+                "login.success",
+                Some(&user_id),
+                Some(&user_id),
+                "success",
+                None,
+                None,
+            );
             Ok(AccountVerifyResponse {
                 session_token,
                 server_proof_m2: m2_hex,

@@ -8,6 +8,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
+use axum::extract::Request;
+use axum::http::{HeaderValue, header};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::{get, post};
 
 mod auth;
@@ -123,7 +127,9 @@ pub fn build_router(
 
     let dashboard = dashboard_routes();
 
-    if mode.is_hosted() {
+    let secure = state.secure_cookies;
+
+    let router = if mode.is_hosted() {
         // Public, unauthenticated routes.
         let public = Router::new()
             .route(
@@ -157,7 +163,48 @@ pub fn build_router(
         dashboard
             .route("/healthz", get(auth_handlers::healthz))
             .with_state(state)
+    };
+
+    // Security headers on every response (outermost layer). HSTS is emitted only
+    // when cookies are marked `Secure` (i.e. the deployment is HTTPS).
+    router.layer(axum::middleware::from_fn(
+        move |req: Request, next: Next| security_headers(secure, req, next),
+    ))
+}
+
+/// Attach hardening headers (CSP, framing, MIME sniffing, referrer, HSTS) to
+/// every response. Flagged in threat model #125 (finding F4).
+///
+/// The CSP keeps `'unsafe-inline'` for scripts and styles because the dashboard
+/// ships one inline `<script>` (import-progress `EventSource`) and inline
+/// `style=`/`<style>` blocks; tightening to nonces is a future follow-up.
+async fn security_headers(secure: bool, req: Request, next: Next) -> Response {
+    const CSP: &str = "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; \
+         object-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; \
+         script-src 'self' 'unsafe-inline'; form-action 'self'";
+
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    if secure {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
     }
+    resp
 }
 
 /// Start serving using a pre-bound listener (local mode; used by the desktop app).

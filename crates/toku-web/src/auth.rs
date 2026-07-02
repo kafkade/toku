@@ -246,7 +246,21 @@ pub enum LoginOutcome {
 
 /// Verify credentials and, on success, issue a new session (session fixation is
 /// avoided because a brand-new token is always minted here).
+///
+/// Anti-enumeration (threat model #125, finding F5): an unknown email and an
+/// inactive account are processed down the *same* path as a real account with a
+/// wrong password — a verifier is always computed and compared in constant time
+/// against a fixed dummy verifier — so response content and timing do not reveal
+/// whether the email exists.
 pub fn login(db_path: &Path, email: &str, password: &str) -> Result<LoginOutcome, String> {
+    // A fixed dummy salt/verifier pair used when the account is absent or
+    // inactive, so the SRP verifier computation always runs (uniform timing).
+    // The verifier is 256 bytes (2048-bit group) of zero → never matches a real
+    // `g^x mod N`, and matches the real verifier's hex length for a constant-time
+    // compare that does not short-circuit on length.
+    const DUMMY_SALT_HEX: &str = "00000000000000000000000000000000";
+    const DUMMY_VERIFIER_HEX: &str = "0"; // expanded to full width below
+
     let email = email.trim();
     let db = open(db_path)?;
 
@@ -269,15 +283,34 @@ pub fn login(db_path: &Path, email: &str, password: &str) -> Result<LoginOutcome
         )
         .ok();
 
-    let Some((user_id, salt_hex, verifier_hex, status, failed_attempts, locked_until)) = row else {
-        return Ok(LoginOutcome::Invalid);
+    // Resolve the (real or dummy) credentials to compare against without an
+    // early return, so every branch performs the verifier computation.
+    let real_active = row
+        .as_ref()
+        .map(|(_, _, _, status, _, _)| status == "active")
+        .unwrap_or(false);
+
+    let (user_id, salt_hex, verifier_hex, failed_attempts, locked_until) = match &row {
+        Some((id, salt, verifier, status, failed, locked)) if status == "active" => (
+            Some(id.clone()),
+            salt.clone(),
+            verifier.clone(),
+            *failed,
+            locked.clone(),
+        ),
+        _ => (
+            None,
+            DUMMY_SALT_HEX.to_string(),
+            DUMMY_VERIFIER_HEX.repeat(512),
+            0,
+            None,
+        ),
     };
 
-    if status != "active" {
-        return Ok(LoginOutcome::Invalid);
-    }
-
-    if let Some(until) = &locked_until {
+    // Locked real accounts short-circuit to `Locked` (lockout inherently reveals
+    // existence and is accepted by the threat model); unknown/inactive accounts
+    // never reach here because `locked_until` is `None` for them.
+    if real_active && let Some(until) = &locked_until {
         let still_locked: bool = db
             .conn
             .query_row("SELECT ?1 > datetime('now')", [until], |r| r.get(0))
@@ -291,10 +324,15 @@ pub fn login(db_path: &Path, email: &str, password: &str) -> Result<LoginOutcome
     let expected = compute_verifier_hex(email, password, &salt_bytes);
 
     let matches: bool = expected.as_bytes().ct_eq(verifier_hex.as_bytes()).into();
-    if !matches {
-        record_failure(&db, &user_id, failed_attempts)?;
+    if !matches || !real_active {
+        // Only real, active accounts accrue lockout state.
+        if let Some(user_id) = &user_id {
+            record_failure(&db, user_id, failed_attempts)?;
+        }
         return Ok(LoginOutcome::Invalid);
     }
+
+    let user_id = user_id.expect("real_active implies a user id");
 
     // Reset failure counter and mint a fresh session.
     db.conn

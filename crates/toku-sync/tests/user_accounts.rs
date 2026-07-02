@@ -375,9 +375,12 @@ fn disable_user_and_guards() {
     );
     assert_eq!(status, 401, "disabled user's session must be revoked");
 
-    // Bob can no longer log in.
+    // Bob can no longer log in. Under the anti-enumeration design (F5) a
+    // disabled account is indistinguishable from a wrong password: the
+    // challenge returns a phantom handshake and verification fails with a
+    // uniform 401 rather than a revealing 403.
     let (status, _) = login(&server, "bob@example.com", "bob pass");
-    assert_eq!(status, 403, "disabled user cannot log in");
+    assert_eq!(status, 401, "disabled user cannot log in");
 
     // Re-enable Bob; login works again.
     let (status, _) = post_json_auth(

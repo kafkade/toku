@@ -78,10 +78,14 @@ impl SyncKey {
     }
 
     /// Generate a random 128-bit salt for key derivation.
-    pub fn generate_salt() -> [u8; 16] {
+    ///
+    /// Returns an error rather than panicking if the OS CSPRNG is unavailable,
+    /// so callers on the crypto path can surface the failure gracefully.
+    pub fn generate_salt() -> Result<[u8; 16], TokuError> {
         let mut salt = [0u8; 16];
-        getrandom::fill(&mut salt).expect("OS CSPRNG failed");
-        salt
+        getrandom::fill(&mut salt)
+            .map_err(|e| TokuError::Crypto(format!("os rng failed for salt: {e}")))?;
+        Ok(salt)
     }
 
     /// Access the raw key bytes (internal use only for AES-GCM).
@@ -178,7 +182,8 @@ pub fn encrypt_fields(
         .map_err(|e| TokuError::Crypto(format!("cipher init: {e}")))?;
 
     let mut nonce_bytes = [0u8; 12];
-    getrandom::fill(&mut nonce_bytes).expect("OS CSPRNG failed");
+    getrandom::fill(&mut nonce_bytes)
+        .map_err(|e| TokuError::Crypto(format!("os rng failed for nonce: {e}")))?;
     let nonce = Nonce::from(nonce_bytes);
 
     let payload = Payload {
@@ -288,7 +293,8 @@ pub fn encrypt_snapshot(
         .map_err(|e| TokuError::Crypto(format!("cipher init: {e}")))?;
 
     let mut nonce_bytes = [0u8; 12];
-    getrandom::fill(&mut nonce_bytes).expect("OS CSPRNG failed");
+    getrandom::fill(&mut nonce_bytes)
+        .map_err(|e| TokuError::Crypto(format!("os rng failed for nonce: {e}")))?;
     let nonce = Nonce::from(nonce_bytes);
 
     let payload = Payload {
@@ -427,8 +433,8 @@ mod tests {
 
     #[test]
     fn generate_salt_produces_random_bytes() {
-        let salt1 = SyncKey::generate_salt();
-        let salt2 = SyncKey::generate_salt();
+        let salt1 = SyncKey::generate_salt().unwrap();
+        let salt2 = SyncKey::generate_salt().unwrap();
         assert_ne!(salt1, salt2, "two salts should not be equal");
     }
 

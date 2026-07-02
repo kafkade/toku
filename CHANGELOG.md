@@ -81,6 +81,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record for the zero-knowledge, two-secret self-host auth model: assets, adversaries,
   mitigations, the zero-knowledge sign-off, and a triaged findings table with residual risks
 
+### Security
+
+- Hardened the self-host sync and web tiers following the threat-model review (#160,
+  findings F2–F11 from #125):
+  - **Web security headers** (`toku serve`): every response now carries a
+    `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+    and `Referrer-Policy: no-referrer`, plus `Strict-Transport-Security` when secure cookies
+    are enabled (F4)
+  - **Account-enumeration resistance**: web login is now constant-time and no longer reveals
+    whether an email exists or is inactive; the sync account challenge/verify flow returns
+    uniform "phantom" responses for unknown or disabled accounts and a single `401` on any
+    verification failure (F5)
+  - **Session revocation**: new `POST /api/v1/auth/logout` (device session) and
+    `POST /api/v1/account/logout` (account session) endpoints, and disabling a user now also
+    purges that user's device sessions rather than leaving them valid until expiry (F6)
+  - **Audit logging**: failed authentications and administrative actions (user
+    enable/disable, registration toggle, device-approval changes, device approval) are now
+    recorded in a server-side `audit_log` table and emitted as `tracing` events (F7)
+  - **App-level rate limiting**: the sync authentication endpoints enforce a per-IP and
+    global request cap (HTTP `429`), honoring `X-Forwarded-For` behind a reverse proxy, as
+    defence-in-depth against online brute-force (F8)
+  - **CSPRNG robustness**: crypto salt/nonce generation now returns a `Result` and surfaces
+    a `Crypto` error instead of panicking if the OS RNG ever fails (F2)
+  - **Operator guidance** (docs): the exact `srp` pre-release pin is documented (F3);
+    `docs/sync-server.md` now recommends device approvals for multi-user deployments (F9) and
+    adds a "Security hardening & operator responsibilities" section covering mandatory TLS,
+    `0600` database permissions, at-rest encryption, clock sync, and edge rate limiting (F11);
+    `docs/recovery.md` documents the plaintext token file-fallback tradeoff and how to harden
+    headless clients (F10)
+
 ## [0.3.2] - 2026-06-28
 
 ### Fixed

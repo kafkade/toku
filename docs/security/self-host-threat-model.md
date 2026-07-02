@@ -88,16 +88,16 @@ at login** in process memory — by design.
 
 | Threat | Mitigation | Residual |
 |--------|------------|----------|
-| Capture password / Secret Key | SRP — neither crosses the wire; TLS in deployment | TLS not code-enforced (**F11**) |
-| Steal session token | Tokens 256-bit, hashed at rest, 24h TTL, device-scoped | No revocation (**F6**) |
+| Capture password / Secret Key | SRP — neither crosses the wire; TLS in deployment | TLS not code-enforced — operator responsibility (**F11**, documented) |
+| Steal session token | Tokens 256-bit, hashed at rest, 24h TTL, device-scoped; logout/disable revoke server-side (**F6**, fixed) | Un-revoked token valid until 24h TTL |
 | MITM via bad cert | reqwest default cert/hostname validation; no `danger_accept_invalid_certs` | Self-signed CA needs config |
 
 ### Lost / stolen device
 
 | Threat | Mitigation | Residual |
 |--------|------------|----------|
-| Read synced library | Device-deregister revokes its sessions; data key unreachable to deregistered device | 24h token window (**F6**) |
-| Read keys on disk | Tokens/derived key in OS keychain; file fallback 0o600 | Plaintext file fallback (**F10**) |
+| Read synced library | Device-deregister revokes its sessions; data key unreachable to deregistered device | Un-revoked token valid until 24h TTL (**F6**, fixed — logout available) |
+| Read keys on disk | Tokens/derived key in OS keychain; file fallback 0o600 | Plaintext file fallback — documented tradeoff (**F10**) |
 
 ### Stolen Emergency Kit (Secret Key only)
 
@@ -110,7 +110,7 @@ at login** in process memory — by design.
 | Threat | Mitigation | Residual |
 |--------|------------|----------|
 | Read other users' content | Zero-knowledge: keys wrapped per user; admin gets ciphertext | None for content |
-| Disable users / approve devices | First account=admin; no self-disable; user_sessions revoked | Device `sessions` survive disable (**F6**); no audit trail (**F7**) |
+| Disable users / approve devices | First account=admin; no self-disable; user_sessions + device `sessions` revoked on disable (**F6**, fixed); actions audit-logged (**F7**, fixed) | None observed |
 | Cross-tenant access | Queries scoped by token-derived user_id/library_id | None observed |
 
 ### Malicious client
@@ -119,7 +119,7 @@ at login** in process memory — by design.
 |--------|------------|----------|
 | Upload plaintext | push/rekey/snapshot reject non-envelope payloads (HTTP 422, exact key-set) | None |
 | Cross-library/user | session token bound to library/user; enrollment ownership-checked (403) | None observed |
-| Online brute-force | Lockout 5 fails → 15 min per account/library | No IP/global limit (**F8**) |
+| Online brute-force | Lockout 5 fails → 15 min per account/library; app-level per-IP + global rate limit (**F8**, fixed, 429) | Lockout `423` still distinguishable from `401` for real accounts (weak oracle) |
 
 ## 5. Zero-knowledge verification
 
@@ -149,28 +149,32 @@ at login** in process memory — by design.
 
 CSRF (double-submit, constant-time, SameSite=Strict cookie), session cookies (HttpOnly, Lax,
 Secure-conditional, 24h, hashed at rest), lockout (5/15 min), logout revokes the session,
-Maud auto-escaping (no XSS), fresh token per login (no fixation). Gaps: **no security headers**
-(**F4**), **plaintext password reaches the server** (trusted-server, by design), enumeration
-on unknown email (**F5**).
+Maud auto-escaping (no XSS), fresh token per login (no fixation), security response headers
+(CSP/X-Frame-Options/nosniff/Referrer-Policy, HSTS when secure — **F4**, fixed), constant-time
+login that no longer reveals unknown vs inactive emails (**F5**, fixed). Remaining by design:
+**plaintext password reaches the server** (trusted-server).
 
 ## 8. Findings & triage
 
-All code fixes are deferred to follow-ups (doc-only PR). Residual risks accepted for release
-are listed in [§9](#9-residual-risks-accepted).
+F1 (HIGH) is tracked separately in [#161](https://github.com/kafkade/toku/issues/161). All
+remaining findings (F2–F11) were addressed under
+[#160](https://github.com/kafkade/toku/issues/160): the code-level ones are **fixed** and the
+operational/dependency ones are **documented**. Residual risks accepted for release are listed
+in [§9](#9-residual-risks-accepted).
 
 | ID | Finding | Sev | Disposition |
 |----|---------|-----|-------------|
 | F1 | SRP verifier input omits Secret Key (`orchestrator.rs:819`, `auth.rs:141/190/291`) — diverges from ADR-010 | HIGH | Bug; follow-up #161 |
-| F4 | No web security headers (CSP, X-Frame-Options, nosniff, HSTS) | MED | Follow-up #160 |
-| F5 | Login/challenge account enumeration | MED | Follow-up #160 |
-| F6 | No token revocation/logout on sync server; user-disable keeps device sessions | MED | Follow-up #160 |
-| F7 | No audit logging | MED | Follow-up #160 |
-| F8 | No IP/global rate limit (proxy-dependent) | MED | Follow-up #160 |
-| F2 | CSPRNG `.expect()` panics on crypto path | LOW | Follow-up #160 |
-| F3 | `srp` pinned to `0.7.0-rc.3` | LOW | Follow-up #160 |
-| F9 | Device approvals off by default | LOW | Follow-up #160 |
-| F10 | Token file fallback plaintext at rest | LOW | Follow-up #160 |
-| F11 | TLS/perms/at-rest/NTP assumed, not enforced | INFO | Follow-up #160 |
+| F4 | No web security headers (CSP, X-Frame-Options, nosniff, HSTS) | MED | **Fixed** (#160): `security_headers` middleware in `toku-web`; HSTS when `secure_cookies` |
+| F5 | Login/challenge account enumeration | MED | **Fixed** (#160): constant-time web login + phantom-account uniform sync challenge/verify (401) |
+| F6 | No token revocation/logout on sync server; user-disable keeps device sessions | MED | **Fixed** (#160): `/auth/logout` + `/account/logout`; disable now purges device `sessions` |
+| F7 | No audit logging | MED | **Fixed** (#160): `audit_log` table + `security::audit` on auth failures & admin actions |
+| F8 | No IP/global rate limit (proxy-dependent) | MED | **Fixed** (#160): in-process per-IP + global limiter on auth endpoints (429); proxy still recommended |
+| F2 | CSPRNG `.expect()` panics on crypto path | LOW | **Fixed** (#160): nonce/salt generation returns `Result`, errors mapped to `TokuError::Crypto` |
+| F3 | `srp` pinned to `0.7.0-rc.3` | LOW | **Documented** (#160): no stable 0.7.x exists; exact `=` pin kept, revisit when 0.7.0 ships |
+| F9 | Device approvals off by default | LOW | **Documented** (#160): `sync-server.md` recommends enabling on multi-user/internet-facing instances |
+| F10 | Token file fallback plaintext at rest | LOW | **Documented** (#160): `recovery.md` Token storage tradeoff + hardening guidance |
+| F11 | TLS/perms/at-rest/NTP assumed, not enforced | INFO | **Documented** (#160): `sync-server.md` "Security hardening & operator responsibilities" |
 
 ## 9. Residual risks accepted
 
@@ -178,8 +182,17 @@ are listed in [§9](#9-residual-risks-accepted).
   alone; the Secret Key's 128 bits do not harden authentication. Content stays zero-knowledge.
 - Cleartext op metadata (entity/op type, counts, timing) is visible to the server.
 - Web dashboard is trusted-server: holds plaintext password (login) and decrypted library.
-- 24h session window before token expiry (no revocation yet).
-- Deployment must provide TLS, 0600 DB perms, at-rest encryption, NTP, and a rate-limiting proxy.
+- Session token window before expiry: logout/disable now revoke server-side sessions (F6), but
+  an un-revoked token remains valid until its 24h TTL.
+- **F5**: the account-lockout response (`423`) is still distinguishable from a normal auth
+  failure (`401`) for a *real* account under active brute-force, a weak residual oracle; the
+  challenge/verify path itself is uniform for unknown/disabled accounts.
+- **F8**: the built-in limiter is coarse (fixed-window, per-process) and shares one bucket for
+  clients behind the same proxy hop; a rate-limiting reverse proxy remains the primary control.
+- **F10**: the client token file fallback is plaintext protected only by `0600` perms; mitigated
+  by at-rest disk encryption on headless hosts.
+- Deployment must still provide TLS, 0600 DB perms, at-rest encryption, and NTP (F11); these are
+  operator responsibilities documented in `sync-server.md`.
 
 ## 10. Sign-off
 
@@ -188,4 +201,6 @@ content reaches the `toku-sync` server — verified by client-side SRP, cipherte
 and server-side 422 plaintext rejection. The hosted web dashboard is a documented
 **trusted-server** exception. The only divergence from ADR-010 (**F1**, verifier omits Secret
 Key) does not break the zero-knowledge content guarantee but weakens credential strength and is
-tracked for fix. All other findings are deferred with residual risks documented above.
+tracked for fix. The remaining findings (F2, F4–F11) have been resolved under #160 — code fixes
+for F2/F4/F5/F6/F7/F8 and documented operator/dependency guidance for F3/F9/F10/F11 — with the
+accepted residual risks recorded in [§9](#9-residual-risks-accepted).

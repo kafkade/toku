@@ -272,6 +272,18 @@ enum Commands {
         insecure_cookies: bool,
     },
 
+    /// Serve the library as an OPDS catalog for e-readers (KOReader, etc.)
+    ///
+    /// Exposes associated ebook files over OPDS so e-reader apps can browse and
+    /// download them. Local-first and LAN-facing: it makes no external calls and
+    /// serves only your local library. Binds all interfaces by default so
+    /// e-readers on your network can reach it; guard it with optional HTTP Basic
+    /// auth via `toku opds set-password`.
+    Opds {
+        #[command(subcommand)]
+        action: OpdsAction,
+    },
+
     /// Manage work grouping (link editions of the same creative work)
     Work {
         #[command(subcommand)]
@@ -441,6 +453,31 @@ enum TagAction {
 
     /// List all tags with book counts
     List,
+}
+
+#[derive(Subcommand)]
+enum OpdsAction {
+    /// Start the OPDS catalog server
+    Serve {
+        /// Port to listen on
+        #[arg(long, short, default_value = "3001")]
+        port: u16,
+
+        /// Host to bind. Defaults to 0.0.0.0 so e-readers on your local network
+        /// can reach the catalog; use 127.0.0.1 to restrict to this machine.
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+    },
+
+    /// Enable HTTP Basic auth by setting a username + password (prompts for the
+    /// password, stores a salted hash in the `[opds]` config section)
+    SetPassword {
+        /// Username for HTTP Basic auth
+        username: String,
+    },
+
+    /// Disable HTTP Basic auth (clears the `[opds]` credentials)
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -963,6 +1000,9 @@ fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("{e}"))
             });
         }
+        Commands::Opds { action } => {
+            return cmd_opds(&data_dir, action);
+        }
         Commands::Sync { action } => {
             return cmd_sync(&data_dir, action.clone(), &cli.format);
         }
@@ -1067,6 +1107,7 @@ fn main() -> Result<()> {
         Commands::Config { .. }
         | Commands::Completions { .. }
         | Commands::Serve { .. }
+        | Commands::Opds { .. }
         | Commands::Sync { .. }
         | Commands::Account { .. } => {
             unreachable!()
@@ -1113,6 +1154,68 @@ fn cmd_config(data_dir: &Path, show_path: bool, open_edit: bool) -> Result<()> {
     let toml_str = toml::to_string_pretty(&config).context("failed to serialize config")?;
     println!("{toml_str}");
     Ok(())
+}
+
+/// Handle `toku opds` — serve the OPDS catalog or manage its auth credentials.
+fn cmd_opds(data_dir: &Path, action: &OpdsAction) -> Result<()> {
+    match action {
+        OpdsAction::Serve { port, host } => {
+            let config = TokuConfig::load(data_dir).context("failed to load config")?;
+            let auth = if config.opds.auth_enabled() {
+                Some(config.opds.clone())
+            } else {
+                None
+            };
+            let db_path = data_dir.join("toku.db");
+            let host = host.clone();
+            let port = *port;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            rt.block_on(async move {
+                toku_web::serve_opds(db_path, &host, port, auth)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            })
+        }
+        OpdsAction::SetPassword { username } => {
+            let username = username.trim();
+            if username.is_empty() {
+                anyhow::bail!("username cannot be empty");
+            }
+            let password = read_password_prompt("OPDS password: ")?;
+            if password.is_empty() {
+                anyhow::bail!("password cannot be empty");
+            }
+            let confirm = read_password_prompt("Confirm OPDS password: ")?;
+            if password != confirm {
+                anyhow::bail!("passwords do not match");
+            }
+            let mut config = TokuConfig::load(data_dir).context("failed to load config")?;
+            config.opds.username = Some(username.to_string());
+            config.opds.password_hash = Some(toku_core::OpdsConfig::hash_password(&password));
+            config.save(data_dir).context("failed to save config")?;
+            eprintln!("OPDS HTTP Basic auth enabled for user '{username}'.");
+            eprintln!(
+                "The catalog will now require this login. Restart `toku opds serve` to apply."
+            );
+            Ok(())
+        }
+        OpdsAction::Disable => {
+            let mut config = TokuConfig::load(data_dir).context("failed to load config")?;
+            let was_enabled = config.opds.auth_enabled();
+            config.opds.username = None;
+            config.opds.password_hash = None;
+            config.save(data_dir).context("failed to save config")?;
+            if was_enabled {
+                eprintln!("OPDS HTTP Basic auth disabled. Restart `toku opds serve` to apply.");
+            } else {
+                eprintln!("OPDS HTTP Basic auth was not enabled.");
+            }
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

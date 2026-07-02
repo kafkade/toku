@@ -453,7 +453,7 @@ Rejected alternatives:
 | Markdown | Blog posts, reading lists | Phase 2 | 🟢 |
 | ZIP backup (canonical) | Full backup/migration | Phase 2 | 🟡 |
 | BibTeX | Academic citations | Phase 3 | 🟡 |
-| OPDS | E-reader catalog | Phase 6 | 🟡 |
+| OPDS | E-reader catalog | Phase 6 | 🟢 |
 | HTML | Static reading list site | Phase 3 | 🟡 |
 
 ### 3.3 — Book Metadata Sources
@@ -729,9 +729,9 @@ DRM note: Only DRM-free files are supported. No DRM stripping.
 
 ### 6.3 — OPDS Server (Phase 6)
 
-- Serve the library as an OPDS catalog for e-readers (KOReader, Moon+ Reader) 🟡
-- Local network only by default
-- Optional basic authentication
+- Serve the library as an OPDS catalog for e-readers (KOReader, Moon+ Reader) 🟢
+- Local network only by default 🟢
+- Optional basic authentication 🟢
 
 ### 6.4 — Architecture Note
 

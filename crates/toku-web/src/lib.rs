@@ -21,12 +21,15 @@ pub mod import_handlers;
 mod import_views;
 pub mod library_handlers;
 mod library_views;
+pub mod opds;
+mod opds_xml;
 mod sync_handlers;
 mod sync_status;
 mod views;
 
 pub use auth::WebMode;
 pub use error::WebError;
+pub use opds::serve_opds;
 
 /// Shared application state for Axum handlers.
 #[derive(Clone)]

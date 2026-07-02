@@ -103,6 +103,12 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Transitive DoS advisories in `quick-xml`, reachable only through
+          # toku-desktop's Tauri stack (plist / tauri-winrt-notification). No
+          # in-range upgrade exists yet (fixed in quick-xml >= 0.41.0, but the
+          # intermediate crates pin ^0.37 / ^0.39). Mirrors .cargo/audit.toml;
+          # remove both once the Tauri chain adopts quick-xml 0.41. See #160.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
   # ── Documentation ─────────────────────────────────────────────────────────────
 

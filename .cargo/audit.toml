@@ -1,0 +1,23 @@
+# cargo-audit configuration.
+#
+# The advisories ignored below are DoS vulnerabilities in `quick-xml`
+# (RUSTSEC-2026-0194, RUSTSEC-2026-0195), pulled in transitively — and only —
+# by `toku-desktop`'s Tauri stack:
+#   * quick-xml 0.39.x  <- plist <- tauri
+#   * quick-xml 0.37.x  <- tauri-winrt-notification <- notify-rust
+#                          <- tauri-plugin-notification
+#
+# They are not reachable from any network-facing Toku surface (the sync server,
+# web tier, or CLI never parse untrusted XML with quick-xml); the affected code
+# is Tauri's local plist parsing and Windows notification bindings.
+#
+# Both advisories are only fixed in quick-xml >= 0.41.0, but the intermediate
+# crates pin incompatible ranges (`plist` -> "^0.39.2", `tauri-winrt-notification`
+# -> "^0.37"), so there is no in-range upgrade available until the Tauri
+# dependency chain publishes releases that adopt quick-xml 0.41. Revisit and
+# remove these ignores once `cargo update` can pull a patched quick-xml.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

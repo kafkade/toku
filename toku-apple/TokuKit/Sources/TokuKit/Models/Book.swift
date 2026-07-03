@@ -69,3 +69,16 @@ public enum BookFormat: String, Codable, CaseIterable {
         }
     }
 }
+
+/// Type of a reading-progress entry, matching the Rust `ProgressType` enum's
+/// serialized form. `value` in a progress entry is interpreted accordingly.
+public enum ProgressType: String, Codable, CaseIterable {
+    /// Page number.
+    case page = "page"
+    /// Percentage complete (0–100).
+    case percent = "percent"
+    /// Chapter number.
+    case chapter = "chapter"
+    /// Elapsed minutes (audiobooks).
+    case duration = "duration"
+}

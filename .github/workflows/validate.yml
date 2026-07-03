@@ -128,12 +128,13 @@ jobs:
         with:
           globs: "**/*.md"
 
-  # ── Apple apps (iOS + watchOS) ────────────────────────────────────────────────
+  # ── Apple apps (iOS + macOS + watchOS) ────────────────────────────────────────
   # Compile-check the SwiftUI apps against the toku-ffi static libs so they don't
-  # silently break. Builds the simulator slices only (device builds add signing +
-  # time without catching more source breakage). No code signing.
+  # silently break. Builds the simulator slices (iOS + watchOS) and the macOS host
+  # app (device builds add signing + time without catching more source breakage).
+  # No code signing.
   apple:
-    name: Apple build (iOS + watchOS)
+    name: Apple build (iOS + macOS + watchOS)
     needs: changes
     if: github.event_name == 'push' || needs.changes.outputs.apple == 'true'
     runs-on: macos-15
@@ -147,10 +148,11 @@ jobs:
           key: apple
       - name: Install XcodeGen
         run: brew install xcodegen
-      - name: Build toku-ffi (iOS + watchOS simulators)
+      - name: Build toku-ffi (iOS + watchOS simulators + macOS host)
         run: |
           cargo build --release -p toku-ffi --target aarch64-apple-ios-sim
           cargo build --release -p toku-ffi --target aarch64-apple-watchos-sim
+          cargo build --release -p toku-ffi
           cp crates/toku-ffi/toku.h toku-apple/TokuKit/Sources/CTokuFFI/toku.h
       - name: Generate Xcode project
         working-directory: toku-apple
@@ -161,6 +163,12 @@ jobs:
           xcodebuild -project Toku.xcodeproj -scheme TokuiOS \
             -destination 'generic/platform=iOS Simulator' \
             -configuration Debug build CODE_SIGNING_ALLOWED=NO EXCLUDED_ARCHS=x86_64
+      - name: Build macOS app
+        working-directory: toku-apple
+        run: |
+          xcodebuild -project Toku.xcodeproj -scheme TokuMac \
+            -destination 'platform=macOS' \
+            -configuration Debug build CODE_SIGNING_ALLOWED=NO
       - name: Build watchOS app
         working-directory: toku-apple
         run: |

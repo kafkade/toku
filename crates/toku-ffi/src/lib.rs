@@ -32,10 +32,12 @@ use std::path::Path;
 use std::str::FromStr;
 
 use serde::Serialize;
+use serde_json::json;
 use toku_core::{
-    Author, Book, ContributorRole, CurrentlyReadingInput, ReadingStatus, StatsInput, compute_stats,
+    Author, Book, ContributorRole, CurrentlyReadingInput, EntityType, HybridClock, OpType,
+    ProgressType, ReadingProgress, ReadingStatus, StatsInput, SyncOp, compute_stats,
 };
-use toku_db::{BookRepository, Database};
+use toku_db::{BookRepository, Database, SyncRepository};
 
 // ── Status codes ────────────────────────────────────────────────────────
 
@@ -174,6 +176,36 @@ fn rust_string_to_c(s: &str) -> *mut c_char {
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+// ── Helper: append a sync op for a local mutation ───────────────────────
+
+/// Best-effort: append a sync op so a local mutation flows through the op-log to
+/// other devices (the same op-log the phone uses).
+///
+/// Op creation is guarded on a configured device identity, mirroring the CLI: when
+/// sync has not been set up there is no device, so nothing is recorded. Any failure
+/// is swallowed — a missing or partial sync setup must never block the primary write.
+fn record_sync_op(
+    db: &Database,
+    entity_type: EntityType,
+    entity_id: uuid::Uuid,
+    op_type: OpType,
+    fields: Option<serde_json::Value>,
+) {
+    let sync_repo = SyncRepository::new(db);
+    if let Ok(Some(identity)) = sync_repo.get_device() {
+        let mut clock = HybridClock::new(&identity.device_id);
+        let op = SyncOp::new(
+            identity.device_id,
+            clock.now(),
+            entity_type,
+            entity_id,
+            op_type,
+            fields,
+        );
+        let _ = sync_repo.insert_op(&op);
     }
 }
 
@@ -535,7 +567,16 @@ pub unsafe extern "C" fn toku_update_book_status(
         let repo = BookRepository::new(&handle.db);
 
         match repo.update_book_status(&uuid, reading_status) {
-            Ok(true) => TokuStatus::Ok,
+            Ok(true) => {
+                record_sync_op(
+                    &handle.db,
+                    EntityType::Book,
+                    uuid,
+                    OpType::Update,
+                    Some(json!({ "status": reading_status.as_str() })),
+                );
+                TokuStatus::Ok
+            }
             Ok(false) => {
                 set_last_error("book not found");
                 TokuStatus::ErrorNotFound
@@ -592,7 +633,16 @@ pub unsafe extern "C" fn toku_update_book_rating(
         let actual_rating = if rating == -1 { 0 } else { rating };
 
         match repo.update_book_rating(&uuid, actual_rating) {
-            Ok(true) => TokuStatus::Ok,
+            Ok(true) => {
+                record_sync_op(
+                    &handle.db,
+                    EntityType::Book,
+                    uuid,
+                    OpType::Update,
+                    Some(json!({ "rating": actual_rating })),
+                );
+                TokuStatus::Ok
+            }
             Ok(false) => {
                 set_last_error("book not found");
                 TokuStatus::ErrorNotFound
@@ -602,6 +652,107 @@ pub unsafe extern "C" fn toku_update_book_rating(
                 TokuStatus::ErrorDb
             }
         }
+    }))
+}
+
+/// Log a reading-progress entry for a book.
+///
+/// `progress_type` is one of `"page"`, `"percent"`, `"chapter"`, or `"duration"`
+/// (minutes, for audiobooks). `value` is the corresponding page number, percentage
+/// (0–100), chapter number, or minute count.
+///
+/// Progress entries are immutable and append-only. When sync is configured, a
+/// `progress` op is recorded so the entry flows through the op-log to other devices.
+/// If an active reading session exists for the book, the entry is linked to it.
+///
+/// # Safety
+/// - `db` must be a valid handle from `toku_open`.
+/// - `id` must be a valid NUL-terminated UUID string.
+/// - `progress_type` must be a valid NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_log_progress(
+    db: *mut TokuDb,
+    id: *const c_char,
+    progress_type: *const c_char,
+    value: i32,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if db.is_null() {
+            set_last_error("null db pointer");
+            return TokuStatus::ErrorNullPointer;
+        }
+
+        let id_str = match unsafe { cstr_to_str(id) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+        let type_str = match unsafe { cstr_to_str(progress_type) } {
+            Ok(s) => s,
+            Err(st) => return st,
+        };
+
+        let uuid = match uuid::Uuid::parse_str(id_str) {
+            Ok(u) => u,
+            Err(_) => {
+                set_last_error("invalid UUID format");
+                return TokuStatus::ErrorInvalidUtf8;
+            }
+        };
+
+        let ptype = match ProgressType::from_str(type_str) {
+            Ok(t) => t,
+            Err(_) => {
+                set_last_error(&format!(
+                    "invalid progress type: {type_str} (expected page, percent, chapter, or duration)"
+                ));
+                return TokuStatus::ErrorInvalidUtf8;
+            }
+        };
+
+        if value < 0 {
+            set_last_error("progress value must be non-negative");
+            return TokuStatus::ErrorInvalidUtf8;
+        }
+        if matches!(ptype, ProgressType::Percent) && value > 100 {
+            set_last_error("percent must be between 0 and 100");
+            return TokuStatus::ErrorInvalidUtf8;
+        }
+
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+
+        // Ensure the book exists so we return NotFound rather than a dangling entry.
+        if let Err(e) = repo.get_book(&uuid) {
+            set_last_error(&format!("book not found: {e}"));
+            return TokuStatus::ErrorNotFound;
+        }
+
+        let active_session = repo.get_active_session(&uuid).ok().flatten();
+        let mut progress = ReadingProgress::new(uuid, ptype, value);
+        progress.session_id = active_session.map(|s| s.id);
+
+        if let Err(e) = repo.log_progress(&progress) {
+            set_last_error(&format!("failed to log progress: {e}"));
+            return TokuStatus::ErrorDb;
+        }
+
+        record_sync_op(
+            &handle.db,
+            EntityType::Progress,
+            progress.id,
+            OpType::Create,
+            Some(json!({
+                "book_id": progress.book_id.to_string(),
+                "progress_type": ptype.as_str(),
+                "value": value,
+                "session_id": progress.session_id.map(|s| s.to_string()),
+                "logged_at": progress.logged_at.to_rfc3339(),
+            })),
+        );
+
+        TokuStatus::Ok
     }))
 }
 
@@ -1750,6 +1901,131 @@ mod tests {
 
         let result = unsafe { toku_update_book_rating(db, id_c.as_ptr(), -2) };
         assert!(matches!(result, TokuStatus::ErrorInvalidUtf8));
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn log_progress_success() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Progress Test", None);
+        let id_c = CString::new(id.clone()).unwrap();
+        let type_c = CString::new("page").unwrap();
+
+        let result = unsafe { toku_log_progress(db, id_c.as_ptr(), type_c.as_ptr(), 42) };
+        assert!(matches!(result, TokuStatus::Ok));
+
+        // Verify the entry was persisted.
+        let handle = unsafe { &*db };
+        let repo = BookRepository::new(&handle.db);
+        let book_uuid = uuid::Uuid::parse_str(&id).unwrap();
+        let log = repo.get_reading_log(&book_uuid).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].value, 42);
+        assert_eq!(log[0].progress_type, ProgressType::Page);
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn log_progress_book_not_found() {
+        let db = open_memory_db();
+        let id = CString::new("01961234-5678-7000-8000-000000000000").unwrap();
+        let type_c = CString::new("page").unwrap();
+
+        let result = unsafe { toku_log_progress(db, id.as_ptr(), type_c.as_ptr(), 10) };
+        assert!(matches!(result, TokuStatus::ErrorNotFound));
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn log_progress_invalid_type() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Bad Type", None);
+        let id_c = CString::new(id).unwrap();
+        let type_c = CString::new("banana").unwrap();
+
+        let result = unsafe { toku_log_progress(db, id_c.as_ptr(), type_c.as_ptr(), 10) };
+        assert!(matches!(result, TokuStatus::ErrorInvalidUtf8));
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn log_progress_percent_out_of_range() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Bad Percent", None);
+        let id_c = CString::new(id).unwrap();
+        let type_c = CString::new("percent").unwrap();
+
+        let result = unsafe { toku_log_progress(db, id_c.as_ptr(), type_c.as_ptr(), 150) };
+        assert!(matches!(result, TokuStatus::ErrorInvalidUtf8));
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn log_progress_emits_sync_op_when_device_configured() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Sync Progress", None);
+
+        // Configure a device so mutations record ops.
+        let handle = unsafe { &*db };
+        let sync_repo = SyncRepository::new(&handle.db);
+        sync_repo.get_or_create_device("test-device").unwrap();
+
+        let id_c = CString::new(id).unwrap();
+        let type_c = CString::new("page").unwrap();
+        let result = unsafe { toku_log_progress(db, id_c.as_ptr(), type_c.as_ptr(), 30) };
+        assert!(matches!(result, TokuStatus::Ok));
+
+        let ops = sync_repo.get_unpushed_ops().unwrap();
+        assert!(
+            ops.iter().any(|op| op.entity_type == EntityType::Progress),
+            "expected a progress sync op to be recorded"
+        );
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn update_status_emits_sync_op_when_device_configured() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "Sync Status", None);
+
+        let handle = unsafe { &*db };
+        let sync_repo = SyncRepository::new(&handle.db);
+        sync_repo.get_or_create_device("test-device").unwrap();
+
+        let id_c = CString::new(id).unwrap();
+        let status_c = CString::new("reading").unwrap();
+        let result = unsafe { toku_update_book_status(db, id_c.as_ptr(), status_c.as_ptr()) };
+        assert!(matches!(result, TokuStatus::Ok));
+
+        let ops = sync_repo.get_unpushed_ops().unwrap();
+        assert!(
+            ops.iter().any(|op| op.entity_type == EntityType::Book),
+            "expected a book sync op to be recorded"
+        );
+
+        unsafe { toku_close(db) };
+    }
+
+    #[test]
+    fn log_progress_without_device_records_no_op() {
+        let db = open_memory_db();
+        let id = add_test_book(db, "No Device", None);
+        let id_c = CString::new(id).unwrap();
+        let type_c = CString::new("page").unwrap();
+
+        // No device configured — the write succeeds but no op is recorded.
+        let result = unsafe { toku_log_progress(db, id_c.as_ptr(), type_c.as_ptr(), 15) };
+        assert!(matches!(result, TokuStatus::Ok));
+
+        let handle = unsafe { &*db };
+        let sync_repo = SyncRepository::new(&handle.db);
+        assert_eq!(sync_repo.count_unpushed_ops().unwrap(), 0);
 
         unsafe { toku_close(db) };
     }

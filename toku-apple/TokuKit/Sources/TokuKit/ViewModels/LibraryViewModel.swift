@@ -111,6 +111,32 @@ public final class LibraryViewModel: ObservableObject {
         }
     }
 
+    /// Log a reading-progress entry for a book. `completion` runs on the main actor
+    /// after the reload settles. Callers that also want to advance the book's status
+    /// (e.g. to `.reading`) should call `updateStatus` alongside this.
+    public func logProgress(
+        id: String,
+        type: ProgressType,
+        value: Int,
+        completion: (@MainActor () -> Void)? = nil
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.ffi.logProgress(id: id, type: type, value: value)
+                Task { @MainActor in
+                    self.loadBooks()
+                    completion?()
+                }
+            } catch {
+                Task { @MainActor in
+                    self.errorMessage = error.localizedDescription
+                    completion?()
+                }
+            }
+        }
+    }
+
     private func sorted(_ books: [Book]) -> [Book] {
         switch sortOrder {
         case .title:

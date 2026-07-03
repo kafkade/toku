@@ -5,9 +5,8 @@ import TokuKit
 ///
 /// Flow: Tap progress button on card (1) → adjust page (2) → tap Save (3).
 ///
-/// Note: Full reading progress logging requires `toku_log_progress` FFI function
-/// which is available in toku-db but not yet exposed via toku-ffi. For now, this
-/// updates the book's reading status to "reading" as a side effect.
+/// Saving records an append-only page-progress entry via `logProgress` and marks the
+/// book as "reading" if it isn't already.
 struct ProgressUpdateSheet: View {
     let book: Book
     var viewModel: LibraryViewModel?
@@ -116,14 +115,13 @@ struct ProgressUpdateSheet: View {
     private func saveProgress() {
         isSaving = true
 
-        // Ensure the book is marked as "reading" if it isn't already
+        // Ensure the book is marked as "reading" if it isn't already.
         if book.status != .reading {
             viewModel?.updateStatus(id: book.id, status: .reading)
         }
 
-        // TODO: Call toku_log_progress FFI function when available.
-        // Currently, toku-db has `repo.log_progress()` but toku-ffi
-        // does not expose it. For now, we update the status only.
+        // Record an append-only page-progress entry through the FFI op-log.
+        viewModel?.logProgress(id: book.id, type: .page, value: currentPage)
 
         onSave?()
         dismiss()

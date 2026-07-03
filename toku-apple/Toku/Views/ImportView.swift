@@ -16,7 +16,7 @@ struct ImportView: View {
             VStack(spacing: 16) {
                 Image(systemName: "arrow.down.doc")
                     .font(.system(size: 48))
-                    .foregroundStyle(isDropTargeted ? .accentColor : .secondary)
+                    .foregroundStyle(isDropTargeted ? Color.accentColor : Color.secondary)
 
                 Text("Drop a Goodreads CSV here")
                     .font(.title3)

@@ -146,6 +146,27 @@ enum TokuStatus toku_update_book_status(struct TokuDb *db, const char *id, const
 enum TokuStatus toku_update_book_rating(struct TokuDb *db, const char *id, int32_t rating);
 
 /**
+ * Log a reading-progress entry for a book.
+ *
+ * `progress_type` is one of `"page"`, `"percent"`, `"chapter"`, or `"duration"`
+ * (minutes, for audiobooks). `value` is the corresponding page number, percentage
+ * (0–100), chapter number, or minute count.
+ *
+ * Progress entries are immutable and append-only. When sync is configured, a
+ * `progress` op is recorded so the entry flows through the op-log to other devices.
+ * If an active reading session exists for the book, the entry is linked to it.
+ *
+ * # Safety
+ * - `db` must be a valid handle from `toku_open`.
+ * - `id` must be a valid NUL-terminated UUID string.
+ * - `progress_type` must be a valid NUL-terminated UTF-8 string.
+ */
+enum TokuStatus toku_log_progress(struct TokuDb *db,
+                                  const char *id,
+                                  const char *progress_type,
+                                  int32_t value);
+
+/**
  * Search books using full-text search. Results are returned as a JSON array.
  *
  * # Safety

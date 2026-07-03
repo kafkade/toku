@@ -3,9 +3,9 @@ import TokuKit
 
 /// Quick progress + status logging for a single book, driven by the Digital Crown.
 ///
-/// The Rust FFI does not yet expose `log_progress`, so — matching the iOS app —
-/// saving a page marks the book as `reading`. Quick actions let the user mark the
-/// book finished or move it to another status straight from the wrist.
+/// Saving records an append-only page-progress entry via `logProgress` and marks the
+/// book as `reading`. Quick actions let the user mark the book finished or move it to
+/// another status straight from the wrist.
 struct LogProgressView: View {
     let book: Book
     @EnvironmentObject var appState: WatchAppState
@@ -128,9 +128,13 @@ struct LogProgressView: View {
     // MARK: - Actions
 
     private func saveProgress() {
-        // FFI has no log_progress yet; ensure the book is marked as reading.
+        // Record an append-only page progress entry; also ensure the book is marked
+        // as reading so the currently-reading list and complication stay accurate.
         if book.status != .reading {
             appState.libraryVM?.updateStatus(id: book.id, status: .reading)
+        }
+        appState.libraryVM?.logProgress(id: book.id, type: .page, value: Int(page)) {
+            appState.refresh()
         }
         appState.updateComplicationSnapshot()
         dismiss()

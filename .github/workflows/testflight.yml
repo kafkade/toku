@@ -1,0 +1,210 @@
+name: TestFlight
+
+# Beta distribution for the Apple apps (iOS app + embedded watchOS companion and
+# complication). Archives, signs, and uploads a build to TestFlight.
+#
+# This workflow is a SCAFFOLD: it only does real work when the signing secrets
+# below are configured on the repository. Without them every signing/upload step
+# is skipped and the job succeeds as a no-op, so it never blocks other work.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   APPLE_TEAM_ID                     Apple Developer team identifier (10 chars)
+#   APPLE_CERTIFICATE_P12             base64 of the "Apple Distribution" .p12
+#   APPLE_CERTIFICATE_PASSWORD        password for the .p12
+#   APPLE_PROVISIONING_PROFILE_IOS            base64 .mobileprovision (app)
+#   APPLE_PROVISIONING_PROFILE_WATCH          base64 .mobileprovision (watch app)
+#   APPLE_PROVISIONING_PROFILE_COMPLICATION   base64 .mobileprovision (widget ext)
+#   APP_STORE_CONNECT_KEY_ID          App Store Connect API key id
+#   APP_STORE_CONNECT_ISSUER_ID       App Store Connect API issuer id
+#   APP_STORE_CONNECT_API_KEY         base64 of the App Store Connect .p8 key
+#
+# Bundle identifiers the provisioning profiles must cover:
+#   com.kafkade.toku.ios
+#   com.kafkade.toku.ios.watchkitapp
+#   com.kafkade.toku.ios.watchkitapp.complication
+#
+# NOTE (CI gate / infra): this is a delivery workflow, NOT a merge gate. It is
+# intentionally kept out of the `Validate` summary check in validate.yml, so the
+# branch-protection config in kafkade/github-infra (repo_toku.tf,
+# required_status_checks) does NOT need to change. If TestFlight is ever promoted
+# to a required check, update that Terraform in lockstep.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tester_notes:
+        description: "What to test in this build (shown to TestFlight testers)"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: testflight-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  testflight:
+    name: Archive & upload to TestFlight
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      # ── Preflight: only proceed when signing secrets are present ──────────────
+      - name: Check for signing secrets
+        id: preflight
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          if [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_CERTIFICATE_P12" ] && [ -n "$APP_STORE_CONNECT_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Signing secrets present — proceeding with a signed archive."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Signing secrets not configured — skipping archive/upload (scaffold no-op)."
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.preflight.outputs.enabled == 'true'
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-watchos
+      - uses: Swatinem/rust-cache@v2
+        if: steps.preflight.outputs.enabled == 'true'
+        with:
+          key: testflight
+      - name: Install XcodeGen
+        if: steps.preflight.outputs.enabled == 'true'
+        run: brew install xcodegen
+
+      - name: Build toku-ffi (iOS + watchOS device slices)
+        if: steps.preflight.outputs.enabled == 'true'
+        run: |
+          cargo build --release -p toku-ffi --target aarch64-apple-ios
+          cargo build --release -p toku-ffi --target aarch64-apple-watchos
+          cp crates/toku-ffi/toku.h toku-apple/TokuKit/Sources/CTokuFFI/toku.h
+
+      # ── Import signing assets into a temporary keychain ───────────────────────
+      - name: Import code-signing certificate
+        if: steps.preflight.outputs.enabled == 'true'
+        env:
+          CERT_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/toku-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Make the temp keychain visible to the build.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Install provisioning profiles
+        if: steps.preflight.outputs.enabled == 'true'
+        env:
+          PROFILE_IOS: ${{ secrets.APPLE_PROVISIONING_PROFILE_IOS }}
+          PROFILE_WATCH: ${{ secrets.APPLE_PROVISIONING_PROFILE_WATCH }}
+          PROFILE_COMPLICATION: ${{ secrets.APPLE_PROVISIONING_PROFILE_COMPLICATION }}
+        run: |
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_DIR"
+          install_profile() {
+            local b64="$1"
+            [ -z "$b64" ] && return 0
+            local tmp
+            tmp="$(mktemp "$RUNNER_TEMP/pp.XXXXXX.mobileprovision")"
+            echo "$b64" | base64 --decode > "$tmp"
+            local uuid
+            uuid="$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin \
+              <<< "$(security cms -D -i "$tmp")")"
+            cp "$tmp" "$PROFILES_DIR/$uuid.mobileprovision"
+            echo "Installed provisioning profile $uuid"
+          }
+          install_profile "$PROFILE_IOS"
+          install_profile "$PROFILE_WATCH"
+          install_profile "$PROFILE_COMPLICATION"
+
+      - name: Generate Xcode project
+        if: steps.preflight.outputs.enabled == 'true'
+        working-directory: toku-apple
+        run: xcodegen generate
+
+      # ── Archive the iOS app (embeds the watch app + complication) ─────────────
+      - name: Archive iOS app
+        if: steps.preflight.outputs.enabled == 'true'
+        working-directory: toku-apple
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcodebuild -project Toku.xcodeproj -scheme TokuiOS \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Toku.xcarchive" \
+            archive \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            -allowProvisioningUpdates
+
+      - name: Export .ipa
+        if: steps.preflight.outputs.enabled == 'true'
+        working-directory: toku-apple
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>uploadSymbols</key><true/>
+            <key>destination</key><string>export</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Toku.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates
+
+      - name: Upload to TestFlight
+        if: steps.preflight.outputs.enabled == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          # App Store Connect API keys are read from a well-known private-keys dir.
+          KEYS_DIR="$RUNNER_TEMP/private_keys"
+          mkdir -p "$KEYS_DIR"
+          echo "$ASC_API_KEY" | base64 --decode > "$KEYS_DIR/AuthKey_${ASC_KEY_ID}.p8"
+
+          IPA="$(find "$RUNNER_TEMP/export" -name '*.ipa' | head -1)"
+          if [ -z "$IPA" ]; then
+            echo "::error::No .ipa produced by export step"; exit 1
+          fi
+          echo "Uploading $IPA to TestFlight…"
+          xcrun altool --upload-app -f "$IPA" -t ios \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Scaffold no-op notice
+        if: steps.preflight.outputs.enabled != 'true'
+        run: |
+          echo "TestFlight signing secrets are not configured on this repository."
+          echo "This workflow is a scaffold — configure the secrets documented at the"
+          echo "top of .github/workflows/testflight.yml to enable beta distribution."

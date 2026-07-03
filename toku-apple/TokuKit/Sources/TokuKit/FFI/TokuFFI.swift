@@ -118,6 +118,20 @@ public final class TokuFFI: @unchecked Sendable {
         try TokuFFI.check(status)
     }
 
+    /// Log an append-only reading-progress entry for a book.
+    ///
+    /// `value` is interpreted per `type` (page number, percentage 0–100, chapter,
+    /// or minutes). When sync is configured, this records a `progress` op that flows
+    /// through the op-log to other devices.
+    public func logProgress(id: String, type: ProgressType, value: Int) throws {
+        let result = id.withCString { idPtr in
+            type.rawValue.withCString { tPtr in
+                toku_log_progress(db, idPtr, tPtr, Int32(value))
+            }
+        }
+        try TokuFFI.check(result)
+    }
+
     // MARK: - Search
 
     /// Full-text search for books.

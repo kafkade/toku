@@ -25,6 +25,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       docs: ${{ steps.filter.outputs.docs }}
+      apple: ${{ steps.filter.outputs.apple }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -37,6 +38,9 @@ jobs:
             docs:
               - '**/*.md'
               - '.markdownlint*'
+            apple:
+              - 'toku-apple/**'
+              - 'crates/toku-ffi/**'
 
   # ── Rust checks ───────────────────────────────────────────────────────────────
 
@@ -124,6 +128,46 @@ jobs:
         with:
           globs: "**/*.md"
 
+  # ── Apple apps (iOS + watchOS) ────────────────────────────────────────────────
+  # Compile-check the SwiftUI apps against the toku-ffi static libs so they don't
+  # silently break. Builds the simulator slices only (device builds add signing +
+  # time without catching more source breakage). No code signing.
+  apple:
+    name: Apple build (iOS + watchOS)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.apple == 'true'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim,aarch64-apple-watchos-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: apple
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build toku-ffi (iOS + watchOS simulators)
+        run: |
+          cargo build --release -p toku-ffi --target aarch64-apple-ios-sim
+          cargo build --release -p toku-ffi --target aarch64-apple-watchos-sim
+          cp crates/toku-ffi/toku.h toku-apple/TokuKit/Sources/CTokuFFI/toku.h
+      - name: Generate Xcode project
+        working-directory: toku-apple
+        run: xcodegen generate
+      - name: Build iOS app
+        working-directory: toku-apple
+        run: |
+          xcodebuild -project Toku.xcodeproj -scheme TokuiOS \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Debug build CODE_SIGNING_ALLOWED=NO EXCLUDED_ARCHS=x86_64
+      - name: Build watchOS app
+        working-directory: toku-apple
+        run: |
+          xcodebuild -project Toku.xcodeproj -scheme TokuWatch \
+            -destination 'generic/platform=watchOS Simulator' \
+            -configuration Debug build CODE_SIGNING_ALLOWED=NO EXCLUDED_ARCHS=x86_64
+
   # ── Summary gate ──────────────────────────────────────────────────────────────
   # Single required status check for branch protection. Downstream jobs may be
   # skipped (path filters) — that is OK; only failures or cancellations block.
@@ -133,7 +177,7 @@ jobs:
   validate:
     name: Validate
     if: always()
-    needs: [test, clippy, fmt, msrv, audit, markdownlint]
+    needs: [test, clippy, fmt, msrv, audit, markdownlint, apple]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any dependency failed

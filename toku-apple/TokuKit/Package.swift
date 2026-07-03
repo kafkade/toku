@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "TokuKit",
-    platforms: [.macOS(.v14), .iOS(.v17)],
+    platforms: [.macOS(.v14), .iOS(.v17), .watchOS(.v10)],
     products: [
         .library(name: "TokuKit", targets: ["TokuKit"]),
         .library(name: "TokuKitUI", targets: ["TokuKitUI"]),

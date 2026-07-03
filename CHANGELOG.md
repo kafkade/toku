@@ -80,6 +80,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New `docs/security/self-host-threat-model.md` — end-to-end threat model and security-review
   record for the zero-knowledge, two-secret self-host auth model: assets, adversaries,
   mitigations, the zero-knowledge sign-off, and a triaged findings table with residual risks
+- watchOS companion app (`TokuWatch`): a wrist-first companion to the iPhone app for glanceable
+  reading tracking. View currently-reading books, log progress with the Digital Crown, quick
+  actions to mark a book finished or on hold, and glance stats (books read, current streak,
+  total pages). A WidgetKit complication shows the current book and reading streak on the watch
+  face (inline, circular, and rectangular families). The app reuses the shared `TokuKit` layer
+  over `toku-ffi`, keeps its own local database, and syncs through the existing op-log — the
+  same model as the iPhone app — so it works fully offline and needs no paired phone to run
+  (#178)
 
 ### Security
 

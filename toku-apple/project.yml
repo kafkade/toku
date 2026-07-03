@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: dev.toku
   deploymentTarget:
     iOS: "18.0"
+    watchOS: "11.0"
   createIntermediateGroups: true
 
 packages:
@@ -49,3 +50,72 @@ targets:
         # Build them first with: ./build-ffi.sh
         "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": "$(PROJECT_DIR)/../target/aarch64-apple-ios/release"
         "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": "$(PROJECT_DIR)/../target/aarch64-apple-ios-sim/release"
+
+  # ---------------------------------------------------------------------------
+  # watchOS companion app (issue #178). A wrist-first companion that reuses the
+  # shared TokuKit layer over toku-ffi. It keeps its own local FFI database and
+  # syncs through the existing op-log (same model as the iOS app), so it builds
+  # and runs on a watch simulator without a paired phone.
+  # ---------------------------------------------------------------------------
+  TokuWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "11.0"
+    sources:
+      - path: TokuWatch
+        excludes:
+          - "Info.plist"
+      - path: TokuWatchShared
+    dependencies:
+      - package: TokuKit
+        product: TokuKit
+      - target: TokuWatchComplication
+        embed: true
+    settings:
+      base:
+        INFOPLIST_FILE: TokuWatch/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafkade.toku.ios.watchkitapp
+        PRODUCT_NAME: Toku
+        MARKETING_VERSION: "0.2.1"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        # toku-ffi is linked via the CTokuFFI module map (link "toku_ffi").
+        # rusqlite needs system libsqlite3; getrandom/keychain need Security.
+        OTHER_LDFLAGS:
+          - "-lsqlite3"
+          - "-framework"
+          - "Security"
+        # Per-SDK search paths for the prebuilt release static libraries.
+        # Build them first with: ./build-ffi.sh
+        "LIBRARY_SEARCH_PATHS[sdk=watchos*]": "$(PROJECT_DIR)/../target/aarch64-apple-watchos/release"
+        "LIBRARY_SEARCH_PATHS[sdk=watchsimulator*]": "$(PROJECT_DIR)/../target/aarch64-apple-watchos-sim/release"
+        # The prebuilt toku-ffi simulator static lib is arm64-only (Apple Silicon).
+        "EXCLUDED_ARCHS[sdk=watchsimulator*]": "x86_64"
+
+  # WidgetKit extension providing watch-face complications (current book + streak).
+  # Deliberately does NOT link toku-ffi: it reads a small shared snapshot written
+  # by the watch app, keeping the extension lightweight.
+  TokuWatchComplication:
+    type: app-extension
+    platform: watchOS
+    deploymentTarget: "11.0"
+    sources:
+      - path: TokuWatchComplication
+        excludes:
+          - "Info.plist"
+      - path: TokuWatchShared
+    settings:
+      base:
+        INFOPLIST_FILE: TokuWatchComplication/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.kafkade.toku.ios.watchkitapp.complication
+        PRODUCT_NAME: TokuWatchComplication
+        MARKETING_VERSION: "0.2.1"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        "EXCLUDED_ARCHS[sdk=watchsimulator*]": "x86_64"

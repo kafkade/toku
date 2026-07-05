@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-04
+
 ### Added
 
 - OPDS server: `toku opds serve [--host <addr>] [--port <n>]` serves the library as an
@@ -501,7 +503,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Export to Markdown: `toku export markdown` with books grouped by reading status and star ratings
 - Canonical backup: `toku export backup --output toku-backup.zip` with library data + cover images in a self-contained ZIP
 
-[Unreleased]: https://github.com/kafkade/toku/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/kafkade/toku/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/kafkade/toku/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/kafkade/toku/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/kafkade/toku/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/kafkade/toku/compare/v0.2.1...v0.3.0

@@ -5872,7 +5872,7 @@ dependencies = [
 
 [[package]]
 name = "toku-cli"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -5908,7 +5908,7 @@ dependencies = [
 
 [[package]]
 name = "toku-core"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -5927,7 +5927,7 @@ dependencies = [
 
 [[package]]
 name = "toku-db"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5944,7 +5944,7 @@ dependencies = [
 
 [[package]]
 name = "toku-desktop"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "tauri",
  "tauri-build",
@@ -5956,7 +5956,7 @@ dependencies = [
 
 [[package]]
 name = "toku-export"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "csv",
@@ -5972,7 +5972,7 @@ dependencies = [
 
 [[package]]
 name = "toku-ffi"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "cbindgen",
  "chrono",
@@ -5987,7 +5987,7 @@ dependencies = [
 
 [[package]]
 name = "toku-files"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -6002,7 +6002,7 @@ dependencies = [
 
 [[package]]
 name = "toku-import"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "csv",
@@ -6017,7 +6017,7 @@ dependencies = [
 
 [[package]]
 name = "toku-meta"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -6031,7 +6031,7 @@ dependencies = [
 
 [[package]]
 name = "toku-sync"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -6062,7 +6062,7 @@ dependencies = [
 
 [[package]]
 name = "toku-sync-client"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6087,7 +6087,7 @@ dependencies = [
 
 [[package]]
 name = "toku-web"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "axum",
  "axum-extra",

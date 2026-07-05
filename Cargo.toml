@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["kafkade"]
@@ -24,14 +24,14 @@ license = "MIT"
 repository = "https://github.com/kafkade/toku"
 
 [workspace.dependencies]
-toku-core = { path = "crates/toku-core", version = "0.3.2" }
-toku-db = { path = "crates/toku-db", version = "0.3.2" }
-toku-meta = { path = "crates/toku-meta", version = "0.3.2" }
-toku-import = { path = "crates/toku-import", version = "0.3.2" }
-toku-export = { path = "crates/toku-export", version = "0.3.2" }
-toku-files = { path = "crates/toku-files", version = "0.3.2" }
-toku-web = { path = "crates/toku-web", version = "0.3.2" }
-toku-sync-client = { path = "crates/toku-sync-client", version = "0.3.2" }
+toku-core = { path = "crates/toku-core", version = "0.4.0" }
+toku-db = { path = "crates/toku-db", version = "0.4.0" }
+toku-meta = { path = "crates/toku-meta", version = "0.4.0" }
+toku-import = { path = "crates/toku-import", version = "0.4.0" }
+toku-export = { path = "crates/toku-export", version = "0.4.0" }
+toku-files = { path = "crates/toku-files", version = "0.4.0" }
+toku-web = { path = "crates/toku-web", version = "0.4.0" }
+toku-sync-client = { path = "crates/toku-sync-client", version = "0.4.0" }
 thiserror = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }

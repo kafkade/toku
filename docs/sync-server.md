@@ -27,7 +27,7 @@ The server is now listening on `http://localhost:8080`. Check it:
 
 ```bash
 curl http://localhost:8080/health
-# {"status":"ok","version":"0.2.1"}
+# {"status":"ok","version":"0.4.0"}
 ```
 
 ### Docker Compose
@@ -253,7 +253,7 @@ After recreating, confirm the new version is healthy:
 
 ```bash
 curl https://sync.example.com/health
-# {"status":"ok","version":"0.3.2","protocol_version":2,"min_protocol":1}
+# {"status":"ok","version":"0.4.0","protocol_version":2,"min_protocol":1}
 ```
 
 > **Back up before upgrading.** Take a copy of `sync.db` (see [Data persistence](#data-persistence))
@@ -261,7 +261,7 @@ curl https://sync.example.com/health
 > automatically on start and are forward-only.
 >
 > **Pin a tag for production.** `:latest` is convenient but moves underneath you. For
-> reproducible upgrades, pin a specific version (e.g. `ghcr.io/kafkade/toku-sync:0.3.2`)
+> reproducible upgrades, pin a specific version (e.g. `ghcr.io/kafkade/toku-sync:0.4.0`)
 > and bump it deliberately. Both `MAJOR.MINOR` and full `MAJOR.MINOR.PATCH` tags are
 > published alongside `latest`.
 

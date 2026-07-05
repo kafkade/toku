@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Toku (読く — Japanese for "to read") is a private, offline-first personal book manager. It combines the metadata depth of Calibre, the reading tracking of Goodreads, and the analytics of StoryGraph — without any social features. Phases 0–5 are complete (CLI, imports, analytics, web dashboard, native apps). Phase 6 (file management) and Phase 7 (sync) are next.
+Toku (読く — Japanese for "to read") is a private, offline-first personal book manager. It combines the metadata depth of Calibre, the reading tracking of Goodreads, and the analytics of StoryGraph — without any social features. Phases 0–7 are complete (CLI, imports, analytics, web dashboard, native apps, file management, and sync). A watchOS companion app is planned (tracked in #178).
 
 ## Non-Negotiable Constraints
 
@@ -16,17 +16,20 @@ Every code contribution, architecture decision, and feature design must uphold t
 
 ## Architecture
 
-Cargo workspace with 9 crates:
+Cargo workspace with 12 crates:
 
 - `toku-core/` — Domain models, traits, state machine, statistics engine. Pure Rust, no I/O. Compiles to native, WASM, FFI.
 - `toku-db/` — SQLite persistence, schema migrations (refinery), FTS5 full-text search.
 - `toku-import/` — Import implementations: Goodreads CSV, Calibre metadata.db, StoryGraph.
 - `toku-meta/` — Metadata fetching: Open Library API (primary), Google Books (fallback). Cover image downloading.
+- `toku-files/` — Ebook file management: association, SHA-256 integrity verification, disk organization, and format conversion (via Calibre's `ebook-convert`).
 - `toku-cli/` — CLI binary (clap v4). The main entry point.
 - `toku-export/` — Export implementations: CSV, JSON, Markdown, BibTeX, canonical backup.
 - `toku-ffi/` — C FFI bindings for Swift/Kotlin via `cbindgen`. Used by macOS and iOS apps.
-- `toku-web/` — Axum + maud web server. Library views, statistics dashboard, import wizard. Started via `toku serve`.
+- `toku-web/` — Axum + maud web server. Library views, statistics dashboard, import wizard, OPDS catalog. Started via `toku serve`.
 - `toku-desktop/` — Tauri v2 Windows desktop app wrapping the web UI.
+- `toku-sync/` — Self-hostable, zero-knowledge sync relay server (stores only client-encrypted ciphertext).
+- `toku-sync-client/` — Client-side sync engine: end-to-end encryption, HLC-based conflict resolution, and op propagation.
 
 ### Data Boundary Rule
 

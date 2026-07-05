@@ -64,6 +64,19 @@ Cargo workspace with 9 crates:
 
 **Branch protection for this repo is managed via Terraform in `kafkade/github-infra` (`repo_toku.tf`).** The `required_status_checks` list must match the job names in `.github/workflows/ci.yml`. If you rename, add, or remove CI jobs that are used as merge gates (currently `Validate`), the corresponding IaC config must be updated or PRs will be permanently blocked. Always flag this when proposing workflow changes.
 
+## Releasing
+
+Releases follow a **two-phase, PR-based flow** driven by a machine-global, repo-agnostic helper (`rust-release.sh`, aliased to `release` — not tracked in-repo). Agents must respect the Git Policy above: perform the **prepare** file edits, but never commit, tag, or push.
+
+- **Phase 1 — prepare (in a feature branch / release PR).** `release prepare <major|minor|patch>` bumps `[workspace.package] version` and every internal `toku-*` path-dep version in `[workspace.dependencies]`, refreshes `Cargo.lock`, and stamps `CHANGELOG.md` (`[Unreleased] → [x.y.z] - <date>`, plus compare links). It does **not** commit, tag, or push — the resulting diff *is* the release PR. An agent may reproduce these edits by hand (equivalent to the script) and leave them uncommitted for review. The phase is idempotent: re-running when already prepared is a no-op.
+- **Phase 2 — tag (on the default branch, after the PR merges).** `release tag [--push]` verifies the version is already stamped, then creates the annotated `vX.Y.Z` tag at the merge commit and (with `--push`) pushes it. **Pushing the tag is the only trigger** for `.github/workflows/release.yml` (multi-target binary build + crates.io publish). This is a human/maintainer step — agents never tag or push.
+
+Conventions:
+
+- During normal work, only accumulate user-facing entries under `## [Unreleased]`; the version bump + changelog stamp happen solely at release time (Phase 1), never per-PR.
+- Because the crates are published to crates.io, `[workspace.dependencies]` path deps carry an explicit `version = "x.y.z"` (required to publish a path dep). These **must stay in lockstep** with `[workspace.package] version` — the helper keeps them synced on every `prepare`. Do not hand-edit one without the other; a lone drift stays invisible within a patch range (`^0.3.0` matches `0.3.x`) and only breaks at the next minor/major bump.
+- Before cutting, confirm the git tag matches `Cargo.toml` and that no CI job names changed (see CI / Infrastructure Dependency).
+
 ## Reference Documents
 
 - Full product roadmap: `ROADMAP.md`

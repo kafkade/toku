@@ -8,7 +8,7 @@ use std::path::Path;
 
 use toku_core::SyncKey;
 use toku_db::{Database, LibraryIo, RestoreMode};
-use toku_export::{export_backup, import_backup, read_backup_manifest};
+use toku_export::{export_backup, export_backup_with_kdf, import_backup, read_backup_manifest};
 
 const COVER_HASH: &str = "covhash123";
 const COVER_BYTES: &[u8] = b"\xFF\xD8\xFFfake-jpeg-cover-bytes";
@@ -171,6 +171,102 @@ fn encrypted_backup_without_key_is_refused() {
     assert!(
         msg.contains("encrypt") || msg.contains("key"),
         "actionable error: {msg}"
+    );
+}
+
+#[test]
+fn passphrase_backup_restores_on_a_fresh_profile() {
+    use toku_core::backup_schema::BackupKdf;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src_dir = tmp.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let src = Database::open_in_memory().unwrap();
+    seed_with_binaries(&src, &src_dir);
+    let exported = LibraryIo::new(&src).export_library().unwrap();
+
+    // Seal with a passphrase-derived local key; the KDF descriptor is embedded
+    // in the manifest so the archive is self-describing.
+    let passphrase = "correct horse battery staple";
+    let kdf = BackupKdf::generate().unwrap();
+    let key = kdf.derive_key(passphrase).unwrap();
+    let zip_path = tmp.path().join("passphrase.zip");
+    export_backup_with_kdf(&src, &src_dir, &zip_path, &key, kdf).unwrap();
+
+    // Manifest is self-describing: encrypted, envelope present, kdf present, and
+    // no plaintext library.json inside the archive.
+    let manifest = read_backup_manifest(&zip_path).unwrap();
+    assert!(manifest.encrypted, "manifest must flag encryption");
+    assert!(
+        manifest.envelope.is_some(),
+        "sealed payload rides in manifest"
+    );
+    let embedded = manifest
+        .kdf
+        .as_ref()
+        .expect("kdf descriptor must travel in the manifest for portability");
+    assert_eq!(embedded.algorithm, "argon2id");
+    let raw = fs::File::open(&zip_path).unwrap();
+    let mut archive = zip::ZipArchive::new(raw).unwrap();
+    assert!(
+        archive.by_name("library.json").is_err(),
+        "encrypted archive must not contain a plaintext library.json"
+    );
+    drop(archive);
+
+    // Restore on a FRESH profile using only the passphrase + embedded salt — no
+    // local config, no sync enrollment.
+    let dst_dir = tmp.path().join("dst");
+    fs::create_dir_all(&dst_dir).unwrap();
+    let dst = Database::open_in_memory().unwrap();
+    let rederived = embedded.derive_key(passphrase).unwrap();
+    import_backup(
+        &zip_path,
+        &dst,
+        &dst_dir,
+        RestoreMode::Replace,
+        Some(&rederived),
+    )
+    .unwrap();
+    let reexported = LibraryIo::new(&dst).export_library().unwrap();
+    assert_eq!(exported, reexported);
+}
+
+#[test]
+fn passphrase_backup_wrong_passphrase_fails_cleanly() {
+    use toku_core::backup_schema::BackupKdf;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src_dir = tmp.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let src = Database::open_in_memory().unwrap();
+    seed_with_binaries(&src, &src_dir);
+
+    let kdf = BackupKdf::generate().unwrap();
+    let key = kdf.derive_key("right passphrase").unwrap();
+    let zip_path = tmp.path().join("passphrase.zip");
+    export_backup_with_kdf(&src, &src_dir, &zip_path, &key, kdf).unwrap();
+
+    // A wrong passphrase derives a different key; decryption must fail cleanly
+    // (AEAD tag mismatch) rather than panic or return garbage.
+    let manifest = read_backup_manifest(&zip_path).unwrap();
+    let embedded = manifest.kdf.expect("kdf descriptor present");
+    let wrong = embedded.derive_key("wrong passphrase").unwrap();
+
+    let dst = Database::open_in_memory().unwrap();
+    let err = import_backup(
+        &zip_path,
+        &dst,
+        tmp.path(),
+        RestoreMode::Replace,
+        Some(&wrong),
+    )
+    .expect_err("wrong passphrase must not decrypt");
+    assert!(
+        matches!(err, toku_export::ExportError::Crypto(_)),
+        "expected a crypto error, got: {err:?}"
     );
 }
 

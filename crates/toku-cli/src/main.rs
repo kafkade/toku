@@ -731,8 +731,10 @@ enum ExportTarget {
         #[arg(long, short)]
         output: PathBuf,
 
-        /// Seal the backup with the configured library data key (AES-256-GCM).
-        /// Requires an enrolled sync key; the default is an unencrypted archive.
+        /// Encrypt the backup (AES-256-GCM). A sync-enrolled device seals it with
+        /// the library data key; an offline-only device prompts for a passphrase
+        /// (or reads TOKU_BACKUP_PASSPHRASE) and embeds the KDF salt so the
+        /// archive restores anywhere with the passphrase. Default: unencrypted.
         #[arg(long)]
         encrypt: bool,
     },
@@ -2110,12 +2112,22 @@ fn cmd_import_backup(
     }
 
     // Decrypt only when the artifact is sealed; plaintext restores stay fully
-    // offline with no key required.
+    // offline with no key required. A passphrase-sealed backup (manifest carries
+    // a `kdf` descriptor) re-derives its key from the embedded salt + passphrase;
+    // a sync-key backup uses the enrolled library key as before.
     let key = if manifest.encrypted {
-        Some(load_library_key(data_dir).context(
-            "backup is encrypted but no library data key is configured; enroll this device \
-             with `toku sync` to restore an encrypted backup",
-        )?)
+        if let Some(kdf) = manifest.kdf.as_ref() {
+            let passphrase = read_backup_passphrase_open()?;
+            Some(
+                kdf.derive_key(&passphrase)
+                    .map_err(|e| anyhow::anyhow!("failed to derive backup key: {e}"))?,
+            )
+        } else {
+            Some(load_library_key(data_dir).context(
+                "backup is encrypted but no library data key is configured; enroll this device \
+                 with `toku sync` to restore an encrypted backup",
+            )?)
+        }
     } else {
         None
     };
@@ -2126,8 +2138,14 @@ fn cmd_import_backup(
         toku_db::RestoreMode::Merge
     };
 
-    let result = toku_export::import_backup(path, db, data_dir, mode, key.as_ref())
-        .context("backup restore failed")?;
+    let result =
+        toku_export::import_backup(path, db, data_dir, mode, key.as_ref()).map_err(|e| {
+            if manifest.kdf.is_some() && matches!(e, toku_export::ExportError::Crypto(_)) {
+                anyhow::anyhow!("could not decrypt backup — wrong passphrase or corrupted archive")
+            } else {
+                anyhow::anyhow!("backup restore failed: {e}")
+            }
+        })?;
 
     match output_format {
         OutputFormat::Json => {
@@ -2239,21 +2257,42 @@ fn cmd_export(db: &Database, data_dir: &Path, target: ExportTarget) -> Result<()
             Ok(())
         }
         ExportTarget::Backup { output, encrypt } => {
-            let key = if encrypt {
-                Some(load_library_key(data_dir).context(
-                    "cannot encrypt backup: no library data key is configured; enroll this \
-                     device with `toku sync` first, or omit --encrypt for a plaintext backup",
-                )?)
+            if !encrypt {
+                toku_export::export_backup(db, data_dir, &output, None)
+                    .context("backup export failed")?;
+                eprintln!("✓ Backup saved to {}", output.display());
+                return Ok(());
+            }
+
+            // Encrypted path. A sync user keeps today's behavior (seal with the
+            // enrolled library key). An offline-only user (no sync configured)
+            // falls back to a passphrase-derived local key; the KDF salt travels
+            // in the archive so the backup restores anywhere with the passphrase.
+            if sync_is_configured(data_dir) {
+                let key = load_library_key(data_dir).context(
+                    "cannot encrypt backup: enroll this device with `toku sync` first, \
+                     or omit --encrypt for a plaintext backup",
+                )?;
+                toku_export::export_backup(db, data_dir, &output, Some(&key))
+                    .context("backup export failed")?;
+                eprintln!(
+                    "✓ Backup saved to {} (encrypted with sync library key)",
+                    output.display()
+                );
             } else {
-                None
-            };
-            toku_export::export_backup(db, data_dir, &output, key.as_ref())
-                .context("backup export failed")?;
-            eprintln!(
-                "✓ Backup saved to {}{}",
-                output.display(),
-                if encrypt { " (encrypted)" } else { "" }
-            );
+                let passphrase = read_backup_passphrase_new()?;
+                let kdf = toku_core::backup_schema::BackupKdf::generate()
+                    .map_err(|e| anyhow::anyhow!("failed to prepare backup key: {e}"))?;
+                let key = kdf
+                    .derive_key(&passphrase)
+                    .map_err(|e| anyhow::anyhow!("failed to derive backup key: {e}"))?;
+                toku_export::export_backup_with_kdf(db, data_dir, &output, &key, kdf)
+                    .context("backup export failed")?;
+                eprintln!(
+                    "✓ Backup saved to {} (encrypted with passphrase)",
+                    output.display()
+                );
+            }
             Ok(())
         }
     }
@@ -4406,6 +4445,55 @@ fn prompt_line(prompt: &str) -> Result<String> {
 fn read_password_prompt(prompt: &str) -> Result<String> {
     eprint!("{prompt}");
     rpassword::read_password().context("failed to read password")
+}
+
+/// Environment variable that supplies a backup passphrase non-interactively
+/// (automation escape hatch for `toku export/import backup --encrypt`).
+const BACKUP_PASSPHRASE_ENV: &str = "TOKU_BACKUP_PASSPHRASE";
+
+/// True when a sync server is configured, i.e. the user is a sync user and
+/// `--encrypt` should seal with the enrolled library key rather than a
+/// passphrase (preserves pre-existing behavior for sync users).
+fn sync_is_configured(data_dir: &Path) -> bool {
+    TokuConfig::load(data_dir)
+        .ok()
+        .and_then(|c| c.sync)
+        .is_some()
+}
+
+/// Read a passphrase for sealing a NEW backup: env override, else prompt twice
+/// with confirmation. Rejects empty/mismatched input.
+fn read_backup_passphrase_new() -> Result<String> {
+    if let Ok(p) = std::env::var(BACKUP_PASSPHRASE_ENV) {
+        if p.is_empty() {
+            anyhow::bail!("{BACKUP_PASSPHRASE_ENV} is set but empty");
+        }
+        return Ok(p);
+    }
+    let passphrase = read_password_prompt("Backup passphrase: ")?;
+    if passphrase.is_empty() {
+        anyhow::bail!("backup passphrase cannot be empty");
+    }
+    let confirm = read_password_prompt("Confirm backup passphrase: ")?;
+    if passphrase != confirm {
+        anyhow::bail!("passphrases do not match");
+    }
+    Ok(passphrase)
+}
+
+/// Read a passphrase to OPEN an existing encrypted backup: env override, else a
+/// single prompt (no confirmation).
+fn read_backup_passphrase_open() -> Result<String> {
+    if let Ok(p) = std::env::var(BACKUP_PASSPHRASE_ENV)
+        && !p.is_empty()
+    {
+        return Ok(p);
+    }
+    let passphrase = read_password_prompt("Backup passphrase: ")?;
+    if passphrase.is_empty() {
+        anyhow::bail!("backup passphrase cannot be empty");
+    }
+    Ok(passphrase)
 }
 
 /// Read a new password twice (with confirmation), rejecting empties/mismatches.

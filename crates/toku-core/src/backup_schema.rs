@@ -12,6 +12,7 @@
 //! and default-constructed on restore (`#[serde(default)]`), so an older Toku
 //! can restore a newer backup's shared subset and vice versa (ADR-012 D5).
 
+use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// The current canonical backup / snapshot schema version.
@@ -35,6 +36,91 @@ pub struct BackupManifest {
     /// The AEAD envelope when `encrypted` is true; absent for plaintext backups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<crate::crypto::EncryptedEnvelope>,
+    /// Key-derivation parameters when the backup was sealed with a
+    /// **passphrase-derived local key** (offline-first path). Present only for
+    /// passphrase backups; absent when the archive was sealed with an enrolled
+    /// sync library key (whose key material lives on the device, not in the
+    /// archive). Carrying the salt + KDF params here makes a passphrase backup
+    /// **self-describing and portable**: it can be restored on any machine with
+    /// only the passphrase, without relying on local configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf: Option<BackupKdf>,
+}
+
+/// Argon2id key-derivation parameters embedded in a passphrase-sealed backup.
+///
+/// The salt and cost parameters travel inside `manifest.json` so the archive is
+/// self-describing — restore re-derives the same AES key from the passphrase and
+/// this salt on any machine, with no dependency on local `config.toml`. The
+/// passphrase itself is **never** stored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupKdf {
+    /// Descriptor schema version.
+    pub version: u16,
+    /// KDF algorithm identifier (currently only `argon2id`).
+    pub algorithm: String,
+    /// Base64-encoded 16-byte per-backup salt.
+    pub salt: String,
+    /// Argon2 memory cost in KiB.
+    pub memory_kib: u32,
+    /// Argon2 iterations (time cost).
+    pub iterations: u32,
+    /// Argon2 parallelism.
+    pub parallelism: u32,
+}
+
+/// Current [`BackupKdf`] descriptor schema version.
+pub const BACKUP_KDF_VERSION: u16 = 1;
+
+/// Argon2id algorithm identifier stored in [`BackupKdf::algorithm`].
+pub const BACKUP_KDF_ALGORITHM: &str = "argon2id";
+
+impl BackupKdf {
+    /// Build a fresh descriptor with a random 16-byte salt and the default
+    /// Argon2id parameters used by [`crate::crypto::SyncKey::derive`].
+    pub fn generate() -> Result<Self, crate::TokuError> {
+        let salt = crate::crypto::SyncKey::generate_salt()?;
+        Ok(Self {
+            version: BACKUP_KDF_VERSION,
+            algorithm: BACKUP_KDF_ALGORITHM.to_string(),
+            salt: base64::prelude::BASE64_STANDARD.encode(salt),
+            memory_kib: crate::crypto::ARGON2_M_COST,
+            iterations: crate::crypto::ARGON2_T_COST,
+            parallelism: crate::crypto::ARGON2_P_COST,
+        })
+    }
+
+    /// Re-derive the AES key from `passphrase` using the embedded salt and
+    /// parameters. Rejects descriptors this build cannot honor so a wrong key is
+    /// never silently produced.
+    pub fn derive_key(&self, passphrase: &str) -> Result<crate::crypto::SyncKey, crate::TokuError> {
+        if self.algorithm != BACKUP_KDF_ALGORITHM {
+            return Err(crate::TokuError::Crypto(format!(
+                "unsupported backup KDF algorithm: {}",
+                self.algorithm
+            )));
+        }
+        if (self.memory_kib, self.iterations, self.parallelism)
+            != (
+                crate::crypto::ARGON2_M_COST,
+                crate::crypto::ARGON2_T_COST,
+                crate::crypto::ARGON2_P_COST,
+            )
+        {
+            return Err(crate::TokuError::Crypto(
+                "unsupported backup KDF parameters for this Toku version".to_string(),
+            ));
+        }
+
+        let salt_bytes = BASE64_STANDARD
+            .decode(&self.salt)
+            .map_err(|e| crate::TokuError::Crypto(format!("invalid backup KDF salt: {e}")))?;
+        let salt: [u8; 16] = salt_bytes.try_into().map_err(|_| {
+            crate::TokuError::Crypto("backup KDF salt must be 16 bytes".to_string())
+        })?;
+
+        crate::crypto::SyncKey::derive(passphrase, &salt)
+    }
 }
 
 /// Row counts for each entity vector, surfaced in the manifest.
@@ -407,4 +493,59 @@ pub struct ImportLogRow {
 pub struct ImportBookRow {
     pub import_id: String,
     pub book_id: String,
+}
+
+#[cfg(test)]
+mod kdf_tests {
+    use super::*;
+
+    #[test]
+    fn generate_uses_default_argon2id_params() {
+        let kdf = BackupKdf::generate().unwrap();
+        assert_eq!(kdf.version, BACKUP_KDF_VERSION);
+        assert_eq!(kdf.algorithm, BACKUP_KDF_ALGORITHM);
+        assert_eq!(kdf.memory_kib, crate::crypto::ARGON2_M_COST);
+        assert_eq!(kdf.iterations, crate::crypto::ARGON2_T_COST);
+        assert_eq!(kdf.parallelism, crate::crypto::ARGON2_P_COST);
+        // 16-byte salt, base64-encoded.
+        let salt = BASE64_STANDARD.decode(&kdf.salt).unwrap();
+        assert_eq!(salt.len(), 16);
+    }
+
+    #[test]
+    fn same_passphrase_and_salt_derive_the_same_key() {
+        let kdf = BackupKdf::generate().unwrap();
+        let a = kdf.derive_key("hunter2").unwrap();
+        let b = kdf.derive_key("hunter2").unwrap();
+        assert_eq!(a.as_exported_bytes(), b.as_exported_bytes());
+    }
+
+    #[test]
+    fn different_passphrases_derive_different_keys() {
+        let kdf = BackupKdf::generate().unwrap();
+        let a = kdf.derive_key("hunter2").unwrap();
+        let b = kdf.derive_key("hunter3").unwrap();
+        assert_ne!(a.as_exported_bytes(), b.as_exported_bytes());
+    }
+
+    #[test]
+    fn rejects_unsupported_algorithm() {
+        let mut kdf = BackupKdf::generate().unwrap();
+        kdf.algorithm = "scrypt".to_string();
+        assert!(kdf.derive_key("pw").is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_params() {
+        let mut kdf = BackupKdf::generate().unwrap();
+        kdf.iterations = 99;
+        assert!(kdf.derive_key("pw").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_salt() {
+        let mut kdf = BackupKdf::generate().unwrap();
+        kdf.salt = "not-base64!!".to_string();
+        assert!(kdf.derive_key("pw").is_err());
+    }
 }

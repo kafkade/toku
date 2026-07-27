@@ -41,11 +41,11 @@ pub use srp::*;
 // ---------------------------------------------------------------------------
 
 /// Argon2id memory cost in KiB (64 MB).
-const ARGON2_M_COST: u32 = 65536;
+pub const ARGON2_M_COST: u32 = 65536;
 /// Argon2id time cost (iterations).
-const ARGON2_T_COST: u32 = 3;
+pub const ARGON2_T_COST: u32 = 3;
 /// Argon2id parallelism.
-const ARGON2_P_COST: u32 = 1;
+pub const ARGON2_P_COST: u32 = 1;
 
 /// Current encryption envelope version.
 const ENCRYPTION_ENVELOPE_VERSION: u16 = 1;

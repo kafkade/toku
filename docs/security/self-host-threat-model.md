@@ -47,6 +47,26 @@ The sync server (`toku-sync`) is the shared, internet-facing component.
 Trust boundaries: client device ↔ network ↔ server process ↔ server disk; plus, in
 multi-user mode, user ↔ admin and user ↔ user.
 
+### Local device at rest (single-device / offline)
+
+The network model above concerns hosted sync. For the **default single-device, offline** use,
+the relevant adversary is **offline theft of the device or disk**. Today the local `toku.db`
+is **plaintext at rest** — `toku-db` links standard SQLite, so confidentiality depends entirely
+on **OS full-disk encryption**. This is a known gap tracked in #204.
+
+[ADR-016](../adr/016-at-rest-encryption.md) designs the mitigation: **optional, off-by-default**
+at-rest DB encryption (SQLCipher, feature-gated on `toku-db`), keyed by a dedicated passphrase
+through Argon2id — independent of sync. When enabled, an offline attacker who takes the disk sees
+only ciphertext; the disabled default path is byte-for-byte unchanged. The heavyweight SQLCipher
+dependency is **deferred to a follow-up implementation**; ADR-016 is the design gate.
+
+Shipping now (from ADR-016 Decision C): **offline-only users can encrypt backups.**
+`toku export backup --encrypt` without a sync account derives a key from a passphrase (Argon2id)
+and seals the archive with AES-256-GCM; the KDF salt/params travel **inside** the archive so it
+restores on any machine with only the passphrase (see [`recovery.md`](../recovery.md)). This does
+not protect the live `toku.db` — only the exported artifact — and a lost passphrase makes that
+artifact unrecoverable by design.
+
 ## 2. Assets
 
 | Asset | Where it lives | Must never reach server |
@@ -192,6 +212,10 @@ for release are listed in [§9](#9-residual-risks-accepted).
   by at-rest disk encryption on headless hosts.
 - Deployment must still provide TLS, 0600 DB perms, at-rest encryption, and NTP (F11); these are
   operator responsibilities documented in `sync-server.md`.
+- The local `toku.db` is plaintext at rest by default; single-device confidentiality relies on OS
+  full-disk encryption. Optional at-rest DB encryption is designed in
+  [ADR-016](../adr/016-at-rest-encryption.md) (opt-in, off by default) with the SQLCipher
+  implementation deferred; offline passphrase-encrypted backups ship now (#204).
 
 ## 10. Sign-off
 

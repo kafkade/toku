@@ -35,11 +35,18 @@ Cargo workspace with 12 crates:
 
 | Data Type | Storage | Network? |
 |---|---|---|
-| User's book library, reading sessions, notes, ratings | Local SQLite (encrypted at rest if sync enabled) | Never sent unless sync opted in |
+| User's book library, reading sessions, notes, ratings | Local SQLite — plaintext at rest (OS full-disk encryption only; app-level DB encryption is future #204) | Never sent unless sync opted in |
 | Book metadata from APIs | Cached locally after fetch | Open Library / Google Books (optional) |
 | Cover images | Local filesystem, content-addressed (SHA-256) | Fetched once, stored locally forever |
 | Import source data (Goodreads CSV, Calibre DB) | Parsed on-device, stored in local DB | Never leaves device |
 | Statistics and analytics | Computed locally from user data | Never sent anywhere |
+
+**Where encryption actually applies** — keep these four guarantees distinct; do not conflate them:
+
+- **Local, at rest** — the working `toku.db` is **plaintext**. `Database::open` sets only `journal_mode=WAL` + `foreign_keys=ON`, and `rusqlite` uses bundled SQLite (not SQLCipher), so protection depends entirely on **OS full-disk encryption**. Optional app-level at-rest encryption is future work (#204).
+- **In transit (self-host / sync)** — network confidentiality relies on **operator-provided TLS**; Toku does not ship its own transport layer.
+- **Relay (zero-knowledge E2E)** — the sync relay stores **only client-encrypted ciphertext** and never sees plaintext or keys.
+- **Web dashboard** — `toku serve` is a **trusted local server** that holds plaintext while running; treat it as inside your trust boundary.
 
 ### Key Data Model Decisions
 

@@ -104,3 +104,48 @@ fn tag_command_emits_tag_op() {
         "a real `toku tag add` must stage a Tag Create op"
     );
 }
+
+/// Run `toku` capturing stdout+status (for arg-parsing/help smoke tests).
+fn toku_output(data_dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_toku"))
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(args)
+        .output()
+        .expect("run toku")
+}
+
+#[test]
+fn sync_bootstrap_command_is_wired_with_reset_cursor_flag() {
+    // The new recovery verb (#199, ADR-013 D3) must be a real subcommand that
+    // parses `--reset-cursor`. `--help` exercises the clap surface without
+    // needing a configured sync server.
+    let dir = tempfile::tempdir().unwrap();
+    let out = toku_output(dir.path(), &["sync", "bootstrap", "--help"]);
+    assert!(
+        out.status.success(),
+        "`toku sync bootstrap --help` should succeed"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--reset-cursor"),
+        "bootstrap help must document --reset-cursor; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn sync_bootstrap_without_config_errors_gracefully() {
+    // With no sync configured, bootstrap must fail with a clean error (non-zero
+    // exit), never panic — no `unwrap()` in the user-facing path.
+    let dir = tempfile::tempdir().unwrap();
+    let out = toku_output(dir.path(), &["sync", "bootstrap"]);
+    assert!(
+        !out.status.success(),
+        "bootstrap without sync configured should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "bootstrap must not panic; stderr:\n{stderr}"
+    );
+}

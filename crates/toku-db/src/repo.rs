@@ -548,15 +548,7 @@ impl<'a> BookRepository<'a> {
                 EntityType::Session,
                 session.id,
                 OpType::Create,
-                Some(serde_json::json!({
-                    "book_id": session.book_id.to_string(),
-                    "started_at": session.started_at.to_rfc3339(),
-                    "finished_at": session.finished_at.map(|d| d.to_rfc3339()),
-                    "start_page": session.start_page,
-                    "end_page": session.end_page,
-                    "rating": session.rating,
-                    "notes": session.notes,
-                })),
+                Some(session_op_fields(session)),
             )
         })
     }
@@ -585,14 +577,7 @@ impl<'a> BookRepository<'a> {
                 EntityType::Progress,
                 progress.id,
                 OpType::Create,
-                Some(serde_json::json!({
-                    "book_id": progress.book_id.to_string(),
-                    "progress_type": progress.progress_type.as_str(),
-                    "value": progress.value,
-                    "session_id": progress.session_id.map(|u| u.to_string()),
-                    "logged_at": progress.logged_at.to_rfc3339(),
-                    "note": progress.note,
-                })),
+                Some(progress_op_fields(progress)),
             )
         })
     }
@@ -996,10 +981,7 @@ impl<'a> BookRepository<'a> {
                     EntityType::Tag,
                     *book_id,
                     OpType::Create,
-                    Some(serde_json::json!({
-                        "tag_name": tag.name,
-                        "tag_type": tag_type.as_str(),
-                    })),
+                    Some(tag_op_fields(&tag.name, tag_type)),
                 )?;
             }
             Ok(())
@@ -1035,10 +1017,7 @@ impl<'a> BookRepository<'a> {
                         EntityType::Tag,
                         *book_id,
                         OpType::Delete,
-                        Some(serde_json::json!({
-                            "tag_name": name,
-                            "tag_type": TagType::Pace.as_str(),
-                        })),
+                        Some(tag_op_fields(name, TagType::Pace)),
                     )?;
                 }
             }
@@ -1054,10 +1033,7 @@ impl<'a> BookRepository<'a> {
                     EntityType::Tag,
                     *book_id,
                     OpType::Create,
-                    Some(serde_json::json!({
-                        "tag_name": tag.name,
-                        "tag_type": TagType::Pace.as_str(),
-                    })),
+                    Some(tag_op_fields(&tag.name, TagType::Pace)),
                 )?;
             }
             Ok(())
@@ -1093,10 +1069,7 @@ impl<'a> BookRepository<'a> {
                 EntityType::Tag,
                 *book_id,
                 OpType::Delete,
-                Some(serde_json::json!({
-                    "tag_name": tag_name,
-                    "tag_type": tag_type.as_str(),
-                })),
+                Some(tag_op_fields(tag_name, tag_type)),
             )?;
 
             Ok(())
@@ -2111,6 +2084,52 @@ pub fn book_op_fields(book: &Book) -> serde_json::Value {
         "cover_hash": book.cover_hash,
         "status": book.status.as_str(),
         "rating": book.rating,
+    })
+}
+
+/// Builds the sync-op field payload for a reading-session Create op.
+///
+/// Mirrors the schema consumed by [`crate::merge`] (`merge_session`). Exposed so
+/// the first-opt-in backfill (#199) can synthesize the exact same Session Create
+/// op as [`BookRepository::create_reading_session`].
+pub fn session_op_fields(session: &ReadingSession) -> serde_json::Value {
+    serde_json::json!({
+        "book_id": session.book_id.to_string(),
+        "started_at": session.started_at.to_rfc3339(),
+        "finished_at": session.finished_at.map(|d| d.to_rfc3339()),
+        "start_page": session.start_page,
+        "end_page": session.end_page,
+        "rating": session.rating,
+        "notes": session.notes,
+    })
+}
+
+/// Builds the sync-op field payload for a reading-progress Create op.
+///
+/// Mirrors the schema consumed by [`crate::merge`] (`merge_progress`). Exposed so
+/// the first-opt-in backfill (#199) can synthesize the exact same Progress Create
+/// op as [`BookRepository::log_progress`].
+pub fn progress_op_fields(progress: &ReadingProgress) -> serde_json::Value {
+    serde_json::json!({
+        "book_id": progress.book_id.to_string(),
+        "progress_type": progress.progress_type.as_str(),
+        "value": progress.value,
+        "session_id": progress.session_id.map(|u| u.to_string()),
+        "logged_at": progress.logged_at.to_rfc3339(),
+        "note": progress.note,
+    })
+}
+
+/// Builds the sync-op field payload for a book-tag Create/Delete op.
+///
+/// Mirrors the schema consumed by [`crate::merge`] (`merge_tag`): a Tag op is
+/// keyed on the book id (the op's `entity_id`) plus the tag's `name`/`type`.
+/// Exposed so the first-opt-in backfill (#199) can synthesize the exact same Tag
+/// Create op as [`BookRepository::add_typed_tag_to_book`].
+pub fn tag_op_fields(tag_name: &str, tag_type: TagType) -> serde_json::Value {
+    serde_json::json!({
+        "tag_name": tag_name,
+        "tag_type": tag_type.as_str(),
     })
 }
 

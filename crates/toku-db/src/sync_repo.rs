@@ -342,6 +342,41 @@ impl<'a> SyncRepository<'a> {
         Ok(())
     }
 
+    /// Clear a sync cursor so the next sync starts from scratch. Used by
+    /// `toku sync bootstrap --reset-cursor` to force a full re-pull.
+    pub fn clear_cursor(&self, key: &str) -> Result<(), DbError> {
+        self.db
+            .conn
+            .execute("DELETE FROM sync_cursors WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Record that this device has completed its initial sync bootstrap
+    /// (backfill on first opt-in, or restore on new-device enroll / deferred
+    /// login). Device-local; never synced. See ADR-013 (D3).
+    pub fn mark_bootstrapped(&self) -> Result<(), DbError> {
+        self.db.conn.execute(
+            "UPDATE sync_device SET bootstrapped_at = ?1 WHERE bootstrapped_at IS NULL",
+            params![chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether this device has already completed its initial sync bootstrap.
+    /// Returns `false` when no device identity exists yet.
+    pub fn is_bootstrapped(&self) -> Result<bool, DbError> {
+        let result: Option<Option<String>> = self
+            .db
+            .conn
+            .query_row(
+                "SELECT bootstrapped_at FROM sync_device LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(matches!(result, Some(Some(_))))
+    }
+
     /// Insert a sync op received from the server.
     ///
     /// Remote ops are stored with `pushed_at` set to now (they don't need

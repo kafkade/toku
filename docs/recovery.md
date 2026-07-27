@@ -75,6 +75,41 @@ A new device is enrolled by entering your **account email + password + Secret Ke
 device performs SRP authentication, derives the account unlock key, and unwraps your keys
 locally. The server never receives the secrets and cannot enroll a device on its own.
 
+### First opt-in uploads your existing library
+
+When you first opt into sync from a device that already has a local library — `toku sync
+signup`, or `toku sync enroll` that creates a fresh library — Toku automatically **backfills**
+your existing books, reading sessions, progress, and tags into the sync log and pushes them.
+You do **not** need to run `toku sync compact` to seed the server; opt-in reports how many
+items were uploaded. (Compaction is only a maintenance step that snapshots and prunes old
+op history.)
+
+Sync does **not** cover ebook file binaries (they stay on the device — see
+[ADR-011](adr/011-file-management.md)) or authors, shelves, works, series, and ISBNs yet
+(tracked in [#208](https://github.com/kafkade/toku/issues/208)); the CLI warns about this at
+opt-in.
+
+### Restoring a device (bootstrap)
+
+When a device joins an **existing** library, Toku **bootstraps** it automatically: it
+downloads and applies the latest server snapshot (if one exists after a `compact`), then
+pulls any remaining op history. A device that enrolls while **approval is required** stays
+pending and has nothing to restore yet — its bootstrap runs on the first `toku sync login`
+after an existing device approves it.
+
+You can also trigger this manually — for re-provisioning, or to recover a device whose local
+state drifted:
+
+```sh
+toku sync bootstrap                 # apply the latest snapshot, then pull remaining ops
+toku sync bootstrap --reset-cursor  # discard the local pull cursor and re-sync from scratch
+```
+
+`--reset-cursor` forces a full re-download (snapshot + full op tail) — useful if the local
+pull cursor is ahead of a freshly restored server, or after a server-side reset. Because your
+**local SQLite database stays the primary recovery** (see below), bootstrap is a convenience
+for re-provisioning from the server, not a replacement for keeping an offline backup.
+
 ## Token storage
 
 After you authenticate, the client keeps a **session token** (and, for hosted accounts, the

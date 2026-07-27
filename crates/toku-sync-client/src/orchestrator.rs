@@ -82,6 +82,20 @@ pub struct BootstrapOutcome {
     pub applied: usize,
 }
 
+/// Report of a first-opt-in op-backfill (#199, ADR-013 D2): how many pre-existing
+/// rows were staged as ops and how they fared on push.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackfillReport {
+    pub books: usize,
+    pub sessions: usize,
+    pub progress: usize,
+    pub tags: usize,
+    /// Total ops synthesized across all entity types.
+    pub ops_total: usize,
+    /// Ops accepted by the server on the backfill push.
+    pub pushed: usize,
+}
+
 /// Outcome of [`signup`].
 #[derive(Debug, Clone, Serialize)]
 pub struct SignupOutcome {
@@ -97,6 +111,9 @@ pub struct SignupOutcome {
     /// The formatted Secret Key — surfaced **once** so the caller can render an
     /// Emergency Kit. Never persisted to disk by the orchestrator.
     pub secret_key: String,
+    /// First-opt-in backfill of pre-existing local state (D2). Always present
+    /// for signup since the first device always creates a fresh library.
+    pub backfill: BackfillReport,
 }
 
 /// Outcome of [`login`].
@@ -109,6 +126,9 @@ pub struct LoginOutcome {
     /// Whether the leaf data key was unwrapped and stored (requires the #143
     /// `GET /api/v1/account/keys` endpoint).
     pub data_key_unlocked: bool,
+    /// Present when this login triggered a deferred new-device bootstrap — i.e.
+    /// the first login after an approval-pending device was approved (D3).
+    pub bootstrap: Option<BootstrapOutcome>,
 }
 
 /// Outcome of [`enroll`].
@@ -122,6 +142,14 @@ pub struct EnrollOutcome {
     pub server: String,
     /// `active` (synced immediately) or `pending` (awaiting approval).
     pub device_status: String,
+    /// First-opt-in backfill of pre-existing local state (D2). Present only when
+    /// this enroll created a **fresh** library from a device that already held
+    /// local data; `None` when joining an existing library.
+    pub backfill: Option<BackfillReport>,
+    /// New-device bootstrap result (D3). Present when an active device session
+    /// was minted and bootstrap ran; `None` for approval-pending devices (whose
+    /// bootstrap is deferred to the first post-approval login).
+    pub bootstrap: Option<BootstrapOutcome>,
 }
 
 /// Outcome of [`migrate`].
@@ -536,7 +564,11 @@ pub fn pull(data_dir: &Path) -> anyhow::Result<PullOutcome> {
 ///
 /// When no snapshot exists the server still holds the full op log, so this is
 /// equivalent to a plain [`pull`].
-pub fn bootstrap(data_dir: &Path) -> anyhow::Result<BootstrapOutcome> {
+///
+/// When `reset_cursor` is set the local pull cursor is cleared first, forcing a
+/// full re-download of the snapshot and a re-pull from op #1 — the recovery path
+/// for a device whose local state is suspect (`toku sync bootstrap --reset-cursor`).
+pub fn bootstrap(data_dir: &Path, reset_cursor: bool) -> anyhow::Result<BootstrapOutcome> {
     let rt = build_runtime()?;
     let token_store = TokenStore::new(data_dir);
     let config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
@@ -544,6 +576,13 @@ pub fn bootstrap(data_dir: &Path) -> anyhow::Result<BootstrapOutcome> {
     let server = &sync_config.server;
     let token = require_token(&token_store, server)?;
     let client = SyncClient::new(server)?;
+
+    if reset_cursor {
+        let db = open_db(data_dir)?;
+        SyncRepository::new(&db)
+            .clear_cursor("pull_cursor")
+            .context("failed to reset pull cursor")?;
+    }
 
     let mut snapshot_applied = false;
     let mut snapshot_books = 0usize;
@@ -575,6 +614,10 @@ pub fn bootstrap(data_dir: &Path) -> anyhow::Result<BootstrapOutcome> {
     // Pull whatever the server still retains (post-snapshot ops, or the full
     // op log if no snapshot existed) and materialize it on top of the snapshot.
     let pulled = pull(data_dir)?;
+
+    // Record that this device has completed a bootstrap so a later routine
+    // `login` does not re-run the deferred new-device restore (D3).
+    mark_bootstrapped(data_dir)?;
 
     Ok(BootstrapOutcome {
         snapshot_applied,
@@ -788,6 +831,52 @@ fn finalize_device(
     Ok(())
 }
 
+/// Record that this device has completed a bootstrap.
+fn mark_bootstrapped(data_dir: &Path) -> anyhow::Result<()> {
+    let db = open_db(data_dir)?;
+    SyncRepository::new(&db)
+        .mark_bootstrapped()
+        .context("failed to record bootstrap state")?;
+    Ok(())
+}
+
+/// Whether this device has already completed a bootstrap.
+fn is_bootstrapped(data_dir: &Path) -> anyhow::Result<bool> {
+    let db = open_db(data_dir)?;
+    Ok(SyncRepository::new(&db).is_bootstrapped()?)
+}
+
+/// First-opt-in op-backfill (#199, ADR-013 D2): synthesize `Create` ops for every
+/// pre-existing syncable row and push them through the normal pipeline.
+///
+/// Layered at the opt-in boundary — after `finalize_device` has configured the
+/// device identity, token, and data key, and before the caller returns — not
+/// inside `push`. Idempotent: re-running never duplicates (see
+/// [`toku_db::backfill_sync_ops`]). Returns a report so the caller can tell the
+/// user exactly what reached the server.
+fn run_backfill(data_dir: &Path) -> anyhow::Result<BackfillReport> {
+    let counts = {
+        let db = open_db(data_dir)?;
+        toku_db::backfill_sync_ops(&db).context("failed to backfill pre-existing state")?
+    };
+
+    // Drain the freshly-staged ops (plus any already pending) to the server.
+    let pushed = if counts.total() > 0 {
+        push(data_dir)?.accepted
+    } else {
+        0
+    };
+
+    Ok(BackfillReport {
+        books: counts.books,
+        sessions: counts.sessions,
+        progress: counts.progress,
+        tags: counts.tags,
+        ops_total: counts.total(),
+        pushed,
+    })
+}
+
 /// Reconstruct the account key hierarchy from a server key bundle and unwrap the
 /// leaf data key with the password + Secret Key.
 ///
@@ -893,6 +982,14 @@ pub fn signup(
         &data_key,
     )?;
 
+    // First opt-in: backfill any pre-existing local library so it reaches the
+    // server without a manual `compact` (D2). The first device always owns a
+    // fresh, active library, so this always runs. A successful backfill also
+    // counts as this device's bootstrap (nothing to restore from an empty
+    // server), so a later routine `login` won't re-run the deferred restore.
+    let backfill = run_backfill(data_dir)?;
+    mark_bootstrapped(data_dir)?;
+
     Ok(SignupOutcome {
         user_id: signup.user_id,
         email: signup.email,
@@ -903,6 +1000,7 @@ pub fn signup(
         server: server.to_string(),
         device_status: enroll.status,
         secret_key: secret_key.format(),
+        backfill,
     })
 }
 
@@ -948,7 +1046,11 @@ pub fn login(
         }
     }
 
-    // Refresh this device's session token if we know our device id.
+    // Refresh this device's session token if we know our device id. Track
+    // whether a device session is available so we can run a deferred new-device
+    // bootstrap below (D3): an approval-pending device has no session at enroll
+    // time, so its bootstrap waits for the first post-approval login.
+    let mut device_session_ready = false;
     if let Some(sync_config) = toku_core::TokuConfig::load(data_dir)
         .unwrap_or_default()
         .sync
@@ -958,6 +1060,15 @@ pub fn login(
             rt.block_on(client.create_device_session(&verify.session_token, &sync_config.device_id))
     {
         token_store.store(server, &session.session_token)?;
+        device_session_ready = true;
+    }
+
+    // Deferred bootstrap: the first login that mints a device session for a
+    // device that has never bootstrapped restores the prior library. Idempotent
+    // and gated on the `bootstrapped` marker so routine logins don't re-run it.
+    let mut bootstrap_result = None;
+    if data_key_unlocked && device_session_ready && !is_bootstrapped(data_dir)? {
+        bootstrap_result = Some(bootstrap(data_dir, false)?);
     }
 
     Ok(LoginOutcome {
@@ -966,6 +1077,7 @@ pub fn login(
         role: verify.role,
         server: server.to_string(),
         data_key_unlocked,
+        bootstrap: bootstrap_result,
     })
 }
 
@@ -1020,6 +1132,28 @@ pub fn enroll(
         &data_key,
     )?;
 
+    let is_active = enroll.session_token.is_some();
+    // A fresh library (caller passed no library_id) created from a device that
+    // already holds local data is a first opt-in: backfill it (D2). Joining an
+    // existing library instead restores from the server via bootstrap (D3).
+    let fresh_library = library_id.is_none();
+
+    let mut backfill = None;
+    let mut bootstrap_result = None;
+    if is_active {
+        if fresh_library {
+            // Nothing on the server yet — push local state up. A self-pull would
+            // only re-fetch our own just-pushed ops, so we skip bootstrap and
+            // just record that this device is provisioned.
+            backfill = Some(run_backfill(data_dir)?);
+            mark_bootstrapped(data_dir)?;
+        } else {
+            // Joining an existing library: restore the prior state through the
+            // normal new-device bootstrap path.
+            bootstrap_result = Some(bootstrap(data_dir, false)?);
+        }
+    }
+
     Ok(EnrollOutcome {
         user_id: verify.user_id,
         email: email.to_string(),
@@ -1028,6 +1162,8 @@ pub fn enroll(
         device_name,
         server: server.to_string(),
         device_status: enroll.status,
+        backfill,
+        bootstrap: bootstrap_result,
     })
 }
 

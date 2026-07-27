@@ -4,8 +4,10 @@ use std::path::Path;
 use chrono::Utc;
 use csv::ReaderBuilder;
 use rusqlite::params;
-use toku_core::{Author, Book, BookFormat, ContributorRole, Isbn, ReadingStatus};
-use toku_db::{BookRepository, Database};
+use toku_core::{
+    Author, Book, BookFormat, ContributorRole, EntityType, Isbn, OpType, ReadingStatus,
+};
+use toku_db::{BookRepository, Database, SyncRepository};
 use uuid::Uuid;
 
 use crate::ImportError;
@@ -429,6 +431,16 @@ fn import_rows(
         if book.pub_date.is_some() {
             set_provenance(&db.conn, &book.id, "pub_date", "goodreads_import")?;
         }
+
+        // Emit the Book Create sync op after provenance is written so the
+        // importer's `source` labels survive (emit only advances `sync_hlc`).
+        // Runs inside the importer's transaction; no-op without a device.
+        SyncRepository::new(db).emit_local_op(
+            EntityType::Book,
+            book.id,
+            OpType::Create,
+            Some(toku_db::book_op_fields(&book)),
+        )?;
 
         if let Some(ref id) = gr_id {
             existing_gr_ids.insert(id.clone(), book.id);

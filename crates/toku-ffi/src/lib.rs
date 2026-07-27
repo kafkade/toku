@@ -32,12 +32,11 @@ use std::path::Path;
 use std::str::FromStr;
 
 use serde::Serialize;
-use serde_json::json;
 use toku_core::{
-    Author, Book, ContributorRole, CurrentlyReadingInput, EntityType, HybridClock, OpType,
-    ProgressType, ReadingProgress, ReadingStatus, StatsInput, SyncOp, compute_stats,
+    Author, Book, ContributorRole, CurrentlyReadingInput, ProgressType, ReadingProgress,
+    ReadingStatus, StatsInput, compute_stats,
 };
-use toku_db::{BookRepository, Database, SyncRepository};
+use toku_db::{BookRepository, Database};
 
 // ── Status codes ────────────────────────────────────────────────────────
 
@@ -176,36 +175,6 @@ fn rust_string_to_c(s: &str) -> *mut c_char {
     match CString::new(s) {
         Ok(cs) => cs.into_raw(),
         Err(_) => std::ptr::null_mut(),
-    }
-}
-
-// ── Helper: append a sync op for a local mutation ───────────────────────
-
-/// Best-effort: append a sync op so a local mutation flows through the op-log to
-/// other devices (the same op-log the phone uses).
-///
-/// Op creation is guarded on a configured device identity, mirroring the CLI: when
-/// sync has not been set up there is no device, so nothing is recorded. Any failure
-/// is swallowed — a missing or partial sync setup must never block the primary write.
-fn record_sync_op(
-    db: &Database,
-    entity_type: EntityType,
-    entity_id: uuid::Uuid,
-    op_type: OpType,
-    fields: Option<serde_json::Value>,
-) {
-    let sync_repo = SyncRepository::new(db);
-    if let Ok(Some(identity)) = sync_repo.get_device() {
-        let mut clock = HybridClock::new(&identity.device_id);
-        let op = SyncOp::new(
-            identity.device_id,
-            clock.now(),
-            entity_type,
-            entity_id,
-            op_type,
-            fields,
-        );
-        let _ = sync_repo.insert_op(&op);
     }
 }
 
@@ -568,13 +537,8 @@ pub unsafe extern "C" fn toku_update_book_status(
 
         match repo.update_book_status(&uuid, reading_status) {
             Ok(true) => {
-                record_sync_op(
-                    &handle.db,
-                    EntityType::Book,
-                    uuid,
-                    OpType::Update,
-                    Some(json!({ "status": reading_status.as_str() })),
-                );
+                // `update_book_status` emits the Book Update sync op atomically
+                // with the write, identical to the CLI path.
                 TokuStatus::Ok
             }
             Ok(false) => {
@@ -634,13 +598,8 @@ pub unsafe extern "C" fn toku_update_book_rating(
 
         match repo.update_book_rating(&uuid, actual_rating) {
             Ok(true) => {
-                record_sync_op(
-                    &handle.db,
-                    EntityType::Book,
-                    uuid,
-                    OpType::Update,
-                    Some(json!({ "rating": actual_rating })),
-                );
+                // `update_book_rating` emits the Book Update sync op atomically
+                // with the write, identical to the CLI path.
                 TokuStatus::Ok
             }
             Ok(false) => {
@@ -738,20 +697,8 @@ pub unsafe extern "C" fn toku_log_progress(
             return TokuStatus::ErrorDb;
         }
 
-        record_sync_op(
-            &handle.db,
-            EntityType::Progress,
-            progress.id,
-            OpType::Create,
-            Some(json!({
-                "book_id": progress.book_id.to_string(),
-                "progress_type": ptype.as_str(),
-                "value": value,
-                "session_id": progress.session_id.map(|s| s.to_string()),
-                "logged_at": progress.logged_at.to_rfc3339(),
-            })),
-        );
-
+        // `log_progress` emits the Progress Create sync op atomically with the
+        // write, identical to the CLI path.
         TokuStatus::Ok
     }))
 }
@@ -1587,6 +1534,8 @@ pub unsafe extern "C" fn toku_free_string(s: *mut c_char) {
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use toku_core::EntityType;
+    use toku_db::SyncRepository;
 
     fn open_memory_db() -> *mut TokuDb {
         let db = Database::open_in_memory().unwrap();
@@ -2010,6 +1959,59 @@ mod tests {
         );
 
         unsafe { toku_close(db) };
+    }
+
+    /// Parity: an FFI status update must emit an op with byte-identical fields
+    /// to the equivalent direct `BookRepository` (CLI) call. Both go through the
+    /// same repo choke-point, so this guards against future divergence.
+    #[test]
+    fn ffi_status_op_matches_repo_op() {
+        use toku_core::OpType;
+
+        fn update_op_fields<F: FnOnce(*mut TokuDb, &str)>(mutate: F) -> Option<serde_json::Value> {
+            let db = open_memory_db();
+            let id = add_test_book(db, "Parity", None);
+            {
+                let handle = unsafe { &*db };
+                SyncRepository::new(&handle.db)
+                    .get_or_create_device("dev")
+                    .unwrap();
+            }
+            mutate(db, &id);
+            let handle = unsafe { &*db };
+            let ops = SyncRepository::new(&handle.db).get_unpushed_ops().unwrap();
+            let fields = ops
+                .into_iter()
+                .find(|op| op.entity_type == EntityType::Book && op.op_type == OpType::Update)
+                .expect("a Book Update op")
+                .fields;
+            unsafe { toku_close(db) };
+            fields
+        }
+
+        // FFI path: go through the C ABI entry point.
+        let ffi_fields = update_op_fields(|db, id| {
+            let id_c = CString::new(id).unwrap();
+            let status_c = CString::new("reading").unwrap();
+            let r = unsafe { toku_update_book_status(db, id_c.as_ptr(), status_c.as_ptr()) };
+            assert!(matches!(r, TokuStatus::Ok));
+        });
+
+        // CLI-equivalent path: call the repository method directly.
+        let repo_fields = update_op_fields(|db, id| {
+            let handle = unsafe { &*db };
+            let repo = BookRepository::new(&handle.db);
+            let uuid = uuid::Uuid::parse_str(id).unwrap();
+            assert!(
+                repo.update_book_status(&uuid, ReadingStatus::Reading)
+                    .unwrap()
+            );
+        });
+
+        assert_eq!(
+            ffi_fields, repo_fields,
+            "FFI status op fields must match the repo/CLI op fields exactly"
+        );
     }
 
     #[test]

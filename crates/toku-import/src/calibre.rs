@@ -3,8 +3,8 @@ use std::path::Path;
 
 use chrono::Utc;
 use rusqlite::{Connection, OpenFlags, params};
-use toku_core::{Author, Book, BookFormat, ContributorRole, Isbn};
-use toku_db::{BookRepository, Database};
+use toku_core::{Author, Book, BookFormat, ContributorRole, EntityType, Isbn, OpType};
+use toku_db::{BookRepository, Database, SyncRepository};
 use uuid::Uuid;
 
 use crate::ImportError;
@@ -208,7 +208,10 @@ fn import_single_book(
         }
     }
 
-    // Insert book with calibre_id
+    // Insert book with calibre_id, atomically with its Book Create sync op.
+    // Calibre imports each book independently (no outer transaction), so open
+    // one here; nested repo mutations join it via `is_autocommit()`.
+    let tx = db.conn.unchecked_transaction()?;
     db.conn.execute(
         "INSERT INTO books (id, title, subtitle, description, page_count, pub_date,
          language, format, duration_minutes, cover_hash, work_id, status, rating,
@@ -293,6 +296,18 @@ fn import_single_book(
     if book.pub_date.is_some() {
         set_provenance(&db.conn, &book.id, "pub_date", "calibre_import")?;
     }
+
+    // Emit the Book Create sync op after provenance is written so the importer's
+    // `source` labels survive (emit only advances `sync_hlc`). No-op without a
+    // device; commits atomically with the book insert above.
+    SyncRepository::new(db).emit_local_op(
+        EntityType::Book,
+        book.id,
+        OpType::Create,
+        Some(toku_db::book_op_fields(&book)),
+    )?;
+
+    tx.commit()?;
 
     Ok(book.id)
 }

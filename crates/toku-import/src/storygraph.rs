@@ -5,9 +5,10 @@ use chrono::Utc;
 use csv::ReaderBuilder;
 use rusqlite::params;
 use toku_core::{
-    Author, Book, BookFormat, ContributorRole, Isbn, ReadingSession, ReadingStatus, TagType,
+    Author, Book, BookFormat, ContributorRole, EntityType, Isbn, OpType, ReadingSession,
+    ReadingStatus, TagType,
 };
-use toku_db::{BookRepository, Database};
+use toku_db::{BookRepository, Database, SyncRepository};
 use uuid::Uuid;
 
 use crate::ImportError;
@@ -467,6 +468,16 @@ fn import_rows(
         if book.rating.is_some() {
             set_provenance(&db.conn, &book.id, "rating", "storygraph_import")?;
         }
+
+        // Emit the Book Create sync op after provenance is written so the
+        // importer's `source` labels survive (emit only advances `sync_hlc`).
+        // Runs inside the importer's transaction; no-op without a device.
+        SyncRepository::new(db).emit_local_op(
+            EntityType::Book,
+            book.id,
+            OpType::Create,
+            Some(toku_db::book_op_fields(&book)),
+        )?;
 
         // Update dedup maps
         let key = format!(

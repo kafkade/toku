@@ -26,7 +26,10 @@ use std::sync::Once;
 use chrono::{DateTime, Utc};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
-use toku_core::{EntityType, HybridClock, OpType, SyncOp};
+use toku_core::{
+    Book, EntityType, HybridClock, OpType, ProgressType, ReadingProgress, ReadingSession,
+    ReadingStatus, SyncOp, TagType,
+};
 use toku_db::{BookRepository, Database, MergeEngine, SyncRepository};
 use toku_sync::build_router;
 use toku_sync::db::SyncDatabase;
@@ -287,6 +290,79 @@ impl SimulatedDevice {
         self.emit(book_id, OpType::Delete, None, at);
     }
 
+    // ── Real-frontend mutations ───────────────────────────────────────────────
+    //
+    // These drive the product's `BookRepository` directly. Because the device
+    // has a configured identity (from enrollment), every write funnels through
+    // the same op-emission choke-point the CLI and FFI use — so these exercise
+    // real command paths, not hand-staged ops. The op is emitted atomically
+    // with the write and staged for the next push.
+
+    /// Create a book through the real repository. Returns the new book id.
+    pub fn repo_add_book(&self, title: &str) -> Uuid {
+        let db = self.open_db();
+        let book = Book::new(title);
+        let id = book.id;
+        BookRepository::new(&db)
+            .create_book(&book)
+            .expect("repo create_book");
+        id
+    }
+
+    /// Set a book's status through the real repository.
+    pub fn repo_set_status(&self, book_id: Uuid, status: ReadingStatus) {
+        let db = self.open_db();
+        BookRepository::new(&db)
+            .update_book_status(&book_id, status)
+            .expect("repo update_book_status");
+    }
+
+    /// Set a book's rating through the real repository.
+    pub fn repo_set_rating(&self, book_id: Uuid, rating: i32) {
+        let db = self.open_db();
+        BookRepository::new(&db)
+            .update_book_rating(&book_id, rating)
+            .expect("repo update_book_rating");
+    }
+
+    /// Soft-delete a book through the real repository.
+    pub fn repo_delete_book(&self, book_id: Uuid) {
+        let db = self.open_db();
+        BookRepository::new(&db)
+            .delete_book(&book_id)
+            .expect("repo delete_book");
+    }
+
+    /// Log a reading session through the real repository. Returns its id.
+    pub fn repo_log_session(&self, book_id: Uuid) -> Uuid {
+        let db = self.open_db();
+        let session = ReadingSession::new(book_id);
+        let id = session.id;
+        BookRepository::new(&db)
+            .create_reading_session(&session)
+            .expect("repo create_reading_session");
+        id
+    }
+
+    /// Log a page-progress entry through the real repository. Returns its id.
+    pub fn repo_log_progress(&self, book_id: Uuid, value: i32) -> Uuid {
+        let db = self.open_db();
+        let progress = ReadingProgress::new(book_id, ProgressType::Page, value);
+        let id = progress.id;
+        BookRepository::new(&db)
+            .log_progress(&progress)
+            .expect("repo log_progress");
+        id
+    }
+
+    /// Add a general tag to a book through the real repository.
+    pub fn repo_add_tag(&self, book_id: Uuid, name: &str) {
+        let db = self.open_db();
+        BookRepository::new(&db)
+            .add_typed_tag_to_book(&book_id, name, TagType::General)
+            .expect("repo add_typed_tag_to_book");
+    }
+
     // ── Sync ─────────────────────────────────────────────────────────────────
 
     /// Push all locally-pending ops to the server.
@@ -335,6 +411,37 @@ impl SimulatedDevice {
             .get_book(&book_id)
             .ok()
             .map(|b| b.status.to_string())
+    }
+
+    /// Number of reading sessions recorded locally for a book.
+    pub fn session_count(&self, book_id: Uuid) -> usize {
+        let db = self.open_db();
+        db.conn
+            .query_row(
+                "SELECT COUNT(*) FROM reading_sessions WHERE book_id = ?1",
+                [book_id.to_string()],
+                |r| r.get::<_, i64>(0),
+            )
+            .expect("count sessions") as usize
+    }
+
+    /// The most recent progress value recorded locally for a book, if any.
+    pub fn latest_progress(&self, book_id: Uuid) -> Option<i32> {
+        let db = self.open_db();
+        BookRepository::new(&db)
+            .get_latest_progress(&book_id)
+            .ok()
+            .flatten()
+            .map(|p| p.value)
+    }
+
+    /// True when the book carries a tag with the given name locally.
+    pub fn has_tag(&self, book_id: Uuid, name: &str) -> bool {
+        let db = self.open_db();
+        BookRepository::new(&db)
+            .get_book_tags(&book_id)
+            .map(|tags| tags.iter().any(|t| t.name == name))
+            .unwrap_or(false)
     }
 
     /// Number of ops staged locally that have not yet been pushed.

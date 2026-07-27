@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Sync now propagates ordinary edits incrementally. Every create/update/delete on a
+  syncable entity (books, reading sessions, progress, and tags) now stages a sync op
+  atomically with the write, in a single choke-point in the persistence layer, so all
+  frontends — the CLI, the FFI/mobile bindings, the web import wizard, and the Goodreads/
+  Calibre/StoryGraph importers — feed the op log by construction. Previously only bulk
+  delete and conflict resolution produced ops, so a normal edit never synced and only a
+  full `toku sync compact` snapshot moved state. Op emission remains a complete no-op until
+  a device identity is configured, preserving offline-first behavior: no sync setup means no
+  ops and no network. The FFI path now produces exactly the same ops as the CLI for
+  equivalent operations and no longer silently swallows op-write failures (#194)
+
 ## [0.4.0] - 2026-07-04
 
 ### Added

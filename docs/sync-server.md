@@ -67,17 +67,46 @@ docker compose up -d
 
 ## Connecting a client
 
-Once the server is reachable, point your Toku CLI at it:
+Once the server is reachable, point your Toku CLI at it. Which command you run depends on
+whether this is your **first** device on a new account, an **additional** device joining an
+existing account, or a device that is already enrolled:
 
 ```bash
-toku sync init --server https://sync.example.com
-toku sync push
-toku sync pull
+# First device / new account. The very first account on a fresh server also
+# becomes the instance admin (see below). Generates your Secret Key + Emergency
+# Kit and auto-uploads your existing library.
+toku sync signup --server https://sync.example.com --email you@example.com
+
+# Additional device for an existing account (password + Secret Key). Auto-restores
+# your prior library state (bootstrap) when joining an existing library.
+toku sync enroll --server https://sync.example.com --email you@example.com
+
+# A device that is already enrolled: just re-authenticate.
+toku sync login --server https://sync.example.com --email you@example.com
 ```
 
-`toku sync init` always prompts for an encryption passphrase — client-side end-to-end
-encryption is **mandatory** in hosted mode, so the server only ever stores opaque ciphertext.
-Use the same passphrase on every device. See `toku sync --help` for the full command set.
+Then sync changes in both directions as you work:
+
+```bash
+toku sync push   # upload local changes
+toku sync pull   # download remote changes
+```
+
+Client-side end-to-end encryption is **mandatory** in hosted mode, so the server only ever
+stores opaque ciphertext. It is keyed by your account **password + Secret Key** — there is no
+per-library passphrase to retype on each device. See the [First-run onboarding &
+admin](#first-run-onboarding--admin) section below for the first-account/admin details, and
+`toku sync --help` for the full command set.
+
+> **First opt-in uploads your existing library.** `toku sync signup` (and a `toku sync enroll`
+> that creates a **fresh** library) automatically backfills your existing books, reading
+> sessions, progress, and tags into the encrypted op log and pushes them — you do **not** need
+> to run `toku sync compact` to seed the server; opt-in reports how many items were uploaded.
+> A device joining an **existing** library is **bootstrapped** automatically (it applies the
+> latest server snapshot, then pulls remaining ops). You can also re-run that restore manually
+> with `toku sync bootstrap` (add `--reset-cursor` to re-sync from scratch). Sync does not
+> cover ebook file binaries. See [`recovery.md`](./recovery.md) for the full upload/restore
+> semantics.
 
 ## First-run onboarding & admin
 

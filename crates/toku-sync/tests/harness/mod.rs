@@ -378,7 +378,7 @@ impl SimulatedDevice {
     /// Bootstrap from a server snapshot (falling back to a full op-log pull
     /// when no snapshot exists).
     pub fn bootstrap(&self) -> toku_sync_client::BootstrapOutcome {
-        toku_sync_client::bootstrap(self.data_dir()).expect("bootstrap")
+        toku_sync_client::bootstrap(self.data_dir(), false).expect("bootstrap")
     }
 
     // ── State readers (assert against materialized tables) ────────────────────

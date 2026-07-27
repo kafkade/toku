@@ -800,6 +800,14 @@ enum SyncAction {
     /// Pull remote changes from the sync server
     Pull,
 
+    /// Restore this device's library from the server (new-device provisioning /
+    /// recovery): download and apply the latest snapshot, then pull remaining ops
+    Bootstrap {
+        /// Discard the local pull cursor and re-sync from scratch (full re-download)
+        #[arg(long)]
+        reset_cursor: bool,
+    },
+
     /// List all devices registered to this library
     Devices,
 
@@ -4234,6 +4242,31 @@ fn read_secret_key() -> Result<toku_core::SecretKey> {
     toku_core::SecretKey::parse(&raw).map_err(|e| anyhow::anyhow!("invalid Secret Key: {e}"))
 }
 
+/// Print, to stderr, what a first-opt-in backfill uploaded and — always — the
+/// classes of data sync does not cover, so the user's "what reached the server"
+/// mental model stays correct (ADR-013 D2: non-silent by construction).
+fn report_backfill(report: &sync::orchestrator::BackfillReport) {
+    if report.ops_total == 0 {
+        eprintln!("Existing library: nothing new to upload (already staged or empty).");
+    } else {
+        eprintln!(
+            "Uploaded your existing library: {} book(s), {} session(s), \
+             {} progress entr{}, {} tag(s) \u{2014} {} ops ({} accepted).",
+            report.books,
+            report.sessions,
+            report.progress,
+            if report.progress == 1 { "y" } else { "ies" },
+            report.tags,
+            report.ops_total,
+            report.pushed,
+        );
+    }
+    eprintln!(
+        "Note: sync does not cover ebook file binaries (they stay on this device), \
+         nor authors, shelves, works, series, or ISBNs yet (tracked in #208)."
+    );
+}
+
 /// Render an Emergency Kit, choosing the format from the output path's extension
 /// (`.pdf`/`.html`, else text). With no path the plain-text kit is printed.
 fn render_emergency_kit(kit: &toku_core::EmergencyKit, out: Option<&Path>) -> Result<()> {
@@ -4420,6 +4453,14 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                             "server": outcome.server,
                             "device_status": outcome.device_status,
                             "secret_key": outcome.secret_key,
+                            "backfill": {
+                                "books": outcome.backfill.books,
+                                "sessions": outcome.backfill.sessions,
+                                "progress": outcome.backfill.progress,
+                                "tags": outcome.backfill.tags,
+                                "ops_total": outcome.backfill.ops_total,
+                                "pushed": outcome.backfill.pushed,
+                            },
                         }))?
                     );
                 }
@@ -4433,6 +4474,8 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                         outcome.device_name, outcome.device_id, outcome.device_status
                     );
                     eprintln!("  Library: {}", outcome.library_id);
+                    eprintln!();
+                    report_backfill(&outcome.backfill);
                     eprintln!();
                     eprintln!("⚠  Your Secret Key is shown only once:");
                     eprintln!("     {}", outcome.secret_key);
@@ -4463,6 +4506,12 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                             "role": outcome.role,
                             "server": outcome.server,
                             "data_key_unlocked": outcome.data_key_unlocked,
+                            "bootstrap": outcome.bootstrap.as_ref().map(|b| serde_json::json!({
+                                "snapshot_applied": b.snapshot_applied,
+                                "snapshot_books": b.snapshot_books,
+                                "pulled": b.pulled,
+                                "applied": b.applied,
+                            })),
                         }))?
                     );
                 }
@@ -4473,6 +4522,17 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                             "note: the encryption key was not unlocked (the server's account-keys \
                              endpoint is unavailable). Sync of encrypted data may not work yet."
                         );
+                    }
+                    if let Some(bootstrap) = &outcome.bootstrap {
+                        if bootstrap.snapshot_applied {
+                            eprintln!(
+                                "Restored your library: applied a server snapshot ({} books), \
+                                 then pulled {} more ops.",
+                                bootstrap.snapshot_books, bootstrap.pulled
+                            );
+                        } else {
+                            eprintln!("Restored your library: pulled {} ops.", bootstrap.pulled);
+                        }
                     }
                 }
             }
@@ -4514,6 +4574,20 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                             "device_name": outcome.device_name,
                             "server": outcome.server,
                             "device_status": outcome.device_status,
+                            "backfill": outcome.backfill.as_ref().map(|b| serde_json::json!({
+                                "books": b.books,
+                                "sessions": b.sessions,
+                                "progress": b.progress,
+                                "tags": b.tags,
+                                "ops_total": b.ops_total,
+                                "pushed": b.pushed,
+                            })),
+                            "bootstrap": outcome.bootstrap.as_ref().map(|b| serde_json::json!({
+                                "snapshot_applied": b.snapshot_applied,
+                                "snapshot_books": b.snapshot_books,
+                                "pulled": b.pulled,
+                                "applied": b.applied,
+                            })),
                         }))?
                     );
                 }
@@ -4525,8 +4599,23 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                     if outcome.device_status == "pending" {
                         eprintln!(
                             "This device is pending approval by an existing trusted device. \
-                             Once approved, run `toku sync login` to activate it."
+                             Once approved, run `toku sync login` to activate it \u{2014} it will \
+                             restore your library then."
                         );
+                    }
+                    if let Some(backfill) = &outcome.backfill {
+                        report_backfill(backfill);
+                    }
+                    if let Some(bootstrap) = &outcome.bootstrap {
+                        if bootstrap.snapshot_applied {
+                            eprintln!(
+                                "Restored your library: applied a server snapshot ({} books), \
+                                 then pulled {} more ops.",
+                                bootstrap.snapshot_books, bootstrap.pulled
+                            );
+                        } else {
+                            eprintln!("Restored your library: pulled {} ops.", bootstrap.pulled);
+                        }
                     }
                 }
             }
@@ -4676,6 +4765,51 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                         eprintln!("Nothing to pull already up to date");
                     } else {
                         eprintln!("Pulled {} ops", outcome.pulled);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        SyncAction::Bootstrap { reset_cursor } => {
+            let outcome = sync::orchestrator::bootstrap(data_dir, reset_cursor)?;
+
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "snapshot_applied": outcome.snapshot_applied,
+                            "snapshot_books": outcome.snapshot_books,
+                            "pulled": outcome.pulled,
+                            "applied": outcome.applied,
+                            "reset_cursor": reset_cursor,
+                        }))?
+                    );
+                }
+                OutputFormat::Csv => {
+                    println!("snapshot_applied,snapshot_books,pulled,applied");
+                    println!(
+                        "{},{},{},{}",
+                        outcome.snapshot_applied,
+                        outcome.snapshot_books,
+                        outcome.pulled,
+                        outcome.applied
+                    );
+                }
+                OutputFormat::Table => {
+                    if reset_cursor {
+                        eprintln!("Reset pull cursor; re-syncing from scratch.");
+                    }
+                    if outcome.snapshot_applied {
+                        eprintln!(
+                            "Applied server snapshot ({} books), then pulled {} ops.",
+                            outcome.snapshot_books, outcome.pulled
+                        );
+                    } else if outcome.pulled == 0 {
+                        eprintln!("Already up to date nothing to restore.");
+                    } else {
+                        eprintln!("No snapshot on server; pulled {} ops.", outcome.pulled);
                     }
                 }
             }

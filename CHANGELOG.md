@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opting into sync now uploads the library you already have. On `toku sync signup` (and on a
+  `toku sync enroll` that creates a fresh library), Toku backfills your existing books,
+  reading sessions, progress, and tags into the sync log and pushes them automatically — no
+  manual `toku sync compact` needed to seed the server. The command reports how many items
+  were uploaded and warns about what sync does not cover yet (ebook file binaries, and
+  authors/shelves/works/series/ISBNs — tracked in #208). The backfill is idempotent and only
+  ever runs at the opt-in boundary, so offline, sync-disabled use never touches the network
+  (#199)
+- New devices restore automatically. Enrolling a device into an existing library now
+  bootstraps it (applies the latest server snapshot, then pulls remaining ops) as part of
+  `toku sync enroll`; a device that enrolls while approval is required restores on its first
+  `toku sync login` after approval. A new `toku sync bootstrap [--reset-cursor]` command
+  exposes the same restore path for manual re-provisioning and recovery. Your local SQLite
+  database remains the primary recovery (#199)
+
 ### Changed
 
 - Sync now propagates ordinary edits incrementally. Every create/update/delete on a

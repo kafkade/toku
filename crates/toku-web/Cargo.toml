@@ -26,7 +26,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 urlencoding = "2"
 sha2.workspace = true
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.10"
 form_urlencoded = "1"
 # SRP-6a (RFC 5054) verifier check for hosted-mode login.

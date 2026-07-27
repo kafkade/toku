@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 chrono.workspace = true
 hex = "0.4"
@@ -38,7 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"
 rand = "0.10"
 reqwest = { workspace = true, features = ["json", "blocking"] }

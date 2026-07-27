@@ -23,7 +23,7 @@ srp = { version = "0.7.0-rc.3", features = ["getrandom"] }
 tokio.workspace = true
 uuid.workspace = true
 keyring-core = "1"
-base64 = "0.22"
+base64 = "0.23"
 hostname = "0.4"
 
 # Platform-native credential stores for the keyring-core ecosystem (keyring 4.x).

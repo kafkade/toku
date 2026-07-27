@@ -1,12 +1,12 @@
 use rusqlite::{OptionalExtension, params};
 use toku_core::{
-    Author, AuthorCount, Book, BookAuthor, BookSeries, ContributorRole, FilterCondition,
-    FilterExpr, FilterField, PaceRating, ReadingProgress, ReadingSession, ReadingStatus, Series,
-    Shelf, SmartFilter, Tag, TagCount, TagType, Work,
+    Author, AuthorCount, Book, BookAuthor, BookSeries, ContributorRole, EntityType,
+    FilterCondition, FilterExpr, FilterField, OpType, PaceRating, ReadingProgress, ReadingSession,
+    ReadingStatus, Series, Shelf, SmartFilter, Tag, TagCount, TagType, Work,
 };
 use uuid::Uuid;
 
-use crate::{Database, DbError};
+use crate::{Database, DbError, SyncRepository};
 
 /// Book persistence operations.
 pub struct BookRepository<'a> {
@@ -18,6 +18,31 @@ impl<'a> BookRepository<'a> {
         Self { db }
     }
 
+    /// Run a mutation together with its sync-op emission atomically.
+    ///
+    /// A transaction is opened only when the connection is not already inside a
+    /// caller-provided one — importers wrap whole batches in their own
+    /// `BEGIN IMMEDIATE`, and SQLite forbids nested `BEGIN`. In the nested case
+    /// the write and its op simply join the outer transaction. Either way the
+    /// row change and the emitted op commit (or roll back) together.
+    ///
+    /// The closure receives a [`SyncRepository`] bound to the same connection;
+    /// op emission is a no-op when no device identity is configured.
+    fn with_sync_txn<T>(
+        &self,
+        f: impl FnOnce(&SyncRepository) -> Result<T, DbError>,
+    ) -> Result<T, DbError> {
+        let sync = SyncRepository::new(self.db);
+        if self.db.conn.is_autocommit() {
+            let tx = self.db.conn.unchecked_transaction()?;
+            let out = f(&sync)?;
+            tx.commit()?;
+            Ok(out)
+        } else {
+            f(&sync)
+        }
+    }
+
     /// Insert a new book. Returns the book's ID.
     pub fn create_book(&self, book: &Book) -> Result<(), DbError> {
         let search_text = build_search_text(
@@ -26,31 +51,38 @@ impl<'a> BookRepository<'a> {
             book.description.as_deref(),
             &[],
         );
-        self.db.conn.execute(
-            "INSERT INTO books (id, title, subtitle, description, page_count, pub_date,
-             language, format, duration_minutes, cover_hash, work_id, status, rating,
-             created_at, updated_at, search_text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![
-                book.id.to_string(),
-                book.title,
-                book.subtitle,
-                book.description,
-                book.page_count,
-                book.pub_date,
-                book.language,
-                book.format.as_str(),
-                book.duration_minutes,
-                book.cover_hash,
-                book.work_id.map(|u| u.to_string()),
-                book.status.as_str(),
-                book.rating,
-                book.created_at.to_rfc3339(),
-                book.updated_at.to_rfc3339(),
-                search_text,
-            ],
-        )?;
-        Ok(())
+        self.with_sync_txn(|sync| {
+            self.db.conn.execute(
+                "INSERT INTO books (id, title, subtitle, description, page_count, pub_date,
+                 language, format, duration_minutes, cover_hash, work_id, status, rating,
+                 created_at, updated_at, search_text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    book.id.to_string(),
+                    book.title,
+                    book.subtitle,
+                    book.description,
+                    book.page_count,
+                    book.pub_date,
+                    book.language,
+                    book.format.as_str(),
+                    book.duration_minutes,
+                    book.cover_hash,
+                    book.work_id.map(|u| u.to_string()),
+                    book.status.as_str(),
+                    book.rating,
+                    book.created_at.to_rfc3339(),
+                    book.updated_at.to_rfc3339(),
+                    search_text,
+                ],
+            )?;
+            sync.emit_local_op(
+                EntityType::Book,
+                book.id,
+                OpType::Create,
+                Some(book_op_fields(book)),
+            )
+        })
     }
 
     /// Retrieve a book by its UUID.
@@ -163,11 +195,16 @@ impl<'a> BookRepository<'a> {
     /// Soft-delete a book by ID. Sets `deleted_at` instead of removing the row.
     pub fn delete_book(&self, id: &Uuid) -> Result<bool, DbError> {
         let now = chrono::Utc::now().to_rfc3339();
-        let rows = self.db.conn.execute(
-            "UPDATE books SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-            params![now, id.to_string()],
-        )?;
-        Ok(rows > 0)
+        self.with_sync_txn(|sync| {
+            let rows = self.db.conn.execute(
+                "UPDATE books SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+                params![now, id.to_string()],
+            )?;
+            if rows > 0 {
+                sync.emit_local_op(EntityType::Book, *id, OpType::Delete, None)?;
+            }
+            Ok(rows > 0)
+        })
     }
 
     /// Retrieve a book by ID, including soft-deleted books.
@@ -448,67 +485,116 @@ impl<'a> BookRepository<'a> {
 
     /// Update a book's reading status.
     pub fn update_book_status(&self, id: &Uuid, status: ReadingStatus) -> Result<bool, DbError> {
-        let rows = self.db.conn.execute(
-            "UPDATE books SET status = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
-            params![
-                status.as_str(),
-                chrono::Utc::now().to_rfc3339(),
-                id.to_string(),
-            ],
-        )?;
-        Ok(rows > 0)
+        self.with_sync_txn(|sync| {
+            let rows = self.db.conn.execute(
+                "UPDATE books SET status = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
+                params![
+                    status.as_str(),
+                    chrono::Utc::now().to_rfc3339(),
+                    id.to_string(),
+                ],
+            )?;
+            if rows > 0 {
+                sync.emit_local_op(
+                    EntityType::Book,
+                    *id,
+                    OpType::Update,
+                    Some(serde_json::json!({ "status": status.as_str() })),
+                )?;
+            }
+            Ok(rows > 0)
+        })
     }
 
     /// Update a book's rating.
     pub fn update_book_rating(&self, id: &Uuid, rating: i32) -> Result<bool, DbError> {
-        let rows = self.db.conn.execute(
-            "UPDATE books SET rating = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
-            params![rating, chrono::Utc::now().to_rfc3339(), id.to_string(),],
-        )?;
-        Ok(rows > 0)
+        self.with_sync_txn(|sync| {
+            let rows = self.db.conn.execute(
+                "UPDATE books SET rating = ?1, updated_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
+                params![rating, chrono::Utc::now().to_rfc3339(), id.to_string(),],
+            )?;
+            if rows > 0 {
+                sync.emit_local_op(
+                    EntityType::Book,
+                    *id,
+                    OpType::Update,
+                    Some(serde_json::json!({ "rating": rating })),
+                )?;
+            }
+            Ok(rows > 0)
+        })
     }
 
     /// Insert a new reading session.
     pub fn create_reading_session(&self, session: &ReadingSession) -> Result<(), DbError> {
-        self.db.conn.execute(
-            "INSERT INTO reading_sessions (id, book_id, started_at, finished_at,
-             start_page, end_page, rating, notes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                session.id.to_string(),
-                session.book_id.to_string(),
-                session.started_at.to_rfc3339(),
-                session.finished_at.map(|d| d.to_rfc3339()),
-                session.start_page,
-                session.end_page,
-                session.rating,
-                session.notes,
-                session.created_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        self.with_sync_txn(|sync| {
+            self.db.conn.execute(
+                "INSERT INTO reading_sessions (id, book_id, started_at, finished_at,
+                 start_page, end_page, rating, notes, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    session.id.to_string(),
+                    session.book_id.to_string(),
+                    session.started_at.to_rfc3339(),
+                    session.finished_at.map(|d| d.to_rfc3339()),
+                    session.start_page,
+                    session.end_page,
+                    session.rating,
+                    session.notes,
+                    session.created_at.to_rfc3339(),
+                ],
+            )?;
+            sync.emit_local_op(
+                EntityType::Session,
+                session.id,
+                OpType::Create,
+                Some(serde_json::json!({
+                    "book_id": session.book_id.to_string(),
+                    "started_at": session.started_at.to_rfc3339(),
+                    "finished_at": session.finished_at.map(|d| d.to_rfc3339()),
+                    "start_page": session.start_page,
+                    "end_page": session.end_page,
+                    "rating": session.rating,
+                    "notes": session.notes,
+                })),
+            )
+        })
     }
 
     // --- Reading progress operations ---
 
     /// Insert a reading progress entry.
     pub fn log_progress(&self, progress: &ReadingProgress) -> Result<(), DbError> {
-        self.db.conn.execute(
-            "INSERT INTO reading_progress (id, book_id, session_id, progress_type,
-             value, note, logged_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                progress.id.to_string(),
-                progress.book_id.to_string(),
-                progress.session_id.map(|u| u.to_string()),
-                progress.progress_type.as_str(),
-                progress.value,
-                progress.note,
-                progress.logged_at.to_rfc3339(),
-                progress.created_at.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
+        self.with_sync_txn(|sync| {
+            self.db.conn.execute(
+                "INSERT INTO reading_progress (id, book_id, session_id, progress_type,
+                 value, note, logged_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    progress.id.to_string(),
+                    progress.book_id.to_string(),
+                    progress.session_id.map(|u| u.to_string()),
+                    progress.progress_type.as_str(),
+                    progress.value,
+                    progress.note,
+                    progress.logged_at.to_rfc3339(),
+                    progress.created_at.to_rfc3339(),
+                ],
+            )?;
+            sync.emit_local_op(
+                EntityType::Progress,
+                progress.id,
+                OpType::Create,
+                Some(serde_json::json!({
+                    "book_id": progress.book_id.to_string(),
+                    "progress_type": progress.progress_type.as_str(),
+                    "value": progress.value,
+                    "session_id": progress.session_id.map(|u| u.to_string()),
+                    "logged_at": progress.logged_at.to_rfc3339(),
+                    "note": progress.note,
+                })),
+            )
+        })
     }
 
     /// Get all progress entries for a book, ordered by `logged_at` DESC.
@@ -900,27 +986,82 @@ impl<'a> BookRepository<'a> {
         self.get_book(book_id)?;
         let tag = self.create_typed_tag(tag_name, tag_type)?;
 
-        self.db.conn.execute(
-            "INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?1, ?2)",
-            params![book_id.to_string(), tag.id.to_string()],
-        )?;
-
-        Ok(())
+        self.with_sync_txn(|sync| {
+            let rows = self.db.conn.execute(
+                "INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?1, ?2)",
+                params![book_id.to_string(), tag.id.to_string()],
+            )?;
+            if rows > 0 {
+                sync.emit_local_op(
+                    EntityType::Tag,
+                    *book_id,
+                    OpType::Create,
+                    Some(serde_json::json!({
+                        "tag_name": tag.name,
+                        "tag_type": tag_type.as_str(),
+                    })),
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Set the pace rating for a book. Removes any existing pace tag first.
     pub fn set_book_pace(&self, book_id: &Uuid, pace: PaceRating) -> Result<(), DbError> {
         self.get_book(book_id)?;
 
-        // Remove existing pace tags
-        self.db.conn.execute(
-            "DELETE FROM book_tags WHERE book_id = ?1
-             AND tag_id IN (SELECT id FROM tags WHERE tag_type = 'pace')",
-            params![book_id.to_string()],
-        )?;
+        self.with_sync_txn(|sync| {
+            // Capture the names of the pace tags currently on the book so the
+            // removal can emit a Tag Delete op for each (merge matches by name).
+            let existing: Vec<String> = {
+                let mut stmt = self.db.conn.prepare(
+                    "SELECT t.name FROM tags t
+                     JOIN book_tags bt ON bt.tag_id = t.id
+                     WHERE bt.book_id = ?1 AND t.tag_type = 'pace'",
+                )?;
+                let names =
+                    stmt.query_map(params![book_id.to_string()], |row| row.get::<_, String>(0))?;
+                names.filter_map(|r| r.ok()).collect()
+            };
 
-        // Add new pace tag
-        self.add_typed_tag_to_book(book_id, pace.as_str(), TagType::Pace)
+            let removed = self.db.conn.execute(
+                "DELETE FROM book_tags WHERE book_id = ?1
+                 AND tag_id IN (SELECT id FROM tags WHERE tag_type = 'pace')",
+                params![book_id.to_string()],
+            )?;
+            if removed > 0 {
+                for name in &existing {
+                    sync.emit_local_op(
+                        EntityType::Tag,
+                        *book_id,
+                        OpType::Delete,
+                        Some(serde_json::json!({
+                            "tag_name": name,
+                            "tag_type": TagType::Pace.as_str(),
+                        })),
+                    )?;
+                }
+            }
+
+            // Add the new pace tag in the same transaction.
+            let tag = self.create_typed_tag(pace.as_str(), TagType::Pace)?;
+            let added = self.db.conn.execute(
+                "INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?1, ?2)",
+                params![book_id.to_string(), tag.id.to_string()],
+            )?;
+            if added > 0 {
+                sync.emit_local_op(
+                    EntityType::Tag,
+                    *book_id,
+                    OpType::Create,
+                    Some(serde_json::json!({
+                        "tag_name": tag.name,
+                        "tag_type": TagType::Pace.as_str(),
+                    })),
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Remove a general tag from a book.
@@ -935,19 +1076,31 @@ impl<'a> BookRepository<'a> {
         tag_name: &str,
         tag_type: TagType,
     ) -> Result<(), DbError> {
-        let rows = self.db.conn.execute(
-            "DELETE FROM book_tags WHERE book_id = ?1
-             AND tag_id IN (SELECT id FROM tags WHERE name = ?2 AND tag_type = ?3)",
-            params![book_id.to_string(), tag_name, tag_type.as_str()],
-        )?;
+        self.with_sync_txn(|sync| {
+            let rows = self.db.conn.execute(
+                "DELETE FROM book_tags WHERE book_id = ?1
+                 AND tag_id IN (SELECT id FROM tags WHERE name = ?2 AND tag_type = ?3)",
+                params![book_id.to_string(), tag_name, tag_type.as_str()],
+            )?;
 
-        if rows == 0 {
-            return Err(DbError::NotFound(format!(
-                "tag '{tag_name}' ({tag_type}) not on this book"
-            )));
-        }
+            if rows == 0 {
+                return Err(DbError::NotFound(format!(
+                    "tag '{tag_name}' ({tag_type}) not on this book"
+                )));
+            }
 
-        Ok(())
+            sync.emit_local_op(
+                EntityType::Tag,
+                *book_id,
+                OpType::Delete,
+                Some(serde_json::json!({
+                    "tag_name": tag_name,
+                    "tag_type": tag_type.as_str(),
+                })),
+            )?;
+
+            Ok(())
+        })
     }
 
     /// Get all tags for a book.
@@ -1918,6 +2071,15 @@ impl<'a> BookRepository<'a> {
             params![removed_id.to_string()],
         )?;
 
+        // Emit a sync op tombstoning the removed book, in the same transaction
+        // so the merge and its op commit atomically. No-op without a device.
+        SyncRepository::new(self.db).emit_local_op(
+            EntityType::Book,
+            *removed_id,
+            OpType::Delete,
+            None,
+        )?;
+
         tx.commit()?;
 
         // 13. Recompute search_text outside the transaction
@@ -1925,6 +2087,31 @@ impl<'a> BookRepository<'a> {
 
         Ok(())
     }
+}
+
+/// Builds the sync-op field payload for a book Create op.
+///
+/// Mirrors the schema consumed by [`crate::merge`] (`BOOK_FIELDS`): enums are
+/// serialized via their string form, numbers as integers. `work_id` is omitted
+/// intentionally — Work rows are not synced yet, so shipping the reference would
+/// dangle on the receiving device.
+///
+/// Exposed so importers (which insert books via raw SQL to also persist source
+/// IDs) can emit the exact same Book Create op as [`BookRepository::create_book`].
+pub fn book_op_fields(book: &Book) -> serde_json::Value {
+    serde_json::json!({
+        "title": book.title,
+        "subtitle": book.subtitle,
+        "description": book.description,
+        "page_count": book.page_count,
+        "pub_date": book.pub_date,
+        "language": book.language,
+        "format": book.format.as_str(),
+        "duration_minutes": book.duration_minutes,
+        "cover_hash": book.cover_hash,
+        "status": book.status.as_str(),
+        "rating": book.rating,
+    })
 }
 
 /// Build the denormalized search_text from book fields and author names.

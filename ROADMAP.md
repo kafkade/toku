@@ -422,21 +422,23 @@ Every importer implements the `ImportEngine` trait with these capabilities:
 
 ### 3.1.2 — Canonical Lossless Export Format
 
-**Recommendation**: ZIP archive containing JSON + cover images.
+**Delivered** (#200, ADR-012): `toku export backup` / `toku import backup` — a versioned ZIP archive of the full domain model plus content-addressed binaries.
 
 ```text
-toku-backup-2025-07-14.zip
-├── manifest.json          # Version, export date, book count
-├── library.json           # Full data model as structured JSON
-├── covers/                # Cover images by content hash
-│   ├── a1b2c3d4.jpg
-│   └── ...
-└── schema-version.txt     # Data model version for forward compatibility
+toku-backup-2026-07-27.zip
+├── manifest.json          # format_version (=2), created_at, entity counts, encrypted flag
+├── library.json           # Full domain model as structured JSON (every persisted entity)
+├── covers/                # Cover images, content-addressed by SHA-256
+│   └── <sha256>.jpg
+└── files/                 # Ebook files, content-addressed by stored checksum
+    └── <checksum>.<ext>
 ```
 
 - **Self-contained**: Single ZIP file, no external dependencies.
-- **Documented**: JSON schema published in `docs/export-format.md`.
-- **Versioned**: `schema-version.txt` enables future parsers to handle old exports.
+- **Documented**: format specified in ADR-012 (`docs/adr/012-canonical-lossless-backup.md`).
+- **Versioned**: `manifest.json` carries a single integer `format_version` (starts at 2); on restore, unknown fields/entities are ignored rather than rejected for forward compatibility.
+- **Lossless, merge-by-default restore**: `toku import backup` dedups by stable `id` → `goodreads_id` → `calibre_id` → ISBN, applies per-field provenance-HLC last-write-wins that never clobbers a newer user edit, and treats reading sessions/progress as append-only. `--replace` performs a verbatim restore into a fresh library for disaster recovery.
+- **Optional encryption**: `--encrypt` seals the artifact with AES-256-GCM under the same zero-knowledge key hierarchy as sync (ADR-010); the `encrypted` flag lives in `manifest.json`.
 - **Round-trip**: `toku export backup` → `toku import backup toku-backup.zip` = identical library.
 
 Rejected alternatives:
@@ -451,7 +453,7 @@ Rejected alternatives:
 | JSON (full) | Backup, programmatic access | **MVP** | 🟢 |
 | CSV | Spreadsheet users | **MVP** | 🟢 |
 | Markdown | Blog posts, reading lists | Phase 2 | 🟢 |
-| ZIP backup (canonical) | Full backup/migration | Phase 2 | 🟡 |
+| ZIP backup (canonical) | Full backup/migration | ✅ Shipped (#200) | 🟡 |
 | BibTeX | Academic citations | Phase 3 | 🟡 |
 | OPDS | E-reader catalog | Phase 6 | 🟢 |
 | HTML | Static reading list site | Phase 3 | 🟡 |
@@ -1396,13 +1398,17 @@ Before committing to the architecture, validate:
 
 **Architecture**: See Section 2.5 (Sync Strategy) and ADR-010 for the current design. Summary: append-only op-log synced over REST with mandatory zero-knowledge E2E encryption (AES-256-GCM), 1Password-style SRP authentication, and Immich-style self-hosted Docker deployment.
 
+**Shipped so far**: op-log emission on every mutation (#194/#209), the Axum `toku-sync` server, mandatory zero-knowledge E2E encryption + 1Password-style SRP auth (ADR-010), new-device bootstrap + first-opt-in upload (#199/#213), and the canonical lossless backup/restore format (#200/ADR-012). The CLI, server, wire protocol, and crypto are in place.
+
 **Deliverables** (5):
 
-1. **Sync data model + op-log**: Local `sync_ops` table with Hybrid Logical Clock (HLC) timestamps, op IDs (UUID v7), entity type/ID, and a payload that is always client-side encrypted (ciphertext) before upload. Every mutation writes to both the domain table and the op-log in a single transaction.
-2. **Sync server (`toku-sync` crate)**: Axum REST API for push/pull/snapshot/device management. Thin relay — stores ops and cursors, does not interpret content. Deployable as a Docker image (`kafkade/toku-sync`).
-3. **Push/pull protocol with entity-specific merge rules**: Push sends new ops since last cursor. Pull receives ops and applies entity-specific merge: LWW per field for books, append-only for reading sessions, monotonic for progress, LWW with conflict detection for notes/reviews. Soft deletes with 30-day tombstone retention.
-4. **Mandatory client-side E2E encryption + SRP auth**: Mandatory for hosted mode — no plaintext fallback. 1Password-style two-secret SRP (password + Secret Key). Key hierarchy: (Secret Key + password) → Argon2id → unlock key → wraps key pair → wraps library key. Emergency Kit generated at account creation.
-5. **CLI sync commands + device management**: `toku sync init`, `toku sync push`, `toku sync pull`, `toku sync status`, `toku sync devices`. Device registration with UUID + human-readable name.
+1. **Sync data model + op-log** ✅ (#194/#209): Local `sync_ops` table with Hybrid Logical Clock (HLC) timestamps, op IDs (UUID v7), entity type/ID, and a payload that is always client-side encrypted (ciphertext) before upload. Every mutation writes to both the domain table and the op-log in a single transaction.
+2. **Sync server (`toku-sync` crate)** ✅: Axum REST API for push/pull/snapshot/device management. Thin relay — stores ops and cursors, does not interpret content. Deployable as a Docker image (`kafkade/toku-sync`).
+3. **Push/pull protocol with entity-specific merge rules** ✅: Push sends new ops since last cursor. Pull receives ops and applies entity-specific merge: LWW per field for books, append-only for reading sessions, monotonic for progress, LWW with conflict detection for notes/reviews. Soft deletes with 30-day tombstone retention.
+4. **Mandatory client-side E2E encryption + SRP auth** ✅ (ADR-010): Mandatory for hosted mode — no plaintext fallback. 1Password-style two-secret SRP (password + Secret Key). Key hierarchy: (Secret Key + password) → Argon2id → unlock key → wraps key pair → wraps library key. Emergency Kit generated at account creation.
+5. **CLI sync commands + device management** ✅: `toku sync signup` (create account + Secret Key + Emergency Kit), `login` (already-enrolled device), `enroll` (new device: password + Secret Key, auto-bootstraps), `push`, `pull`, `status`, `bootstrap` (new-device provisioning/recovery), and `devices` / `deregister`. Device registration with UUID + human-readable name.
+
+**Remaining (why still 🟡)**: genuine multi-device client integration — the iOS, macOS, web, and Windows apps actually syncing between each other end-to-end (the CLI already does).
 
 **Acceptance criteria**:
 
@@ -1422,7 +1428,7 @@ Before committing to the architecture, validate:
 - Conflict resolution UX — what happens when two devices edit the same book's title? **Mitigation**: LWW per field is invisible to the user in most cases; only note/review conflicts surface for manual resolution.
 - Encryption complexity — nonce management, key storage, rotation. **Mitigation**: dedicated security review before merge; use well-audited crates (ring, aes-gcm).
 
-**Cut line**: Managed hosted instance (`sync.toku.dev`) — self-hosted first. Browser-local SQLite for web app (web remains a connected companion). File sync for ebooks (Phase 6 files are not synced in Phase 7).
+**Cut line**: Managed hosted instance (`sync.toku.dev`) — self-hosted first (now tracked as the **Post-1.0 Managed Sync Tier** milestone below). Browser-local SQLite for web app (web remains a connected companion). File sync for ebooks (Phase 6 files are not synced in Phase 7).
 
 ---
 
@@ -1430,6 +1436,23 @@ Before committing to the architecture, validate:
 
 **Theme**: "Beyond tracking."
 **Deliverables**: On-device recommendations, ebook reader integration, reading timer.
+
+---
+
+### Post-1.0 Milestone: Managed Sync Tier 🔴
+
+**Theme**: "Sync without running a server."
+**Goal**: Offer an optional hosted (managed) instance of the sync relay for users who don't want to self-host — strictly additive, changing none of Toku's guarantees.
+
+**Scope & sequencing guardrails**:
+
+- **Self-host first**: the self-hosted sync path (Phase 7, ADR-010) must be solid before a managed tier is built. Managed hosting is additive and is never a prerequisite for any core feature.
+- **Same zero-knowledge model**: mandatory end-to-end encryption identical to self-hosted sync — the managed relay stores only client-encrypted ciphertext and can never read library content.
+- **Local-first, no social**: the non-negotiables are unchanged — the app stays fully functional offline, and there are no social features.
+
+**Design**: to be specified in **ADR-014** (planned — multi-tenant managed SaaS; tracked in #203). Not yet written; no architecture is committed here beyond the guardrails above.
+
+**Status**: post-1.0, not scheduled.
 
 ---
 

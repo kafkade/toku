@@ -5,6 +5,112 @@
 **Supersedes**: ADR-006, ADR-008
 **Issue**: #114 (Epic), #115 (this ADR)
 
+## Amendment — 2026-07-27: Implementation Reconciliation (#197)
+
+> This dated amendment reconciles ADR-010 with the shipped implementation as part
+> of the on-device-first architecture assessment (epic #207, seq 6). The original
+> **Decision** below is preserved as written; where the shipped construction
+> differs, this amendment is authoritative and the affected passages carry an
+> inline `Amended (#197)` pointer. **No code changed** — the shipped security
+> properties are correct for a personal, no-sharing, local-first tool; only this
+> ADR's depiction was stale. This amendment extends, and stays consistent with,
+> ADR-013.
+
+### A1 — Master unlock key: shipped KDF is a two-step construction
+
+The "Key Hierarchy" diagram and bullets below depict the Secret Key and account
+password entering **Argon2id together** to yield the unlock key. The shipped
+derivation (`crates/toku-core/src/crypto/key_hierarchy.rs`,
+`MasterUnlockKey::derive`) is instead **two steps**, and only the password is run
+through the memory-hard KDF:
+
+```text
+password_derived = Argon2id(password, salt=per-account, m=64 MB, t=3, p=1) -> 32 bytes
+unlock_key       = SHA-256( "toku/master-unlock-key/v1" || Secret Key || password_derived )
+```
+
+- The Secret Key is folded in via a **domain-separated SHA-256 combine**, not by
+  being fed into Argon2id. Running only the (low-entropy) password through the
+  memory-hard KDF while combining the (128-bit, high-entropy) Secret Key with a
+  fast hash is the intended design — the Secret Key needs no key-stretching.
+- The shipped algorithm identifier is `argon2id+sha256-2skd`
+  (`MASTER_KDF_ALGORITHM`).
+- Naming: the code type is `MasterUnlockKey`; this ADR calls it the "Account
+  Unlock Key". They are the same key.
+
+The security intent is unchanged from the original decision — both secrets are
+required to derive the unlock key. Only the construction differs, so this is a
+documentation reconciliation, not a code change.
+
+### A2 — Data-key cardinality: one wrapped data key per account (not per library)
+
+**Decision (maintainer-confirmed): the data key is per-account.** The original
+"one key per library, generated at library creation" wording is superseded.
+
+Shipped reality:
+
+- `crates/toku-sync/migrations/V7__wrapped_data_key.sql` stores a single
+  `wrapped_data_key` column on the **`users`** table — one wrapped data key per
+  **account**. `AccountKeys::create` generates exactly one leaf `SyncKey` per
+  account; `signup`/`enroll` recover that one account data key and reuse it for
+  whichever library the enrolling device lands on.
+- The server does support **multiple libraries per user**: `enroll_device`
+  (`crates/toku-sync/src/handlers.rs`) mints a fresh library (UUID v7) whenever a
+  device enrolls without naming a `library_id`, and `libraries.user_id`
+  (migration V5) links many libraries to one account.
+
+**Consequence (stated plainly):** a single account's multiple libraries are **not
+cryptographically isolated from each other** — they are all encrypted under the
+same per-account data key, so compromise of that data key exposes every library
+the account owns. This is an accepted posture for a **personal, single-user tool
+with no sharing feature**: there is no second party from whom one library must be
+kept secret, so inter-library key separation buys nothing today.
+
+**Rationale:** consistent with this ADR already rejecting per-item keys as
+"unnecessary complexity for a personal tool" (see Alternatives Considered); and it
+gives the simplest recovery — one key to wrap at signup and unwrap per device
+enroll.
+
+**Migration path (if ever needed):** should per-library isolation become a real
+requirement (for example a future selective-sharing feature), move to per-library
+`wrapped_data_key` rows keyed by `(user_id, library_id)` and generate a distinct
+`SyncKey` per library at library creation — matching the original diagram below.
+No such work is planned or tracked; this note only records the exit path.
+
+**Naming debt:** the code and this ADR still call the leaf key the "library data
+key" (`WrappedDataKey`, `DATA_KEY_WRAP_INFO = "toku/library-data-key-wrap/v1"`,
+and the diagram below) even though its scope is per-account. Left as-is to avoid a
+churny rename; flagged here so the term is not read as implying per-library scope.
+
+### A3 — "Encrypted at rest" is scoped to the server and in transit, not the local DB
+
+This ADR's zero-knowledge guarantees — "the server stores only encrypted blobs",
+mandatory `encrypted` envelopes, and wrapped keys — apply to **data at the server
+and in transit**, plus the **zero-knowledge-wrapped data key**. They do **not**
+imply that the local working database is encrypted at rest.
+
+- The local `toku.db` is **not encrypted at rest today**: `toku-db`'s database
+  open path (`crates/toku-db/src/database.rs`) sets only `journal_mode=WAL` and
+  `foreign_keys=ON` — there is no SQLCipher or other at-rest encryption.
+- Optional at-rest DB encryption (SQLCipher) plus encrypted backups are separate,
+  future work tracked in **#204** (epic #207, seq 10).
+- The same overclaim in `.github/copilot-instructions.md`'s data-boundary table
+  ("Local SQLite (encrypted at rest if sync enabled)") is corrected under **#196**
+  (seq 7); this amendment and #196 must stay consistent.
+
+Local-first, offline-first, user-data-ownership, and CLI-first are unchanged; this
+is a scoping clarification that avoids overstating the local-disk guarantee.
+
+### Note — F1 / #161 (Secret Key in the SRP verifier) shipped
+
+The two-secret SRP verifier described in "Two-Secret Authentication Model" is
+implemented as written: `toku_core::srp_verifier_input(secret_key, password)`
+(`crates/toku-core/src/crypto/srp.rs`, domain `toku/srp/verifier-input/v1`) folds
+the Secret Key into every verifier create/verify site. Issue **#161** (the F1
+finding that the Secret Key was initially not folded into the verifier) is
+**closed/shipped**, so the threat-model claim that a stolen verifier is not
+brute-forceable against the password alone is now true as implemented.
+
 ## Context
 
 ADR-006 chose **optional** symmetric encryption (single passphrase → Argon2id → AES-256-GCM)
@@ -87,6 +193,11 @@ Key, or any encryption key from it.
 
 ### Key Hierarchy
 
+> **Amended (#197):** The shipped master-unlock-key derivation is a two-step
+> construction — Argon2id over the password, then a domain-separated SHA-256
+> combine with the Secret Key — not both secrets entering Argon2id together. See
+> the 2026-07-27 Amendment (A1) above.
+
 ```text
 Secret Key + Account Password
           │
@@ -116,6 +227,11 @@ Concretely:
 - **Library Key**: per-library AES-256-GCM key, generated at library creation. Wrapped
   with the account's public key and stored on the server. The client unwraps it using the
   private key after authentication.
+
+> **Amended (#197):** The wrapped data key is stored **per account**
+> (`users.wrapped_data_key`), not per library; a single account's libraries all
+> share one data key and are not cryptographically isolated from each other. See
+> the 2026-07-27 Amendment (A2) above.
 
 The server stores: SRP verifier, wrapped private key ciphertext, wrapped library key
 ciphertext. It **cannot** derive any plaintext data from these.
@@ -197,6 +313,11 @@ binding and op-type indexing while leaking only aggregate counts, never content.
 exposure is documented in `docs/sync-server.md`.
 
 ### Revised Threat Model
+
+> **Amended (#197):** "Zero-knowledge / encrypted" here scopes to server-side +
+> in-transit + the ZK-wrapped data key. The local `toku.db` is **not** encrypted
+> at rest today (WAL + FK pragmas only); SQLCipher at-rest is future work (#204).
+> See the 2026-07-27 Amendment (A3) above.
 
 | Threat | Old model (ADR-006/008) | New model (ADR-010) |
 |--------|-------------------------|---------------------|

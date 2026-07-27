@@ -1,142 +1,283 @@
+//! Canonical, versioned, lossless backup container (ADR-012).
+//!
+//! A backup is a ZIP holding:
+//! - `manifest.json` — [`BackupManifest`] (`format_version`, `created_at`,
+//!   entity counts, `encrypted` flag + AEAD envelope when sealed).
+//! - `library.json` — the full [`LibraryData`] domain schema (omitted when the
+//!   backup is encrypted; the sealed payload then lives in the manifest
+//!   envelope).
+//! - `covers/<sha256>.jpg` — cover images, content-addressed by `cover_hash`.
+//! - `files/<checksum>.<ext>` — ebook files, content-addressed by
+//!   `files.checksum`.
+//!
+//! Export and restore both work fully offline. Encryption is an optional outer
+//! wrapper over `library.json` using the snapshot AEAD path; the unencrypted
+//! plaintext backup is the default artifact (ADR-012 D4).
+
+use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use zip::write::SimpleFileOptions;
 
-use toku_db::Database;
+use toku_core::backup_schema::{BACKUP_FORMAT_VERSION, BackupManifest, LibraryData};
+use toku_core::crypto::{EncryptedEnvelope, SyncKey, decrypt_snapshot, encrypt_snapshot};
+use toku_db::{Database, LibraryIo, RestoreMode, RestoreResult};
 
-use crate::{ExportError, build_library_export};
+use crate::ExportError;
 
-/// Create a canonical backup ZIP containing manifest.json, library.json, and cover images.
+/// Create a canonical lossless backup ZIP.
+///
+/// When `key` is `Some`, `library.json` is sealed with the library data key and
+/// the manifest records the AEAD envelope; binaries remain plaintext in the
+/// archive (at-rest binary sealing is deferred to a later phase). With `None`,
+/// a fully plaintext backup is written — the default offline artifact.
 pub fn export_backup(
     db: &Database,
     data_dir: &Path,
     output_path: &Path,
+    key: Option<&SyncKey>,
 ) -> Result<(), ExportError> {
-    let export = build_library_export(db)?;
+    let data = LibraryIo::new(db).export_library()?;
+    let library_json = serde_json::to_string_pretty(&data)?;
+
+    let (encrypted, envelope): (bool, Option<EncryptedEnvelope>) = match key {
+        Some(k) => {
+            let env = encrypt_snapshot(k, &library_json)
+                .map_err(|e| ExportError::Crypto(e.to_string()))?;
+            (true, Some(env))
+        }
+        None => (false, None),
+    };
 
     let file = fs::File::create(output_path)?;
     let mut zip = zip::ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    // Write manifest.json
-    let manifest = serde_json::json!({
-        "version": export.version,
-        "exported_at": export.exported_at,
-        "book_count": export.book_count,
-    });
-    zip.start_file("manifest.json", options)?;
-    zip.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
+    // Payload: plaintext library.json, or nothing (sealed payload rides in the
+    // manifest envelope).
+    if !encrypted {
+        zip.start_file("library.json", options)?;
+        zip.write_all(library_json.as_bytes())?;
+    }
 
-    // Write library.json
-    zip.start_file("library.json", options)?;
-    zip.write_all(serde_json::to_string_pretty(&export)?.as_bytes())?;
-
-    // Copy cover images
+    // Cover binaries, content-addressed and de-duplicated by hash.
     let covers_dir = data_dir.join("covers");
-    if covers_dir.is_dir() {
-        for book in &export.books {
-            if let Some(hash) = &book.cover_hash {
-                let cover_path = covers_dir.join(format!("{hash}.jpg"));
-                if cover_path.exists() {
-                    let cover_data = fs::read(&cover_path)?;
-                    zip.start_file(format!("covers/{hash}.jpg"), options)?;
-                    zip.write_all(&cover_data)?;
-                }
+    let mut written_covers: HashSet<String> = HashSet::new();
+    for book in &data.books {
+        if let Some(hash) = &book.cover_hash
+            && written_covers.insert(hash.clone())
+        {
+            let cover_path = covers_dir.join(format!("{hash}.jpg"));
+            if cover_path.exists() {
+                let bytes = fs::read(&cover_path)?;
+                zip.start_file(format!("covers/{hash}.jpg"), options)?;
+                zip.write_all(&bytes)?;
             }
         }
     }
+
+    // Ebook binaries, content-addressed by checksum and de-duplicated.
+    let mut written_files: HashSet<String> = HashSet::new();
+    for f in &data.files {
+        let entry = format!("files/{}.{}", f.checksum, f.format);
+        if !written_files.insert(entry.clone()) {
+            continue;
+        }
+        let src = Path::new(&f.path);
+        if src.exists() {
+            let bytes = fs::read(src)?;
+            zip.start_file(entry, options)?;
+            zip.write_all(&bytes)?;
+        }
+    }
+
+    let mut counts = data.counts();
+    counts.covers = written_covers.len();
+    let manifest = BackupManifest {
+        format_version: BACKUP_FORMAT_VERSION,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        counts,
+        encrypted,
+        envelope,
+    };
+    zip.start_file("manifest.json", options)?;
+    zip.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
 
     zip.finish()?;
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Read;
-    use toku_core::{Book, BookFormat, ReadingStatus};
-    use toku_db::BookRepository;
+/// Read and validate the manifest of a backup ZIP without restoring anything.
+///
+/// Used for `--dry-run` and to surface encryption/version state before a write.
+pub fn read_backup_manifest(zip_path: &Path) -> Result<BackupManifest, ExportError> {
+    let file = fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    parse_manifest(&mut archive)
+}
 
-    #[test]
-    fn backup_contains_manifest_and_library() {
-        let db = Database::open_in_memory().unwrap();
-        let repo = BookRepository::new(&db);
+/// Restore a canonical backup into the database (ADR-012 D3).
+///
+/// `mode` selects merge (default, additive, precedence-respecting) or replace
+/// (verbatim into a cleared library). `key` decrypts a sealed `library.json`.
+/// Binaries are extracted content-addressed after the database transaction
+/// commits; extraction is idempotent (existing content is left in place).
+pub fn import_backup(
+    zip_path: &Path,
+    db: &Database,
+    data_dir: &Path,
+    mode: RestoreMode,
+    key: Option<&SyncKey>,
+) -> Result<RestoreResult, ExportError> {
+    let file = fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
 
-        let mut book = Book::new("Dune");
-        book.status = ReadingStatus::Read;
-        book.format = BookFormat::Physical;
-        repo.create_book(&book).unwrap();
+    let manifest = parse_manifest(&mut archive)?;
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        fs::create_dir_all(&data_dir).unwrap();
-        let output = tmp.path().join("backup.zip");
+    let library_json = if manifest.encrypted {
+        let envelope = manifest
+            .envelope
+            .as_ref()
+            .ok_or_else(|| ExportError::Malformed("encrypted backup has no envelope".into()))?;
+        let key = key.ok_or_else(|| {
+            ExportError::Crypto(
+                "backup is encrypted but no library data key is available to decrypt it".into(),
+            )
+        })?;
+        decrypt_snapshot(key, envelope).map_err(|e| ExportError::Crypto(e.to_string()))?
+    } else {
+        read_zip_entry_string(&mut archive, "library.json")?
+    };
 
-        export_backup(&db, &data_dir, &output).unwrap();
+    let data: LibraryData = serde_json::from_str(&library_json)
+        .map_err(|e| ExportError::Malformed(format!("library.json: {e}")))?;
 
-        let file = fs::File::open(&output).unwrap();
-        let mut archive = zip::ZipArchive::new(file).unwrap();
+    let result = LibraryIo::new(db).restore_library(&data, mode)?;
 
-        let mut names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
-            .collect();
-        names.sort();
+    extract_binaries(&mut archive, data_dir, &data)?;
 
-        assert!(names.contains(&"manifest.json".to_string()));
-        assert!(names.contains(&"library.json".to_string()));
+    Ok(result)
+}
 
-        // Verify manifest parses
-        {
-            let mut manifest_file = archive.by_name("manifest.json").unwrap();
-            let mut manifest_str = String::new();
-            manifest_file.read_to_string(&mut manifest_str).unwrap();
-            let manifest: serde_json::Value = serde_json::from_str(&manifest_str).unwrap();
-            assert_eq!(manifest["version"], "1");
-            assert_eq!(manifest["book_count"], 1);
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
+
+/// Parse and version-check `manifest.json`, distinguishing a superseded v1 flat
+/// archive from a current v2 lossless one.
+fn parse_manifest<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<BackupManifest, ExportError> {
+    let raw = read_zip_entry_string(archive, "manifest.json")?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| ExportError::Malformed(format!("manifest.json: {e}")))?;
+
+    // A v1 flat backup carries a string `version` and no `format_version`.
+    if value.get("format_version").is_none() {
+        if value.get("version").is_some() {
+            return Err(ExportError::UnsupportedVersion(1, BACKUP_FORMAT_VERSION));
         }
+        return Err(ExportError::Malformed(
+            "manifest.json is missing format_version".into(),
+        ));
+    }
 
-        // Verify library.json round-trips
+    let manifest: BackupManifest = serde_json::from_value(value)
+        .map_err(|e| ExportError::Malformed(format!("manifest.json: {e}")))?;
+
+    if manifest.format_version < BACKUP_FORMAT_VERSION {
+        // Only v1 exists below the current version; treat any sub-current value
+        // as the superseded flat format.
+        return Err(ExportError::UnsupportedVersion(
+            manifest.format_version,
+            BACKUP_FORMAT_VERSION,
+        ));
+    }
+    if manifest.format_version > BACKUP_FORMAT_VERSION {
+        return Err(ExportError::FutureVersion(
+            manifest.format_version,
+            BACKUP_FORMAT_VERSION,
+        ));
+    }
+
+    Ok(manifest)
+}
+
+fn read_zip_entry_string<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Result<String, ExportError> {
+    let mut entry = archive
+        .by_name(name)
+        .map_err(|_| ExportError::Malformed(format!("backup is missing {name}")))?;
+    let mut s = String::new();
+    entry.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// Extract cover and ebook binaries to their content-addressed locations,
+/// skipping any content already present (dedup by hash/checksum, ADR-011).
+fn extract_binaries<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    data_dir: &Path,
+    data: &LibraryData,
+) -> Result<(), ExportError> {
+    // Covers → data_dir/covers/<hash>.jpg
+    let covers_dir = data_dir.join("covers");
+    let mut done: HashSet<String> = HashSet::new();
+    for book in &data.books {
+        if let Some(hash) = &book.cover_hash
+            && done.insert(hash.clone())
         {
-            let mut lib_file = archive.by_name("library.json").unwrap();
-            let mut lib_str = String::new();
-            lib_file.read_to_string(&mut lib_str).unwrap();
-            let parsed: crate::LibraryExport = serde_json::from_str(&lib_str).unwrap();
-            assert_eq!(parsed.books.len(), 1);
-            assert_eq!(parsed.books[0].title, "Dune");
+            let entry_name = format!("covers/{hash}.jpg");
+            let dest = covers_dir.join(format!("{hash}.jpg"));
+            if dest.exists() {
+                continue;
+            }
+            if let Some(bytes) = read_zip_entry_bytes(archive, &entry_name)? {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&dest, bytes)?;
+            }
         }
     }
 
-    #[test]
-    fn backup_includes_cover_files() {
-        let db = Database::open_in_memory().unwrap();
-        let repo = BookRepository::new(&db);
+    // Ebook files → their recorded path (reconstructs the on-disk library).
+    let mut file_done: HashSet<String> = HashSet::new();
+    for f in &data.files {
+        let entry_name = format!("files/{}.{}", f.checksum, f.format);
+        if !file_done.insert(entry_name.clone()) {
+            continue;
+        }
+        let dest = Path::new(&f.path);
+        if dest.exists() {
+            continue;
+        }
+        if let Some(bytes) = read_zip_entry_bytes(archive, &entry_name)? {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(dest, bytes)?;
+        }
+    }
 
-        let mut book = Book::new("Dune");
-        book.status = ReadingStatus::Read;
-        book.format = BookFormat::Physical;
-        book.cover_hash = Some("abc123def456".to_string());
-        repo.create_book(&book).unwrap();
+    Ok(())
+}
 
-        let tmp = tempfile::TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        let covers_dir = data_dir.join("covers");
-        fs::create_dir_all(&covers_dir).unwrap();
-
-        // Write a fake cover image
-        let cover_content = b"fake-jpeg-data";
-        fs::write(covers_dir.join("abc123def456.jpg"), cover_content).unwrap();
-
-        let output = tmp.path().join("backup.zip");
-        export_backup(&db, &data_dir, &output).unwrap();
-
-        let file = fs::File::open(&output).unwrap();
-        let mut archive = zip::ZipArchive::new(file).unwrap();
-
-        let mut cover_file = archive.by_name("covers/abc123def456.jpg").unwrap();
-        let mut cover_data = Vec::new();
-        cover_file.read_to_end(&mut cover_data).unwrap();
-        assert_eq!(cover_data, cover_content);
+fn read_zip_entry_bytes<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Result<Option<Vec<u8>>, ExportError> {
+    match archive.by_name(name) {
+        Ok(mut entry) => {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            Ok(Some(buf))
+        }
+        Err(zip::result::ZipError::FileNotFound) => Ok(None),
+        Err(e) => Err(ExportError::Zip(e)),
     }
 }

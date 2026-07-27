@@ -1,3 +1,4 @@
+pub mod backup_schema;
 mod book;
 mod config;
 pub mod crypto;
@@ -9,6 +10,7 @@ pub mod merge;
 pub mod stats;
 pub mod sync;
 
+pub use backup_schema::*;
 pub use book::*;
 pub use config::*;
 pub use crypto::*;

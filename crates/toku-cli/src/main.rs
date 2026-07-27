@@ -1095,7 +1095,7 @@ fn main() -> Result<()> {
             force,
         } => cmd_convert(&db, &repo, &book, &to, from.as_deref(), force),
         Commands::Export { target } => cmd_export(&db, &data_dir, target),
-        Commands::Bulk { action } => cmd_bulk(&db, &repo, action),
+        Commands::Bulk { action } => cmd_bulk(&repo, action),
         Commands::Stats {
             year,
             author,
@@ -3206,7 +3206,7 @@ fn resolve_bulk_books(
     Ok(filtered)
 }
 
-fn cmd_bulk(db: &toku_db::Database, repo: &BookRepository, action: BulkAction) -> Result<()> {
+fn cmd_bulk(repo: &BookRepository, action: BulkAction) -> Result<()> {
     match action {
         BulkAction::Tag {
             tag,
@@ -3318,29 +3318,13 @@ fn cmd_bulk(db: &toku_db::Database, repo: &BookRepository, action: BulkAction) -
             let verb = if dry_run { "Would delete" } else { "Deleting" };
             eprintln!("{verb} {} book(s):\n", books.len());
 
-            // If sync is configured, create delete ops for each book
-            let sync_repo = toku_db::SyncRepository::new(db);
-            let device_identity = sync_repo.get_device()?;
-
             for book in &books {
                 if dry_run {
                     eprintln!("  [dry-run] \"{}\"", book.title);
                 } else {
+                    // `delete_book` emits the Book Delete sync op atomically
+                    // with the write (no-op when sync isn't configured).
                     repo.delete_book(&book.id)?;
-
-                    if let Some(ref identity) = device_identity {
-                        let mut clock = toku_core::HybridClock::new(&identity.device_id);
-                        let op = toku_core::SyncOp::new(
-                            identity.device_id,
-                            clock.now(),
-                            toku_core::EntityType::Book,
-                            book.id,
-                            toku_core::OpType::Delete,
-                            None,
-                        );
-                        sync_repo.insert_op(&op)?;
-                    }
-
                     eprintln!("  ✗ \"{}\"", book.title);
                 }
             }

@@ -77,6 +77,101 @@ impl<'a> SyncRepository<'a> {
         Ok(())
     }
 
+    /// Emit a local sync op for a frontend mutation and stage it for push.
+    ///
+    /// This is the single choke-point through which every domain mutation
+    /// records its op. It is a **no-op when no device identity is configured**,
+    /// preserving the offline-first guarantee: op creation never requires sync
+    /// setup or network access.
+    ///
+    /// The op is stored in plaintext — `fields` are encrypted later, at push
+    /// time (see `toku-sync-client`). The HLC is seeded past the highest local
+    /// HLC so emitted ops are monotonic. For book fields, local provenance is
+    /// recorded (mirroring the merge engine) so that a later pull of a staler
+    /// remote edit cannot clobber this local write.
+    ///
+    /// Errors propagate to the caller so a failed op rolls back the enclosing
+    /// transaction: sync correctness must not be silently dropped.
+    pub fn emit_local_op(
+        &self,
+        entity_type: EntityType,
+        entity_id: Uuid,
+        op_type: OpType,
+        fields: Option<serde_json::Value>,
+    ) -> Result<(), DbError> {
+        let Some(identity) = self.get_device()? else {
+            return Ok(());
+        };
+
+        let hlc = self.next_local_hlc(&identity.device_id)?;
+
+        // Record local field provenance for book create/update writes so that
+        // subsequent merges (pulled remote edits) respect this write's recency.
+        // Session/Progress/Tag entities are append-only or immutable and carry
+        // no per-field HLC bookkeeping, so they need no provenance here.
+        if entity_type == EntityType::Book
+            && matches!(op_type, OpType::Create | OpType::Update)
+            && let Some(obj) = fields.as_ref().and_then(|f| f.as_object())
+        {
+            let hlc_str = hlc.to_canonical();
+            let book_id = entity_id.to_string();
+            for field_name in obj.keys() {
+                self.upsert_book_provenance(&book_id, field_name, &hlc_str)?;
+            }
+        }
+
+        let op = SyncOp::new(
+            identity.device_id,
+            hlc,
+            entity_type,
+            entity_id,
+            op_type,
+            fields,
+        );
+        self.insert_op(&op)
+    }
+
+    /// Build the next monotonic local HLC, seeded past the highest HLC already
+    /// present in the local op log (across all devices). This guarantees each
+    /// emitted op sorts after every existing one, avoiding same-millisecond
+    /// collisions that could otherwise drop a rapid second edit on the peer.
+    fn next_local_hlc(&self, device_id: &Uuid) -> Result<HlcTimestamp, DbError> {
+        let mut clock = HybridClock::new(device_id);
+        let max_hlc: Option<String> = self
+            .db
+            .conn
+            .query_row("SELECT MAX(hlc) FROM sync_ops", [], |row| row.get(0))
+            .optional()?
+            .flatten();
+
+        if let Some(max) = max_hlc
+            && let Ok(remote) = HlcTimestamp::from_str(&max)
+        {
+            return Ok(clock.update(&remote));
+        }
+        Ok(clock.now())
+    }
+
+    /// Upsert book field provenance with the given sync HLC. Mirrors the merge
+    /// engine's provenance write so local and remote edits share identical LWW
+    /// bookkeeping. On conflict only `sync_hlc` advances, leaving any existing
+    /// metadata `source` (e.g. from an importer) untouched.
+    fn upsert_book_provenance(
+        &self,
+        book_id: &str,
+        field_name: &str,
+        hlc: &str,
+    ) -> Result<(), DbError> {
+        self.db.conn.execute(
+            "INSERT INTO metadata_provenance (book_id, field_name, source, source_date, is_user_override, sync_hlc)
+             VALUES (?1, ?2, 'sync', ?3, 0, ?3)
+             ON CONFLICT (book_id, field_name) DO UPDATE SET sync_hlc = ?3
+             WHERE sync_hlc IS NULL OR sync_hlc < ?3",
+            params![book_id, field_name, hlc],
+        )?;
+        Ok(())
+    }
+
     /// Get all ops that have not been pushed yet, ordered by HLC.
     pub fn get_unpushed_ops(&self) -> Result<Vec<SyncOp>, DbError> {
         let mut stmt = self.db.conn.prepare(

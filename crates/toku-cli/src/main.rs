@@ -359,6 +359,21 @@ enum ImportSource {
         /// Import ID (shown after a successful import)
         import_id: String,
     },
+
+    /// Restore from a canonical lossless backup (`.zip`)
+    Backup {
+        /// Path to the backup ZIP created by `toku export backup`
+        path: PathBuf,
+
+        /// Replace the current library verbatim (disaster recovery) instead of
+        /// the default additive, precedence-respecting merge
+        #[arg(long)]
+        replace: bool,
+
+        /// Preview what would be restored without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -715,6 +730,11 @@ enum ExportTarget {
         /// Output file path (required)
         #[arg(long, short)]
         output: PathBuf,
+
+        /// Seal the backup with the configured library data key (AES-256-GCM).
+        /// Requires an enrolled sync key; the default is an unencrypted archive.
+        #[arg(long)]
+        encrypt: bool,
     },
 }
 
@@ -1091,7 +1111,7 @@ fn main() -> Result<()> {
             tag.as_deref(),
             &cli.format,
         ),
-        Commands::Import { source } => cmd_import(&db, &repo, source, &cli.format),
+        Commands::Import { source } => cmd_import(&db, &repo, source, &data_dir, &cli.format),
         Commands::Lookup { query, limit } => cmd_lookup(&query, limit, &cli.format),
         Commands::Reading { action } => cmd_reading(&repo, action, &cli.format),
         Commands::Tag { action } => cmd_tag(&repo, action, &cli.format),
@@ -1974,6 +1994,7 @@ fn cmd_import(
     db: &Database,
     _repo: &BookRepository,
     source: ImportSource,
+    data_dir: &Path,
     output_format: &OutputFormat,
 ) -> Result<()> {
     match source {
@@ -2027,7 +2048,158 @@ fn cmd_import(
 
             Ok(())
         }
+        ImportSource::Backup {
+            path,
+            replace,
+            dry_run,
+        } => cmd_import_backup(db, &path, replace, dry_run, data_dir, output_format),
     }
+}
+
+fn cmd_import_backup(
+    db: &Database,
+    path: &Path,
+    replace: bool,
+    dry_run: bool,
+    data_dir: &Path,
+    output_format: &OutputFormat,
+) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("backup not found: {}", path.display());
+    }
+
+    let manifest =
+        toku_export::read_backup_manifest(path).context("could not read backup manifest")?;
+
+    if dry_run {
+        let c = &manifest.counts;
+        match output_format {
+            OutputFormat::Json => {
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            }
+            _ => {
+                eprintln!("Dry run — no changes will be made.");
+                eprintln!(
+                    "Backup format v{} ({}), created {}",
+                    manifest.format_version,
+                    if manifest.encrypted {
+                        "encrypted"
+                    } else {
+                        "plaintext"
+                    },
+                    manifest.created_at
+                );
+                eprintln!(
+                    "Would restore: {} books, {} reading sessions, {} progress, {} notes, \
+                     {} reviews, {} tags, {} shelves, {} works, {} series, {} files",
+                    c.books,
+                    c.reading_sessions,
+                    c.reading_progress,
+                    c.notes,
+                    c.reviews,
+                    c.tags,
+                    c.shelves,
+                    c.works,
+                    c.series,
+                    c.files,
+                );
+                eprintln!("Mode: {}", if replace { "replace" } else { "merge" });
+            }
+        }
+        return Ok(());
+    }
+
+    // Decrypt only when the artifact is sealed; plaintext restores stay fully
+    // offline with no key required.
+    let key = if manifest.encrypted {
+        Some(load_library_key(data_dir).context(
+            "backup is encrypted but no library data key is configured; enroll this device \
+             with `toku sync` to restore an encrypted backup",
+        )?)
+    } else {
+        None
+    };
+
+    let mode = if replace {
+        toku_db::RestoreMode::Replace
+    } else {
+        toku_db::RestoreMode::Merge
+    };
+
+    let result = toku_export::import_backup(path, db, data_dir, mode, key.as_ref())
+        .context("backup restore failed")?;
+
+    match output_format {
+        OutputFormat::Json => {
+            let out = serde_json::json!({
+                "mode": if replace { "replace" } else { "merge" },
+                "books_inserted": result.books_inserted,
+                "books_updated": result.books_updated,
+                "reading_sessions": result.reading_sessions,
+                "reading_progress": result.reading_progress,
+                "notes": result.notes,
+                "reviews": result.reviews,
+                "tags": result.tags,
+                "shelves": result.shelves,
+                "works": result.works,
+                "series": result.series,
+                "isbns": result.isbns,
+                "files": result.files,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        OutputFormat::Csv => {
+            println!("metric,count");
+            println!("books_inserted,{}", result.books_inserted);
+            println!("books_updated,{}", result.books_updated);
+            println!("reading_sessions,{}", result.reading_sessions);
+            println!("reading_progress,{}", result.reading_progress);
+            println!("notes,{}", result.notes);
+            println!("reviews,{}", result.reviews);
+            println!("tags,{}", result.tags);
+            println!("shelves,{}", result.shelves);
+            println!("works,{}", result.works);
+            println!("series,{}", result.series);
+            println!("isbns,{}", result.isbns);
+            println!("files,{}", result.files);
+        }
+        OutputFormat::Table => {
+            eprintln!(
+                "✓ Restored backup ({} mode)",
+                if replace { "replace" } else { "merge" }
+            );
+            eprintln!(
+                "  {} books added, {} updated · {} sessions · {} progress · {} notes · \
+                 {} reviews · {} files",
+                result.books_inserted,
+                result.books_updated,
+                result.reading_sessions,
+                result.reading_progress,
+                result.notes,
+                result.reviews,
+                result.files,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Load the library data key from the configured sync server's local key store,
+/// if one is enrolled. Fully local — no network access.
+fn load_library_key(data_dir: &Path) -> Result<toku_core::SyncKey> {
+    let config = toku_core::TokuConfig::load(data_dir).unwrap_or_default();
+    let server = config
+        .sync
+        .as_ref()
+        .map(|s| s.server.clone())
+        .ok_or_else(|| anyhow::anyhow!("no sync server configured"))?;
+    let token_store = sync::token_store::TokenStore::new(data_dir);
+    let key_bytes = token_store
+        .load_sync_key(&server)?
+        .ok_or_else(|| anyhow::anyhow!("no library data key stored for {server}"))?;
+    toku_core::SyncKey::from_exported_bytes(&key_bytes)
+        .map_err(|e| anyhow::anyhow!("stored library data key is invalid: {e}"))
 }
 
 fn cmd_export(db: &Database, data_dir: &Path, target: ExportTarget) -> Result<()> {
@@ -2066,9 +2238,22 @@ fn cmd_export(db: &Database, data_dir: &Path, target: ExportTarget) -> Result<()
             }
             Ok(())
         }
-        ExportTarget::Backup { output } => {
-            toku_export::export_backup(db, data_dir, &output).context("backup export failed")?;
-            eprintln!("✓ Backup saved to {}", output.display());
+        ExportTarget::Backup { output, encrypt } => {
+            let key = if encrypt {
+                Some(load_library_key(data_dir).context(
+                    "cannot encrypt backup: no library data key is configured; enroll this \
+                     device with `toku sync` first, or omit --encrypt for a plaintext backup",
+                )?)
+            } else {
+                None
+            };
+            toku_export::export_backup(db, data_dir, &output, key.as_ref())
+                .context("backup export failed")?;
+            eprintln!(
+                "✓ Backup saved to {}{}",
+                output.display(),
+                if encrypt { " (encrypted)" } else { "" }
+            );
             Ok(())
         }
     }

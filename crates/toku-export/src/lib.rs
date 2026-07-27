@@ -4,7 +4,7 @@ mod error;
 mod json_export;
 mod markdown_export;
 
-pub use backup::export_backup;
+pub use backup::{export_backup, import_backup, read_backup_manifest};
 pub use csv_export::export_csv;
 pub use error::ExportError;
 pub use json_export::export_json;

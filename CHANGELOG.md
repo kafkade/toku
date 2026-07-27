@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Canonical, lossless backups. `toku export backup` now writes a versioned,
+  self-describing archive (JSON-in-ZIP) that captures your **entire** library —
+  books (including audiobook durations, works, and soft-delete tombstones),
+  contributors and their roles, every ISBN, tags with their types, shelves
+  (including smart-shelf definitions), series, reading sessions and progress,
+  notes, reviews, ratings, per-field metadata provenance, user settings, import
+  history, and your cover images and ebook files as content-addressed binaries.
+  Nothing is flattened or dropped, so your data stays fully portable and
+  yours — no lock-in (#200)
+- Restore from a backup with `toku import backup <archive.zip>`. By default it
+  **merges** into your current library without ever clobbering a newer edit:
+  books match by id, then Goodreads/Calibre id, then ISBN; reading sessions and
+  progress are append-only; notes and reviews resolve last-writer-wins by clock
+  while respecting deletions; covers and files de-duplicate by checksum; and
+  re-running the same restore is a no-op. Use `--replace` for a verbatim
+  disaster-recovery restore into a cleared library, `--dry-run` to preview what
+  would change, and `--format table|json|csv` for the summary. Everything works
+  fully offline (#200)
+- Optional encrypted backups. Pass `--encrypt` to `toku export backup` to seal
+  the archive with your library data key (AES-256-GCM); `toku import backup`
+  transparently decrypts it. Unencrypted plaintext remains the default offline
+  artifact (#200)
+
 - Opting into sync now uploads the library you already have. On `toku sync signup` (and on a
   `toku sync enroll` that creates a fresh library), Toku backfills your existing books,
   reading sessions, progress, and tags into the sync log and pushes them automatically — no

@@ -5971,6 +5971,7 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "csv",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

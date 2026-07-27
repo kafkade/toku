@@ -21,7 +21,7 @@ use std::path::Path;
 
 use zip::write::SimpleFileOptions;
 
-use toku_core::backup_schema::{BACKUP_FORMAT_VERSION, BackupManifest, LibraryData};
+use toku_core::backup_schema::{BACKUP_FORMAT_VERSION, BackupKdf, BackupManifest, LibraryData};
 use toku_core::crypto::{EncryptedEnvelope, SyncKey, decrypt_snapshot, encrypt_snapshot};
 use toku_db::{Database, LibraryIo, RestoreMode, RestoreResult};
 
@@ -38,6 +38,33 @@ pub fn export_backup(
     data_dir: &Path,
     output_path: &Path,
     key: Option<&SyncKey>,
+) -> Result<(), ExportError> {
+    write_backup(db, data_dir, output_path, key, None)
+}
+
+/// Create an encrypted backup sealed with a **passphrase-derived local key**,
+/// embedding the `kdf` descriptor (salt + Argon2id params) in the manifest so
+/// the archive is self-describing and restorable on any machine with only the
+/// passphrase. Used by the offline-first path where no sync key is enrolled;
+/// the sealing itself reuses the same AEAD snapshot envelope as [`export_backup`].
+pub fn export_backup_with_kdf(
+    db: &Database,
+    data_dir: &Path,
+    output_path: &Path,
+    key: &SyncKey,
+    kdf: BackupKdf,
+) -> Result<(), ExportError> {
+    write_backup(db, data_dir, output_path, Some(key), Some(kdf))
+}
+
+/// Shared backup writer. `kdf` is recorded in the manifest for passphrase-sealed
+/// archives (portability), and is `None` for plaintext or sync-key backups.
+fn write_backup(
+    db: &Database,
+    data_dir: &Path,
+    output_path: &Path,
+    key: Option<&SyncKey>,
+    kdf: Option<BackupKdf>,
 ) -> Result<(), ExportError> {
     let data = LibraryIo::new(db).export_library()?;
     let library_json = serde_json::to_string_pretty(&data)?;
@@ -101,6 +128,7 @@ pub fn export_backup(
         counts,
         encrypted,
         envelope,
+        kdf,
     };
     zip.start_file("manifest.json", options)?;
     zip.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;

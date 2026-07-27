@@ -154,3 +154,36 @@ toku export backup   # canonical, portable ZIP archive of your library
 
 Keep at least one offline backup. Combined with your Emergency Kit, that is everything you
 need to recover from any single loss.
+
+## Encrypted backups without sync (backup passphrase)
+
+You do **not** need a sync account to encrypt a backup. On a device that has never enrolled
+in sync, add `--encrypt`:
+
+```sh
+toku export backup --encrypt --output library.enc.zip
+```
+
+Toku prompts for a **backup passphrase** (entered twice to confirm), derives a key from it
+with Argon2id, and seals the archive with AES-256-GCM. For automation you can supply the
+passphrase via the `TOKU_BACKUP_PASSPHRASE` environment variable instead of the prompt.
+
+The archive is **self-describing**: the key-derivation salt and parameters are stored inside
+it, so it restores on **any** machine with only the passphrase — no `config.toml`, no sync
+account, nothing else to carry:
+
+```sh
+toku import backup library.enc.zip           # prompts for the same passphrase
+TOKU_BACKUP_PASSPHRASE=… toku import backup library.enc.zip   # non-interactive
+```
+
+If a sync server **is** configured, `--encrypt` keeps using your enrolled library key exactly
+as before; the passphrase path is only the fallback for offline-only users. On restore Toku
+detects which kind of encrypted backup it is from the archive itself.
+
+> **⚠️ Lose the passphrase and the backup is gone.** A passphrase-encrypted backup has **no
+> backdoor and no reset** — the same zero-knowledge stance as the Secret Key. If you forget
+> the passphrase, that archive is permanently unrecoverable. Write the passphrase down and
+> store it offline (a password manager, a safe), separate from the backup itself. A wrong
+> passphrase on restore fails cleanly ("could not decrypt backup") and never corrupts your
+> current library.

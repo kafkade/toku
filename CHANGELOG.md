@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the archive with your library data key (AES-256-GCM); `toku import backup`
   transparently decrypts it. Unencrypted plaintext remains the default offline
   artifact (#200)
+- Encrypted backups now work **without sync**. If you have never enrolled in
+  sync, `toku export backup --encrypt` prompts for a passphrase (or reads
+  `TOKU_BACKUP_PASSPHRASE`), derives a key with Argon2id, and seals the archive
+  with AES-256-GCM. The archive is **self-describing** — the key-derivation salt
+  and parameters travel inside it — so `toku import backup` restores it on any
+  machine with just the passphrase, no config or sync account required. Sync
+  users are unaffected: with a server configured, `--encrypt` still uses your
+  enrolled library key. **Losing the passphrase makes the backup
+  unrecoverable — there is no backdoor** (#204)
 
 - Opting into sync now uploads the library you already have. On `toku sync signup` (and on a
   `toku sync enroll` that creates a fresh library), Toku backfills your existing books,

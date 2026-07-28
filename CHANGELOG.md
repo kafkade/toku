@@ -85,6 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Sync error messages now point at the right command. When sync isn't set up, when your
+  device has no auth token, after `toku sync disable`, or when a library key hasn't been
+  unlocked, Toku now tells you to run `toku sync signup`, `toku sync login`, or
+  `toku sync enroll` — whichever actually fits your situation — instead of the deprecated
+  `toku sync init`. The web dashboard's sync page says the same thing. `toku sync init`
+  still works and still prints its deprecation notice; only the guidance text changed (#221)
+
 - Sync now propagates ordinary edits incrementally. Every create/update/delete on a
   syncable entity (books, reading sessions, progress, and tags) now stages a sync op
   atomically with the write, in a single choke-point in the persistence layer, so all

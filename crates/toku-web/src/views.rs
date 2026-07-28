@@ -59,7 +59,7 @@ pub fn sync_page(o: &SyncOverview) -> Markup {
         @if !o.configured {
             div.conflict-empty {
                 p { "Sync is not configured on this device." }
-                p.muted { "Set up sync from the command line (" code { "toku sync init" } ") or a native app. The web dashboard is a read-only companion." }
+                p.muted { "Set up sync from the command line (" code { "toku sync signup" } " or " code { "toku sync enroll" } ") or a native app. The web dashboard is a read-only companion." }
             }
         } @else {
             div.sync-card {

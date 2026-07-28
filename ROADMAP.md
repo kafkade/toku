@@ -453,7 +453,7 @@ Rejected alternatives:
 | JSON (full) | Backup, programmatic access | **MVP** | 🟢 |
 | CSV | Spreadsheet users | **MVP** | 🟢 |
 | Markdown | Blog posts, reading lists | Phase 2 | 🟢 |
-| ZIP backup (canonical) | Full backup/migration | ✅ Shipped (#200) | 🟡 |
+| ZIP backup (canonical) | Full backup/migration | Phase 2 ✅ (#200) | 🟡 |
 | BibTeX | Academic citations | Phase 3 | 🟡 |
 | OPDS | E-reader catalog | Phase 6 | 🟢 |
 | HTML | Static reading list site | Phase 3 | 🟡 |
@@ -767,13 +767,18 @@ File management lives in a new `toku-files` crate that depends on `toku-core` an
 - Apple Books: annotations in `~/Library/Containers/com.apple.iBooksX/` `[Validation Required]`.
 - Phase: Post-1.0 research. High value but each reader is a separate integration effort.
 
-### 7.5 — Self-Hosted Sync Server 🔴
+### 7.5 — Self-Hosted Sync Server 🟡
 
-- Deferred to Phase 7. See ADR-010 for the current architecture decision.
-- Immich-style self-hostable Docker image with first-run admin onboarding, real user
-  accounts, and 1Password-style two-secret SRP authentication.
-- Mandatory zero-knowledge E2E encryption — no plaintext mode for hosted sync.
-- Axum server with REST API (op-log wire protocol from ADR-008 retained).
+- **Shipped (Phase 7)**: the `toku-sync` Axum server with a REST API (op-log wire protocol from
+  ADR-008 retained), mandatory zero-knowledge E2E encryption — no plaintext mode for hosted sync —
+  and 1Password-style two-secret SRP authentication (ADR-010). Immich-style self-hostable Docker
+  image (`ghcr.io/kafkade/toku-sync`) with first-run admin onboarding and real user accounts,
+  op-log emission on every mutation (#194), and new-device bootstrap (#199).
+- Optional managed-tier controls for operators running a shared instance — per-user quotas,
+  per-user rate limiting, admin-scoped encrypted backup, and signup email verification — are off
+  by default and preserve the zero-knowledge guarantee (#206).
+- **Remaining (why still 🟡)**: genuine multi-device client integration — the iOS, macOS, web, and
+  Windows apps actually syncing between each other end-to-end (the CLI already does).
 - cr-sqlite kept as a research alternative if it matures for iOS/WASM.
 
 ---

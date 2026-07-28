@@ -92,7 +92,7 @@ pub async fn serve_opds(
     port: u16,
     auth: Option<OpdsConfig>,
 ) -> Result<(), WebError> {
-    Database::open(&db_path)
+    Database::open_default(&db_path)
         .map_err(|e| WebError::Internal(format!("failed to open database: {e}")))?;
 
     let covers_dir = db_path
@@ -352,7 +352,7 @@ async fn search_feed(
         let db_path = state.db_path.clone();
         let q = query.clone();
         let ids = tokio::task::spawn_blocking(move || -> Result<Vec<String>, WebError> {
-            let db = Database::open_no_migrate(&db_path)?;
+            let db = Database::open_no_migrate_default(&db_path)?;
             let repo = BookRepository::new(&db);
             Ok(repo
                 .search_books_filtered(&q, None, None, None)?
@@ -396,7 +396,7 @@ async fn download(
     let db_path = state.db_path.clone();
 
     let file = tokio::task::spawn_blocking(move || -> Result<Option<EbookFile>, WebError> {
-        let db = Database::open_no_migrate(&db_path)?;
+        let db = Database::open_no_migrate_default(&db_path)?;
         let repo = FileRepository::new(&db);
         repo.get_file(&id)
             .map_err(|e| WebError::Internal(e.to_string()))
@@ -471,7 +471,7 @@ async fn load_bundles(db_path: &std::path::Path) -> Result<Vec<BookBundle>, WebE
 }
 
 fn gather_bundles(db_path: &std::path::Path) -> Result<Vec<BookBundle>, WebError> {
-    let db = Database::open_no_migrate(db_path)?;
+    let db = Database::open_no_migrate_default(db_path)?;
     let repo = BookRepository::new(&db);
     let file_repo = FileRepository::new(&db);
 

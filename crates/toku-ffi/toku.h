@@ -69,6 +69,29 @@ const char *toku_last_error(void);
 enum TokuStatus toku_open(const char *path, struct TokuDb **out);
 
 /**
+ * Open (or create) an **encrypted** Toku database at `path`, unlocking it with
+ * a raw 256-bit key.
+ *
+ * `key` must point to exactly 32 bytes (the Argon2id-derived key; the caller
+ * derives it from the user's passphrase). On success, writes a handle to
+ * `*out`. The caller must eventually call `toku_close`. A wrong key fails
+ * cleanly with `TokuStatus::ErrorDb` (see `toku_last_error`), never a crash.
+ *
+ * This function is only functional in builds compiled with the `sqlcipher`
+ * feature; otherwise it returns `TokuStatus::ErrorDb` with an explanatory
+ * message. `toku_open` is unaffected and continues to open plaintext databases.
+ *
+ * # Safety
+ * - `path` must be a valid NUL-terminated UTF-8 string.
+ * - `key` must point to `key_len` readable bytes.
+ * - `out` must be a valid pointer to a `*mut TokuDb`.
+ */
+enum TokuStatus toku_open_encrypted(const char *path,
+                                    const uint8_t *key,
+                                    uintptr_t key_len,
+                                    struct TokuDb **out);
+
+/**
  * Close a Toku database handle and free its resources.
  * After this call, the handle must not be used. Passing null is a safe no-op.
  *

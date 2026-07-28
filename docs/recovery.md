@@ -187,3 +187,43 @@ detects which kind of encrypted backup it is from the archive itself.
 > store it offline (a password manager, a safe), separate from the backup itself. A wrong
 > passphrase on restore fails cleanly ("could not decrypt backup") and never corrupts your
 > current library.
+
+## At-rest database encryption (lost passphrase = unrecoverable)
+
+Separate from backups, you can encrypt the **live** `toku.db` itself with SQLCipher (ADR-016,
+issue #225). This is **opt-in and off by default**; the default plaintext database is unchanged.
+It is available only in builds compiled with the `toku-db` `sqlcipher` feature.
+
+```bash
+toku db status            # is the database encrypted?
+toku db encrypt           # encrypt in place (prompts for a new passphrase, twice)
+toku db encrypt --remember  # also cache the passphrase in the OS keychain (opt-in)
+toku db decrypt           # revert to a plaintext database
+toku db forget            # drop any keychain-cached passphrase
+```
+
+Your passphrase is stretched with Argon2id (m=64 MiB, t=3, p=1) into a 256-bit key that unlocks
+the database. **Toku never stores the passphrase or the derived key** — only the KDF salt,
+parameters, and a verifier live in `config.toml`'s `[encryption]` section.
+
+> **⚠️ Lose the passphrase and the database is gone.** At-rest encryption has **no backdoor and
+> no reset** — the same zero-knowledge stance as the Secret Key and encrypted backups. If you
+> forget the passphrase there is **no way**, for you or anyone else, to recover the data in that
+> `toku.db`. Write the passphrase down and store it offline (a password manager, a safe),
+> separate from the device. A wrong passphrase fails cleanly ("incorrect passphrase or not an
+> encrypted Toku database") and never corrupts the file.
+
+Providing the passphrase to short-lived CLI commands, in order of precedence:
+
+1. **`TOKU_DB_PASSPHRASE` environment variable** (opt-in). Convenient for automation, but the
+   **weakest** option: it can leak through `ps`, shell history, and CI logs. Use only where those
+   risks are acceptable.
+2. **OS keychain** (opt-in, via `toku db encrypt --remember`). The stronger convenience option —
+   the passphrase is stored by the OS secret store, never in a plaintext file next to the
+   database. Honors `TOKU_DISABLE_KEYCHAIN` / `TOKU_TOKEN_STORE=file`.
+3. **Interactive prompt** (the baseline). If neither of the above is present, Toku prompts (up to
+   three attempts).
+
+Because the encryption is opt-in, the recoverability rules above stack: OS full-disk encryption
+still protects a plaintext database, and encrypted backups (`toku export backup --encrypt`) remain
+a separate, portable safety net regardless of whether the live database is encrypted.

@@ -32,7 +32,7 @@ pub async fn conflicts_page(
     let db_path = state.db_path.clone();
 
     let conflicts = tokio::task::spawn_blocking(move || {
-        let db = Database::open_no_migrate(&db_path)?;
+        let db = Database::open_no_migrate_default(&db_path)?;
         SyncRepository::new(&db).list_unresolved_conflicts()
     })
     .await
@@ -57,7 +57,7 @@ pub async fn resolve_conflict(
     if form.keep == "custom" {
         let value = form.value.unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let db = Database::open(&db_path)?;
+            let db = Database::open_default(&db_path)?;
             SyncRepository::new(&db).resolve_conflict_with_value(&id, Some(&value))
         })
         .await
@@ -67,7 +67,7 @@ pub async fn resolve_conflict(
 
     let keep = parse_keep(&form.keep)?;
     tokio::task::spawn_blocking(move || {
-        let db = Database::open(&db_path)?;
+        let db = Database::open_default(&db_path)?;
         SyncRepository::new(&db).resolve_conflict(&id, keep)
     })
     .await
@@ -85,7 +85,7 @@ pub async fn resolve_all_conflicts(
     let db_path = state.db_path.clone();
 
     tokio::task::spawn_blocking(move || {
-        let db = Database::open(&db_path)?;
+        let db = Database::open_default(&db_path)?;
         SyncRepository::new(&db).resolve_all_conflicts(keep)
     })
     .await

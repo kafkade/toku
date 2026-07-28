@@ -164,7 +164,7 @@ fn gather_library(
     sort: &str,
     page: usize,
 ) -> Result<(Vec<BookCard>, usize, Vec<TagCount>), WebError> {
-    let db = Database::open_no_migrate(db_path)?;
+    let db = Database::open_no_migrate_default(db_path)?;
     let repo = BookRepository::new(&db);
 
     let mut books = match tag {
@@ -233,7 +233,7 @@ fn gather_book_detail(db_path: &std::path::Path, id_str: &str) -> Result<BookDet
     let id =
         uuid::Uuid::parse_str(id_str).map_err(|_| WebError::NotFound("invalid book ID".into()))?;
 
-    let db = Database::open_no_migrate(db_path)?;
+    let db = Database::open_no_migrate_default(db_path)?;
     let repo = BookRepository::new(&db);
 
     let book = repo
@@ -261,7 +261,7 @@ fn gather_search(
     status: Option<&str>,
     tag: Option<&str>,
 ) -> Result<(Vec<BookCard>, Vec<TagCount>), WebError> {
-    let db = Database::open_no_migrate(db_path)?;
+    let db = Database::open_no_migrate_default(db_path)?;
     let repo = BookRepository::new(&db);
 
     let books = match q {

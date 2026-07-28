@@ -71,6 +71,7 @@ pub struct TokenStore {
 const KEYRING_SERVICE: &str = "toku-sync";
 const KEYRING_SERVICE_SYNCKEY: &str = "toku-sync-key";
 const KEYRING_SERVICE_USER: &str = "toku-sync-user";
+const KEYRING_SERVICE_DB_PASSPHRASE: &str = "toku-db-passphrase";
 
 impl TokenStore {
     pub fn new(data_dir: &Path) -> Self {
@@ -223,6 +224,59 @@ impl TokenStore {
 
         let _ = self.delete_file(&format!("{key}:usersession_expires"));
         self.delete_file(&format!("{key}:usersession"))
+    }
+
+    /// Store the local **DB unlock passphrase** in the OS keychain (opt-in
+    /// convenience for at-rest DB encryption, ADR-016 D4).
+    ///
+    /// Keychain-only: unlike sync tokens, this **never** falls back to the local
+    /// file store — writing the DB passphrase to a plaintext file next to the
+    /// encrypted database would defeat the purpose. Keyed by the data directory
+    /// so multiple libraries don't collide. Fails if no OS keychain is available
+    /// or if the keychain is disabled by env.
+    pub fn store_db_passphrase(&self, passphrase: &str) -> anyhow::Result<()> {
+        if keychain_disabled() {
+            anyhow::bail!("OS keychain is disabled; cannot cache the DB passphrase");
+        }
+        ensure_keyring_store();
+        let key = self.db_passphrase_key();
+        let entry = keyring_core::Entry::new(KEYRING_SERVICE_DB_PASSPHRASE, &key)
+            .map_err(|e| anyhow::anyhow!("OS keychain unavailable: {e}"))?;
+        entry
+            .set_password(passphrase)
+            .map_err(|e| anyhow::anyhow!("could not store DB passphrase in keychain: {e}"))?;
+        Ok(())
+    }
+
+    /// Load the cached DB unlock passphrase from the OS keychain, if present.
+    /// Keychain-only; returns `None` when absent, disabled, or unavailable.
+    pub fn load_db_passphrase(&self) -> Option<String> {
+        if keychain_disabled() {
+            return None;
+        }
+        ensure_keyring_store();
+        let key = self.db_passphrase_key();
+        let entry = keyring_core::Entry::new(KEYRING_SERVICE_DB_PASSPHRASE, &key).ok()?;
+        entry.get_password().ok()
+    }
+
+    /// Remove the cached DB passphrase from the OS keychain (no-op if absent).
+    pub fn forget_db_passphrase(&self) -> anyhow::Result<()> {
+        if keychain_disabled() {
+            return Ok(());
+        }
+        ensure_keyring_store();
+        let key = self.db_passphrase_key();
+        if let Ok(entry) = keyring_core::Entry::new(KEYRING_SERVICE_DB_PASSPHRASE, &key) {
+            let _ = entry.delete_credential();
+        }
+        Ok(())
+    }
+
+    /// Keychain entry key for the DB passphrase, derived from the data directory
+    /// so distinct libraries have distinct cached passphrases.
+    fn db_passphrase_key(&self) -> String {
+        self.data_dir.to_string_lossy().to_string()
     }
 
     /// Store the derived sync encryption key in the OS keychain.

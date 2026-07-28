@@ -176,6 +176,29 @@ jobs:
             -destination 'generic/platform=watchOS Simulator' \
             -configuration Debug build CODE_SIGNING_ALLOWED=NO EXCLUDED_ARCHS=x86_64
 
+  # ── At-rest encryption (SQLCipher) ────────────────────────────────────────────
+  # Proves the off-by-default `sqlcipher` feature (ADR-016) still compiles and its
+  # keyed-open / migration tests pass. Deliberately NON-gating: it is intentionally
+  # omitted from the `validate` job's `needs` list so the "Validate" required status
+  # check — and therefore kafkade/github-infra → repo_toku.tf — is unchanged. The
+  # feature bundles SQLCipher + vendored OpenSSL, which is the biggest cross-compile
+  # hazard in the tree; keeping this leg off the gate avoids blocking PRs on it.
+  sqlcipher:
+    name: SQLCipher feature (toku-db)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sqlcipher
+      - run: cargo clippy -p toku-db --features sqlcipher --all-targets -- -D warnings
+      - run: cargo test -p toku-db --features sqlcipher
+
   # ── Summary gate ──────────────────────────────────────────────────────────────
   # Single required status check for branch protection. Downstream jobs may be
   # skipped (path filters) — that is OK; only failures or cancellations block.

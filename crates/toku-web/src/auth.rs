@@ -436,7 +436,7 @@ pub fn delete_session(db_path: &Path, token: &str) -> Result<(), String> {
 }
 
 fn open(db_path: &Path) -> Result<toku_db::Database, String> {
-    toku_db::Database::open_no_migrate(db_path).map_err(|e| e.to_string())
+    toku_db::Database::open_no_migrate_default(db_path).map_err(|e| e.to_string())
 }
 
 // ── Cookie builders ──────────────────────────────────────────────────────────

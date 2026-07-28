@@ -40,6 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   users are unaffected: with a server configured, `--encrypt` still uses your
   enrolled library key. **Losing the passphrase makes the backup
   unrecoverable — there is no backdoor** (#204)
+- Optional at-rest database encryption (ADR-016). Builds compiled with the
+  `toku-db` `sqlcipher` feature can encrypt the live `toku.db` in place with
+  SQLCipher via a new `toku db` command group: `toku db encrypt` (prompts for a
+  new passphrase and keeps a verified plaintext backup until the swap is
+  confirmed), `toku db decrypt`, `toku db status`, and `toku db forget`. The
+  passphrase is stretched with Argon2id (m=64 MiB, t=3, p=1) into a 256-bit key;
+  Toku stores **only** the salt, KDF parameters, and a verifier in
+  `config.toml`'s `[encryption]` section — never the passphrase or derived key.
+  Short-lived CLI commands obtain the key from (in order) the opt-in
+  `TOKU_DB_PASSPHRASE` env var, an opt-in OS-keychain cache
+  (`toku db encrypt --remember`), or an interactive prompt. Encryption is
+  **opt-in and off by default**; the default plaintext path — and any build
+  without the `sqlcipher` feature — is byte-for-byte unchanged. A new
+  `toku_open_encrypted` C FFI entry point is added for the native apps
+  (`toku_open` is unchanged). **Losing the passphrase makes the database
+  unrecoverable — there is no backdoor** (#225)
 
 - Opting into sync now uploads the library you already have. On `toku sync signup` (and on a
   `toku sync enroll` that creates a fresh library), Toku backfills your existing books,

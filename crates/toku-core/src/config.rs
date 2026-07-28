@@ -20,6 +20,9 @@ pub struct TokuConfig {
     pub files: FilesConfig,
     /// OPDS server configuration (optional HTTP Basic auth).
     pub opds: OpdsConfig,
+    /// At-rest database encryption configuration (optional — absent until
+    /// `toku db encrypt`). Present only when the DB is SQLCipher-encrypted.
+    pub encryption: Option<EncryptionConfig>,
 }
 
 /// OPDS server configuration stored in `config.toml` under `[opds]`.
@@ -151,6 +154,30 @@ impl Default for FilesConfig {
     }
 }
 
+/// At-rest database encryption configuration stored in `config.toml` under
+/// `[encryption]`.
+///
+/// Present only when the local `toku.db` is SQLCipher-encrypted (`toku db
+/// encrypt`). It records **only** the KDF salt, Argon2id parameters, and a
+/// verifier token — never the passphrase or the derived key. The verifier lets
+/// the CLI reject a wrong passphrase before touching the database.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncryptionConfig {
+    /// Whether at-rest encryption is enabled for the local database.
+    pub enabled: bool,
+    /// Base64-encoded 128-bit Argon2id salt.
+    pub salt: String,
+    /// Argon2id memory cost in KiB.
+    pub m_cost: u32,
+    /// Argon2id time cost (iterations).
+    pub t_cost: u32,
+    /// Argon2id parallelism.
+    pub p_cost: u32,
+    /// Verifier token: `base64(nonce || AES-256-GCM(key, constant))`. Proves a
+    /// passphrase matches without persisting the key.
+    pub verifier: String,
+}
+
 /// Sync configuration stored in `config.toml` under `[sync]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncConfig {
@@ -175,6 +202,7 @@ impl Default for TokuConfig {
             sync: None,
             files: FilesConfig::default(),
             opds: OpdsConfig::default(),
+            encryption: None,
         }
     }
 }
@@ -246,6 +274,7 @@ mod tests {
             sync: None,
             files: FilesConfig::default(),
             opds: OpdsConfig::default(),
+            encryption: None,
         };
         cfg.save(&dir).expect("save should succeed");
 
@@ -253,6 +282,31 @@ mod tests {
         assert_eq!(loaded, cfg);
 
         // Clean up
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encryption_config_roundtrips_through_toml() {
+        let dir = std::env::temp_dir().join("toku-test-config-encryption");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cfg = TokuConfig {
+            encryption: Some(EncryptionConfig {
+                enabled: true,
+                salt: "c2FsdHNhbHRzYWx0c2E=".to_string(),
+                m_cost: 65536,
+                t_cost: 3,
+                p_cost: 1,
+                verifier: "dmVyaWZpZXI=".to_string(),
+            }),
+            ..TokuConfig::default()
+        };
+        cfg.save(&dir).expect("save should succeed");
+
+        let loaded = TokuConfig::load(&dir).expect("load should succeed");
+        assert_eq!(loaded, cfg);
+        assert!(loaded.encryption.is_some());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

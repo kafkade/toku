@@ -7,6 +7,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Passthrough: enable at-rest DB encryption support (ADR-016). OFF by default.
+sqlcipher = ["toku-db/sqlcipher"]
+
 [dependencies]
 toku-core.workspace = true
 toku-db.workspace = true

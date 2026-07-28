@@ -11,6 +11,12 @@ repository.workspace = true
 name = "toku"
 path = "src/main.rs"
 
+[features]
+# Opt-in at-rest DB encryption via SQLCipher (ADR-016). OFF by default; enables
+# the `toku db encrypt/decrypt/status` commands and keyed opens across the CLI,
+# the embedded web server, and the sync client.
+sqlcipher = ["toku-db/sqlcipher", "toku-web/sqlcipher", "toku-sync-client/sqlcipher"]
+
 [dependencies]
 toku-core.workspace = true
 toku-db.workspace = true

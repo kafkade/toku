@@ -31,8 +31,8 @@ use toku_core::{
     ReadingStatus, SyncOp, TagType,
 };
 use toku_db::{BookRepository, Database, MergeEngine, SyncRepository};
-use toku_sync::build_router;
 use toku_sync::db::SyncDatabase;
+use toku_sync::{ManagedRuntime, build_router_with};
 use uuid::Uuid;
 
 /// Ensure the token store never touches the OS keychain during tests.
@@ -66,6 +66,12 @@ pub struct TestServer {
 impl TestServer {
     /// Start a fresh server with an empty, migrated database.
     pub fn start() -> Self {
+        Self::start_managed(ManagedRuntime::default())
+    }
+
+    /// Start a fresh server with an explicit [`ManagedRuntime`] (managed-tier
+    /// capabilities such as a capturing mailer or per-user rate limiter).
+    pub fn start_managed(managed: ManagedRuntime) -> Self {
         let tempdir = tempfile::tempdir().expect("create server temp dir");
         let db_path = tempdir.path().join("server.db");
 
@@ -84,7 +90,7 @@ impl TestServer {
             .expect("bind loopback listener");
         let addr = listener.local_addr().expect("read local addr");
 
-        let router = build_router(db_path);
+        let router = build_router_with(db_path, managed);
         runtime.spawn(async move {
             axum::serve(listener, router).await.expect("serve");
         });

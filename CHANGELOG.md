@@ -55,6 +55,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `toku sync login` after approval. A new `toku sync bootstrap [--reset-cursor]` command
   exposes the same restore path for manual re-provisioning and recovery. Your local SQLite
   database remains the primary recovery (#199)
+- Managed-tier controls for operators running a shared or public `toku-sync` relay. Every
+  control is **off by default**, so a self-hosted or offline relay is completely unchanged
+  until you opt in, and the **zero-knowledge** guarantee is preserved throughout — the server
+  still only ever stores client-encrypted ciphertext. New capabilities (all #206, ADR-014):
+  - **Per-account storage quotas.** Cap how much stored ciphertext (bytes) and how many ops
+    each account may accumulate, via `--default-max-user-bytes` / `--default-max-user-ops`
+    (instance-wide) with an optional per-account override in the `user_quota` table. A push or
+    snapshot that would exceed the ceiling is rejected with HTTP `413`; quotas are measured
+    from ciphertext sizes and counts only, never content. Unowned libraries (the classic
+    self-host case) are always exempt.
+  - **Per-account rate limiting.** An authenticated-user request ceiling
+    (`--per-user-rate-max` within `--per-user-rate-window-secs`) layered above the existing
+    per-IP and global limiters, returning HTTP `429` when tripped. Disabled by default
+    (`--per-user-rate-max 0`).
+  - **Per-account encrypted backup & restore.** Admin-scoped
+    `GET /api/v1/admin/users/{id}/backup` exports a JSON bundle of one account's ciphertext
+    ops and snapshots plus opaque library metadata, and
+    `POST /api/v1/admin/users/{id}/backup/restore` re-ingests it idempotently. The bundle
+    contains **no** plaintext and **no** key material — the backup is ciphertext-only, so
+    zero-knowledge holds end-to-end.
+  - **Self-serve signup email verification.** Optionally require new (non-admin) signups to
+    confirm their email before they can obtain a session
+    (`--require-email-verification`, with `--smtp-url` / `--smtp-from` / `--public-base-url`
+    for delivery). New endpoints `POST /api/v1/account/verify-email` and
+    `POST /api/v1/account/resend-verification` (velocity-capped) complete the flow. The first
+    admin account is always auto-verified, and with verification off the signup flow is
+    identical to before.
 
 ### Changed
 

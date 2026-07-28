@@ -26,7 +26,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use axum::Json;
-use axum::extract::{FromRequestParts, Request, State};
+use axum::extract::{Extension, FromRequestParts, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::middleware::Next;
@@ -34,12 +34,16 @@ use axum::response::Response;
 use sha2::{Digest, Sha256};
 use srp::ServerG2048;
 
+use rusqlite::OptionalExtension;
+
 use crate::db::SyncDatabase;
 use crate::error::SyncError;
+use crate::managed::ManagedRuntime;
 use crate::models::{
     AccountChallengeRequest, AccountChallengeResponse, AccountVerifyRequest, AccountVerifyResponse,
-    EnrollRequest, EnrollResponse, SignupRequest, SignupResponse, SrpChallengeRequest,
-    SrpChallengeResponse, SrpVerifyRequest, SrpVerifyResponse,
+    EnrollRequest, EnrollResponse, ResendVerificationRequest, SignupRequest, SignupResponse,
+    SrpChallengeRequest, SrpChallengeResponse, SrpVerifyRequest, SrpVerifyResponse,
+    VerifyEmailRequest, VerifyEmailResponse,
 };
 
 /// Maximum failed login attempts before account lockout.
@@ -56,6 +60,10 @@ const SESSION_TTL_HOURS: i64 = 24;
 pub struct AuthDevice {
     pub device_id: String,
     pub library_id: String,
+    /// The account that owns this device's library, when the library has been
+    /// claimed by a user account. `None` for legacy unowned relay libraries
+    /// (self-hosted open-relay model), which are exempt from per-user controls.
+    pub user_id: Option<String>,
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for AuthDevice {
@@ -150,9 +158,10 @@ pub async fn require_auth(
             //    active devices may authenticate — a rejected/pending device
             //    (issue #120) is denied even if a stale session row lingers.
             let session = db.conn.query_row(
-                "SELECT s.device_id, s.library_id
+                "SELECT s.device_id, s.library_id, l.user_id
                  FROM sessions s
                  JOIN devices d ON d.device_id = s.device_id
+                 LEFT JOIN libraries l ON l.id = s.library_id
                  WHERE s.session_token_hash = ?1
                    AND s.expires_at > datetime('now')
                    AND d.status = 'active'",
@@ -161,6 +170,7 @@ pub async fn require_auth(
                     Ok(AuthDevice {
                         device_id: row.get(0)?,
                         library_id: row.get(1)?,
+                        user_id: row.get(2)?,
                     })
                 },
             );
@@ -176,13 +186,16 @@ pub async fn require_auth(
             let device = db
                 .conn
                 .query_row(
-                    "SELECT device_id, library_id
-                     FROM devices WHERE auth_token_hash = ?1 AND status = 'active'",
+                    "SELECT d.device_id, d.library_id, l.user_id
+                     FROM devices d
+                     LEFT JOIN libraries l ON l.id = d.library_id
+                     WHERE d.auth_token_hash = ?1 AND d.status = 'active'",
                     [&token_hash],
                     |row| {
                         Ok(AuthDevice {
                             device_id: row.get(0)?,
                             library_id: row.get(1)?,
+                            user_id: row.get(2)?,
                         })
                     },
                 )
@@ -812,6 +825,7 @@ fn validate_email(email: &str) -> Result<(), SyncError> {
 /// server never sees the password or Secret Key.
 pub async fn account_signup(
     State(db_path): State<PathBuf>,
+    Extension(managed): Extension<ManagedRuntime>,
     Json(req): Json<SignupRequest>,
 ) -> Result<Json<SignupResponse>, SyncError> {
     validate_email(&req.email)?;
@@ -821,6 +835,10 @@ pub async fn account_signup(
         .map_err(|_| SyncError::BadRequest("srp_verifier must be hex-encoded".into()))?;
 
     let user_id = uuid::Uuid::now_v7().to_string();
+    // Verification token is minted up front (cheap, CSPRNG) and only persisted +
+    // emailed when the instance requires verification for this account.
+    let verification_token = generate_token();
+    let verification_token_hash = sha256_hex(&verification_token);
 
     let resp = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
@@ -832,6 +850,7 @@ pub async fn account_signup(
         let account_public_key = req.account_public_key.clone();
         let kdf_params = req.kdf_params.clone();
         let wrapped_data_key = req.wrapped_data_key.clone();
+        let verification_token_hash = verification_token_hash.clone();
         move || -> Result<SignupResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
 
@@ -862,6 +881,19 @@ pub async fn account_signup(
                 "user"
             };
 
+            // Email verification (ADR-014 D4): gate only non-admin signups, and
+            // only when the instance opts in. The admin bootstrap is always
+            // verified so an operator can never lock themselves out.
+            let require_verification: i64 = tx_guard
+                .query_row(
+                    "SELECT require_email_verification FROM instance_config WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let needs_verification = require_verification == 1 && role == "user";
+            let email_verified: i64 = if needs_verification { 0 } else { 1 };
+
             // Reject duplicate emails with a clear 409.
             let email_taken: i64 = tx_guard.query_row(
                 "SELECT COUNT(*) FROM users WHERE email = ?1",
@@ -875,8 +907,9 @@ pub async fn account_signup(
             tx_guard.execute(
                 "INSERT INTO users
                  (id, email, srp_salt, srp_verifier, wrapped_private_key,
-                  account_public_key, kdf_params, wrapped_data_key, role, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', datetime('now'))",
+                  account_public_key, kdf_params, wrapped_data_key, role, status,
+                  email_verified, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'active', ?10, datetime('now'))",
                 rusqlite::params![
                     user_id,
                     email,
@@ -887,8 +920,18 @@ pub async fn account_signup(
                     kdf_params,
                     wrapped_data_key,
                     role,
+                    email_verified,
                 ],
             )?;
+
+            if needs_verification {
+                tx_guard.execute(
+                    "INSERT INTO email_verification_tokens
+                     (token_hash, user_id, expires_at, created_at)
+                     VALUES (?1, ?2, datetime('now', '+24 hours'), datetime('now'))",
+                    rusqlite::params![verification_token_hash, user_id],
+                )?;
+            }
 
             // First admin bootstrap: adopt any orphan relay libraries/devices
             // (registered under the old unauthenticated model, user_id IS NULL)
@@ -926,13 +969,205 @@ pub async fn account_signup(
                 role: role.to_string(),
                 adopted_libraries,
                 adopted_devices,
+                email_verification_required: needs_verification,
             })
         }
     })
     .await
     .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
 
+    // Deliver the verification link outside the DB transaction. Mail failures
+    // must not roll back a committed account; the user can re-request via
+    // `resend-verification`. The link carries only an opaque token — no library
+    // data — so the zero-knowledge boundary is untouched.
+    if resp.email_verification_required {
+        let verify_url = build_verify_url(managed.public_base_url.as_deref(), &verification_token);
+        let mailer = managed.mailer.clone();
+        let to = resp.email.clone();
+        let _ = tokio::task::spawn_blocking(move || mailer.send_verification(&to, &verify_url))
+            .await
+            .map_err(|e| SyncError::Internal(format!("task join error: {e}")))?
+            .map_err(|e| {
+                tracing::warn!(target: "toku_sync::mailer", error = %e, "verification email send failed");
+                e
+            });
+    }
+
     Ok(Json(resp))
+}
+
+/// Build the email-verification URL from the configured public base URL and an
+/// opaque token. When no base URL is configured (self-hosted / tests) the path
+/// is returned relative so the token is still recoverable from logs/captures.
+fn build_verify_url(public_base_url: Option<&str>, token: &str) -> String {
+    let base = public_base_url.unwrap_or("").trim_end_matches('/');
+    format!("{base}/api/v1/account/verify-email?token={token}")
+}
+
+/// `POST /api/v1/account/verify-email`
+///
+/// Confirm control of a signup email by presenting the one-time token delivered
+/// by [`account_signup`]. Marks the account verified and consumes the token.
+/// The token is account metadata only — this path never touches library data.
+pub async fn verify_email(
+    State(db_path): State<PathBuf>,
+    Json(req): Json<VerifyEmailRequest>,
+) -> Result<Json<VerifyEmailResponse>, SyncError> {
+    if req.token.trim().is_empty() {
+        return Err(SyncError::BadRequest("token is required".into()));
+    }
+    let token_hash = sha256_hex(&req.token);
+
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || -> Result<VerifyEmailResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+            let tx = db.conn.unchecked_transaction()?;
+
+            let row: Option<(String, bool)> = tx
+                .query_row(
+                    "SELECT user_id, expires_at < datetime('now')
+                     FROM email_verification_tokens WHERE token_hash = ?1",
+                    [&token_hash],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+
+            let (user_id, expired) =
+                row.ok_or_else(|| SyncError::BadRequest("invalid or expired token".into()))?;
+            if expired {
+                // Consume the stale token so it can't be probed further.
+                tx.execute(
+                    "DELETE FROM email_verification_tokens WHERE token_hash = ?1",
+                    [&token_hash],
+                )?;
+                tx.commit()?;
+                return Err(SyncError::BadRequest("invalid or expired token".into()));
+            }
+
+            tx.execute(
+                "UPDATE users SET email_verified = 1 WHERE id = ?1",
+                [&user_id],
+            )?;
+            // One account, one verification: drop every outstanding token.
+            tx.execute(
+                "DELETE FROM email_verification_tokens WHERE user_id = ?1",
+                [&user_id],
+            )?;
+
+            crate::security::audit(
+                &db,
+                "email.verify",
+                Some(&user_id),
+                Some(&user_id),
+                "success",
+                None,
+                None,
+            );
+            tx.commit()?;
+            Ok(VerifyEmailResponse { verified: true })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
+}
+
+/// Maximum verification emails per address inside [`RESEND_WINDOW_SECS`].
+const RESEND_MAX_PER_WINDOW: i64 = 3;
+/// Velocity window for `resend-verification`, in seconds (15 minutes).
+const RESEND_WINDOW_SECS: i64 = 900;
+
+/// `POST /api/v1/account/resend-verification`
+///
+/// Re-issue a verification email for an unverified account. Responds `202` for
+/// any well-formed email regardless of whether it maps to an account, so the
+/// endpoint never reveals which addresses are registered. Per-email velocity
+/// capped to blunt mail-flooding abuse.
+pub async fn resend_verification(
+    State(db_path): State<PathBuf>,
+    Extension(managed): Extension<ManagedRuntime>,
+    Json(req): Json<ResendVerificationRequest>,
+) -> Result<Json<VerifyEmailResponse>, SyncError> {
+    validate_email(&req.email)?;
+
+    let outcome = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let email = req.email.clone();
+        move || -> Result<Option<(String, String)>, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // Per-email velocity cap (anti-abuse, ADR-014 D4/D7). Counted from the
+            // audit log so it survives process restarts.
+            let recent: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_log
+                     WHERE event_type = 'email.resend' AND target = ?1
+                       AND ts > datetime('now', ?2)",
+                    rusqlite::params![email, format!("-{RESEND_WINDOW_SECS} seconds")],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if recent >= RESEND_MAX_PER_WINDOW {
+                return Err(SyncError::RateLimited {
+                    retry_after: format!("{RESEND_WINDOW_SECS}s"),
+                });
+            }
+
+            // Resolve the account without leaking existence to the caller.
+            let user: Option<(String, i64)> = db
+                .conn
+                .query_row(
+                    "SELECT id, email_verified FROM users WHERE email = ?1",
+                    [&email],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+
+            // Always record the attempt for the velocity cap.
+            crate::security::audit(
+                &db,
+                "email.resend",
+                None,
+                Some(&email),
+                "success",
+                None,
+                None,
+            );
+
+            match user {
+                // Unknown address or already-verified account: nothing to send,
+                // but we still return 202 to the caller.
+                None => Ok(None),
+                Some((_, verified)) if verified != 0 => Ok(None),
+                Some((user_id, _)) => {
+                    let token = generate_token();
+                    let token_hash = sha256_hex(&token);
+                    db.conn.execute(
+                        "INSERT INTO email_verification_tokens
+                         (token_hash, user_id, expires_at, created_at)
+                         VALUES (?1, ?2, datetime('now', '+24 hours'), datetime('now'))",
+                        rusqlite::params![token_hash, user_id],
+                    )?;
+                    Ok(Some((email, token)))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    if let Some((to, token)) = outcome {
+        let verify_url = build_verify_url(managed.public_base_url.as_deref(), &token);
+        let mailer = managed.mailer.clone();
+        let _ = tokio::task::spawn_blocking(move || mailer.send_verification(&to, &verify_url))
+            .await
+            .map_err(|e| SyncError::Internal(format!("task join error: {e}")))?;
+    }
+
+    Ok(Json(VerifyEmailResponse { verified: false }))
 }
 
 /// `POST /api/v1/account/challenge`
@@ -1122,7 +1357,7 @@ pub async fn account_verify(
                 return Err(SyncError::Unauthorized);
             }
 
-            let (email, srp_salt_hex, srp_verifier_hex, role, status, failed_attempts, locked_until): (
+            let (email, srp_salt_hex, srp_verifier_hex, role, status, failed_attempts, locked_until, email_verified): (
                 String,
                 String,
                 String,
@@ -1130,10 +1365,11 @@ pub async fn account_verify(
                 String,
                 i64,
                 Option<String>,
+                i64,
             ) = db
                 .conn
                 .query_row(
-                    "SELECT email, srp_salt, srp_verifier, role, status, failed_attempts, locked_until
+                    "SELECT email, srp_salt, srp_verifier, role, status, failed_attempts, locked_until, email_verified
                      FROM users WHERE id = ?1",
                     [&user_id],
                     |row| {
@@ -1145,6 +1381,7 @@ pub async fn account_verify(
                             row.get(4)?,
                             row.get(5)?,
                             row.get(6)?,
+                            row.get(7)?,
                         ))
                     },
                 )
@@ -1230,6 +1467,26 @@ pub async fn account_verify(
             }
 
             let m2_hex = hex::encode(server_verifier.proof());
+
+            // Email-verification gate (ADR-014 D4): only issue a session once the
+            // account has confirmed its address. Checked *after* the SRP proof so
+            // verification status never leaks to an unauthenticated caller.
+            // `email_verified` defaults to 1, so self-hosted and admin accounts
+            // pass unconditionally.
+            if email_verified == 0 {
+                crate::security::audit(
+                    &db,
+                    "login.failure",
+                    Some(&email),
+                    Some(&user_id),
+                    "failure",
+                    Some("email not verified"),
+                    None,
+                );
+                return Err(SyncError::Forbidden(
+                    "email address not verified; check your inbox or request a new link".into(),
+                ));
+            }
 
             let _ = db.conn.execute(
                 "UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?1",

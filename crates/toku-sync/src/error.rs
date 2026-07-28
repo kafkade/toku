@@ -32,6 +32,9 @@ pub enum SyncError {
     #[error("too many failed authentication attempts; retry after {retry_after}")]
     RateLimited { retry_after: String },
 
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
+
     #[error("account locked until {until}")]
     AccountLocked { until: String },
 
@@ -54,6 +57,7 @@ impl IntoResponse for SyncError {
             SyncError::PlaintextRejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             SyncError::Conflict(_) => StatusCode::CONFLICT,
             SyncError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            SyncError::QuotaExceeded(_) => StatusCode::PAYLOAD_TOO_LARGE,
             SyncError::AccountLocked { .. } => StatusCode::from_u16(423).unwrap(),
             SyncError::UpgradeRequired { .. } => StatusCode::UPGRADE_REQUIRED,
             SyncError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

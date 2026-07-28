@@ -2,18 +2,19 @@ use std::path::PathBuf;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use rusqlite::OptionalExtension;
 
 use crate::auth::{AuthDevice, AuthUser, generate_token, sha256_hex};
 use crate::db::SyncDatabase;
 use crate::error::SyncError;
 use crate::models::{
-    AccountDeviceListResponse, AccountDeviceSummary, AccountKeysResponse, DeviceApprovalRequest,
-    DeviceApprovalsConfigResponse, DeviceResponse, DeviceSessionResponse, DownloadSnapshotResponse,
-    EnrollDeviceRequest, EnrollDeviceResponse, HealthResponse, OpPayload, PullQuery, PullResponse,
-    PushRequest, PushResponse, RegisterRequest, RegisterResponse, RegistrationConfigResponse,
-    RekeyRequest, RekeyResponse, SetDeviceApprovalsRequest, SetRegistrationRequest,
-    SetUserStatusRequest, UploadSnapshotRequest, UploadSnapshotResponse, UserListResponse,
-    UserSummary,
+    AccountDeviceListResponse, AccountDeviceSummary, AccountKeysResponse, BackupLibrary, BackupOp,
+    BackupSnapshot, DeviceApprovalRequest, DeviceApprovalsConfigResponse, DeviceResponse,
+    DeviceSessionResponse, DownloadSnapshotResponse, EnrollDeviceRequest, EnrollDeviceResponse,
+    HealthResponse, OpPayload, PullQuery, PullResponse, PushRequest, PushResponse, RegisterRequest,
+    RegisterResponse, RegistrationConfigResponse, RekeyRequest, RekeyResponse,
+    RestoreBackupResponse, SetDeviceApprovalsRequest, SetRegistrationRequest, SetUserStatusRequest,
+    UploadSnapshotRequest, UploadSnapshotResponse, UserBackupBundle, UserListResponse, UserSummary,
 };
 
 const MAX_BATCH_SIZE: usize = 1000;
@@ -96,8 +97,108 @@ fn require_ciphertext_snapshot(snapshot_json: &str) -> Result<(), SyncError> {
     }
 }
 
-// ── Health ──────────────────────────────────────────────────────────────────
+// ── Per-user quotas (issue #206, ADR-014 D2) ─────────────────────────────────
 
+/// Resolve the effective storage/op ceilings for an account: a per-user
+/// `user_quota` override wins, else the instance-wide default, else unlimited
+/// (`None`). This is the ADR-014 D5 plan-lookup seam — it reads capability
+/// ceilings only, never any price or billing state.
+fn resolve_quota_ceilings(
+    conn: &rusqlite::Connection,
+    user_id: &str,
+) -> Result<(Option<i64>, Option<i64>), SyncError> {
+    let over: Option<(Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT max_bytes, max_ops FROM user_quota WHERE user_id = ?1",
+            [user_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (inst_bytes, inst_ops): (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT default_max_user_bytes, default_max_user_ops FROM instance_config WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((None, None));
+    let (ov_bytes, ov_ops) = over.unwrap_or((None, None));
+    Ok((ov_bytes.or(inst_bytes), ov_ops.or(inst_ops)))
+}
+
+/// Enforce per-account storage/op quotas before persisting new writes.
+///
+/// Zero-knowledge preserved: this reads only ciphertext **sizes** and **counts**
+/// keyed by ownership — never plaintext. Libraries with no owning account
+/// (legacy self-hosted open relay, `libraries.user_id IS NULL`) are exempt, so
+/// the default self-hosted relay is unaffected. `incoming_bytes` / `incoming_ops`
+/// are the size and count this request would add.
+fn enforce_user_quota(
+    conn: &rusqlite::Connection,
+    library_id: &str,
+    incoming_bytes: i64,
+    incoming_ops: i64,
+) -> Result<(), SyncError> {
+    // Resolve the owning account; unowned libraries are exempt.
+    let user_id: Option<String> = conn
+        .query_row(
+            "SELECT user_id FROM libraries WHERE id = ?1",
+            [library_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(user_id) = user_id else {
+        return Ok(());
+    };
+
+    let (max_bytes, max_ops) = resolve_quota_ceilings(conn, &user_id)?;
+    if max_bytes.is_none() && max_ops.is_none() {
+        return Ok(());
+    }
+
+    if let Some(limit) = max_bytes {
+        let ops_bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(o.payload)), 0)
+             FROM ops o JOIN libraries l ON l.id = o.library_id
+             WHERE l.user_id = ?1",
+            [&user_id],
+            |row| row.get(0),
+        )?;
+        let snap_bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(s.snapshot_json)), 0)
+             FROM snapshots s JOIN libraries l ON l.id = s.library_id
+             WHERE l.user_id = ?1",
+            [&user_id],
+            |row| row.get(0),
+        )?;
+        let used = ops_bytes + snap_bytes;
+        if used + incoming_bytes > limit {
+            return Err(SyncError::QuotaExceeded(format!(
+                "storage quota exceeded: {used} stored + {incoming_bytes} new bytes exceeds the {limit}-byte ceiling"
+            )));
+        }
+    }
+
+    if incoming_ops > 0
+        && let Some(limit) = max_ops
+    {
+        let used: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ops o JOIN libraries l ON l.id = o.library_id WHERE l.user_id = ?1",
+            [&user_id],
+            |row| row.get(0),
+        )?;
+        if used + incoming_ops > limit {
+            return Err(SyncError::QuotaExceeded(format!(
+                "op-count quota exceeded: {used} stored + {incoming_ops} new ops exceeds the {limit}-op ceiling"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+// ── Health ──────────────────────────────────────────────────────────────────
 pub async fn health(State(db_path): State<PathBuf>) -> Json<HealthResponse> {
     let min = SyncDatabase::open_no_migrate(&db_path)
         .map(|db| crate::protocol::min_protocol(&db))
@@ -868,6 +969,18 @@ pub async fn push_ops(
                 ));
             }
 
+            // Per-user storage/op quota (ADR-014 D2). Reads ciphertext sizes and
+            // counts only — ZK-safe. Unowned libraries are exempt.
+            let incoming_bytes: i64 = ops
+                .iter()
+                .map(|op| {
+                    serde_json::to_string(&op.payload)
+                        .map(|s| s.len() as i64)
+                        .unwrap_or(0)
+                })
+                .sum();
+            enforce_user_quota(&db.conn, &library_id, incoming_bytes, ops.len() as i64)?;
+
             let tx = db.conn.unchecked_transaction()?;
 
             let mut accepted = 0usize;
@@ -1093,6 +1206,11 @@ pub async fn upload_snapshot(
         let hlc = req.hlc_at_snapshot;
         move || -> Result<UploadSnapshotResponse, SyncError> {
             let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // Per-user storage quota (ADR-014 D2): count the snapshot ciphertext
+            // size. ZK-safe (size only); unowned libraries are exempt.
+            enforce_user_quota(&db.conn, &library_id, snapshot_json.len() as i64, 0)?;
+
             let tx = db.conn.unchecked_transaction()?;
 
             // Store the snapshot
@@ -1463,6 +1581,251 @@ pub async fn set_user_status(
     .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
 
     Ok(Json(summary))
+}
+
+/// `GET /api/v1/admin/users/{id}/backup` — export a per-user encrypted backup
+/// (admin only, ADR-014 D6).
+///
+/// Zero-knowledge preserved: the bundle carries only ciphertext (`ops.payload`,
+/// `snapshots.snapshot_json`) plus the opaque metadata the relay already stores
+/// in the clear (op ids, HLCs, device ids, library salts). No plaintext user
+/// content and no key material ever leave the relay.
+pub async fn admin_backup_user(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Path(target_id): Path<String>,
+) -> Result<Json<UserBackupBundle>, SyncError> {
+    require_admin(&user)?;
+
+    let bundle = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let target_id = target_id.clone();
+        move || -> Result<UserBackupBundle, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // Load the target account (404 if absent).
+            let email: String = db
+                .conn
+                .query_row("SELECT email FROM users WHERE id = ?1", [&target_id], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .ok_or_else(|| SyncError::NotFound(format!("user {target_id} not found")))?;
+
+            let mut lib_stmt = db.conn.prepare(
+                "SELECT id, salt, created_at FROM libraries WHERE user_id = ?1 ORDER BY created_at",
+            )?;
+            let libraries = lib_stmt
+                .query_map([&target_id], |row| {
+                    Ok(BackupLibrary {
+                        id: row.get(0)?,
+                        salt: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut op_stmt = db.conn.prepare(
+                "SELECT o.op_id, o.library_id, o.device_id, o.hlc, o.entity_type,
+                        o.entity_id, o.op_type, o.payload, o.received_at
+                 FROM ops o JOIN libraries l ON l.id = o.library_id
+                 WHERE l.user_id = ?1
+                 ORDER BY o.library_id, o.hlc",
+            )?;
+            let ops = op_stmt
+                .query_map([&target_id], |row| {
+                    Ok(BackupOp {
+                        op_id: row.get(0)?,
+                        library_id: row.get(1)?,
+                        device_id: row.get(2)?,
+                        hlc: row.get(3)?,
+                        entity_type: row.get(4)?,
+                        entity_id: row.get(5)?,
+                        op_type: row.get(6)?,
+                        payload: row.get(7)?,
+                        received_at: row.get(8)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut snap_stmt = db.conn.prepare(
+                "SELECT s.library_id, s.snapshot_json, s.hlc_at_snapshot,
+                        s.created_by_device, s.created_at
+                 FROM snapshots s JOIN libraries l ON l.id = s.library_id
+                 WHERE l.user_id = ?1
+                 ORDER BY s.library_id, s.created_at",
+            )?;
+            let snapshots = snap_stmt
+                .query_map([&target_id], |row| {
+                    Ok(BackupSnapshot {
+                        library_id: row.get(0)?,
+                        snapshot_json: row.get(1)?,
+                        hlc_at_snapshot: row.get(2)?,
+                        created_by_device: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            crate::security::audit(
+                &db,
+                "user.backup",
+                Some(&user.user_id),
+                Some(&target_id),
+                "success",
+                Some(&format!(
+                    "{} libraries, {} ops, {} snapshots",
+                    libraries.len(),
+                    ops.len(),
+                    snapshots.len()
+                )),
+                None,
+            );
+
+            let exported_at: String = db
+                .conn
+                .query_row("SELECT datetime('now')", [], |r| r.get(0))?;
+
+            Ok(UserBackupBundle {
+                version: 1,
+                user_id: target_id,
+                email,
+                exported_at,
+                libraries,
+                ops,
+                snapshots,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(bundle))
+}
+
+/// `POST /api/v1/admin/users/{id}/backup/restore` — restore a per-user encrypted
+/// backup (admin only, ADR-014 D6).
+///
+/// Idempotent: ops are re-inserted by `op_id` and snapshots by natural key, so
+/// re-running is a no-op. The bundle's `user_id` must match the path id, and
+/// libraries are (re)attached under that account. Ciphertext is written back
+/// verbatim — zero-knowledge preserved.
+pub async fn admin_restore_user(
+    State(db_path): State<PathBuf>,
+    user: AuthUser,
+    Path(target_id): Path<String>,
+    Json(bundle): Json<UserBackupBundle>,
+) -> Result<Json<RestoreBackupResponse>, SyncError> {
+    require_admin(&user)?;
+
+    if bundle.user_id != target_id {
+        return Err(SyncError::BadRequest(
+            "backup bundle user_id does not match the target account".into(),
+        ));
+    }
+
+    let resp = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        let target_id = target_id.clone();
+        let actor_id = user.user_id.clone();
+        move || -> Result<RestoreBackupResponse, SyncError> {
+            let db = SyncDatabase::open_no_migrate(&db_path)?;
+
+            // The target account must exist before we can attach libraries to it
+            // (FK libraries.user_id → users.id).
+            let exists: bool = db
+                .conn
+                .query_row("SELECT 1 FROM users WHERE id = ?1", [&target_id], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !exists {
+                return Err(SyncError::NotFound(format!("user {target_id} not found")));
+            }
+
+            let tx = db.conn.unchecked_transaction()?;
+
+            let mut libraries_restored = 0usize;
+            for lib in &bundle.libraries {
+                let changed = tx.execute(
+                    "INSERT INTO libraries (id, created_at, salt, user_id)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id",
+                    rusqlite::params![lib.id, lib.created_at, lib.salt, target_id],
+                )?;
+                libraries_restored += changed;
+            }
+
+            let mut ops_restored = 0usize;
+            for op in &bundle.ops {
+                let changed = tx.execute(
+                    "INSERT OR IGNORE INTO ops
+                       (op_id, library_id, device_id, hlc, entity_type,
+                        entity_id, op_type, payload, received_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        op.op_id,
+                        op.library_id,
+                        op.device_id,
+                        op.hlc,
+                        op.entity_type,
+                        op.entity_id,
+                        op.op_type,
+                        op.payload,
+                        op.received_at,
+                    ],
+                )?;
+                ops_restored += changed;
+            }
+
+            let mut snapshots_restored = 0usize;
+            for snap in &bundle.snapshots {
+                // Natural-key dedupe (snapshots.id is a synthetic autoincrement).
+                let changed = tx.execute(
+                    "INSERT INTO snapshots
+                       (library_id, snapshot_json, hlc_at_snapshot,
+                        created_by_device, created_at)
+                     SELECT ?1, ?2, ?3, ?4, ?5
+                     WHERE NOT EXISTS (
+                        SELECT 1 FROM snapshots
+                        WHERE library_id = ?1 AND hlc_at_snapshot = ?3
+                          AND created_by_device = ?4
+                     )",
+                    rusqlite::params![
+                        snap.library_id,
+                        snap.snapshot_json,
+                        snap.hlc_at_snapshot,
+                        snap.created_by_device,
+                        snap.created_at,
+                    ],
+                )?;
+                snapshots_restored += changed;
+            }
+
+            crate::security::audit(
+                &db,
+                "user.restore",
+                Some(&actor_id),
+                Some(&target_id),
+                "success",
+                Some(&format!(
+                    "{libraries_restored} libraries, {ops_restored} ops, {snapshots_restored} snapshots"
+                )),
+                None,
+            );
+
+            tx.commit()?;
+
+            Ok(RestoreBackupResponse {
+                libraries_restored,
+                ops_restored,
+                snapshots_restored,
+            })
+        }
+    })
+    .await
+    .map_err(|e| SyncError::Internal(format!("task join error: {e}")))??;
+
+    Ok(Json(resp))
 }
 
 /// `GET /api/v1/admin/registration` — read the open-registration flag (admin only).

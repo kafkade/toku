@@ -146,6 +146,8 @@ unauthenticated admin surface). The relevant endpoints are:
 | `GET/PUT /api/v1/admin/device-approvals` | Read / toggle the device-approval gate |
 | `GET /api/v1/admin/users` | List accounts |
 | `POST /api/v1/admin/users/{id}/status` | Enable / disable an account |
+| `GET /api/v1/admin/users/{id}/backup` | Export an account's ciphertext backup bundle (see [Managed-tier controls](#per-account-encrypted-backup--restore)) |
+| `POST /api/v1/admin/users/{id}/backup/restore` | Restore an account from a backup bundle |
 
 For example, to temporarily open self-registration so additional people can sign up
 (replace `$ADMIN_TOKEN` with your admin session token and close it again afterwards):
@@ -234,6 +236,90 @@ per-module filters (e.g. `RUST_LOG=toku_sync=debug,tower_http=debug`).
 
 > The container image defaults `TOKU_SYNC_DATA_DIR` to `/data`. When running the binary directly
 > (outside Docker) the default is `./toku-sync-data`.
+
+## Managed-tier controls
+
+For a shared, multi-tenant, or public instance you can enable a set of optional
+per-account controls (issue #206, [ADR-014](./adr/014-managed-multitenant-saas.md)).
+**Every control below is off by default**, so a single-user, self-hosted, or offline
+relay behaves exactly as it did before — you only opt in when you need them. None of
+these controls weaken the [zero-knowledge guarantee](#zero-knowledge-guarantee): the
+server still only ever stores and relays client-encrypted ciphertext.
+
+| Env variable | CLI flag | Default | Description |
+|--------------|----------|---------|-------------|
+| `TOKU_SYNC_DEFAULT_MAX_USER_BYTES` | `--default-max-user-bytes` | unset (unlimited) | Per-account stored-ciphertext ceiling, in bytes. |
+| `TOKU_SYNC_DEFAULT_MAX_USER_OPS` | `--default-max-user-ops` | unset (unlimited) | Per-account stored-op ceiling. |
+| `TOKU_SYNC_PER_USER_RATE_MAX` | `--per-user-rate-max` | `0` (disabled) | Max authenticated requests per account within the window. |
+| `TOKU_SYNC_PER_USER_RATE_WINDOW_SECS` | `--per-user-rate-window-secs` | `60` | Fixed-window length for the per-account rate limiter. |
+| `TOKU_SYNC_REQUIRE_EMAIL_VERIFICATION` | `--require-email-verification` | `false` | Require non-admin signups to confirm their email before login. |
+| `TOKU_SYNC_SMTP_URL` | `--smtp-url` | unset | SMTP relay URL for verification email, e.g. `smtps://smtp.example.com:465`. |
+| `TOKU_SYNC_SMTP_FROM` | `--smtp-from` | unset | `From:` address, e.g. `Toku <no-reply@example.com>`. |
+| `TOKU_SYNC_PUBLIC_BASE_URL` | `--public-base-url` | unset | Public base URL used to build verification links. |
+
+> **Fail-fast:** if `--require-email-verification` is set without `--smtp-url`,
+> `--smtp-from`, and `--public-base-url`, the server refuses to start. When SMTP is
+> unset but verification is off, no mail is sent.
+
+### Per-account storage quotas
+
+Cap how much stored ciphertext each account may accumulate. The instance-wide defaults
+(`--default-max-user-bytes` / `--default-max-user-ops`) apply to every **owned** account;
+a per-account override can be written to the `user_quota` entitlement table (the seam a
+future entitlement/plan lookup would populate — there is **no** pricing or billing logic
+here, only ceilings). A `push` or `snapshot` that would push an account over its ceiling
+is rejected with **HTTP 413 (Payload Too Large)** and nothing is persisted. Usage is
+computed from ciphertext **sizes and counts only** — the server never inspects content,
+so quotas do not touch the zero-knowledge boundary. Libraries with no owner (the classic
+self-hosted, account-less relay) are always exempt.
+
+### Per-account rate limiting
+
+`--per-user-rate-max` adds an authenticated request ceiling keyed on the account,
+layered **above** the always-on per-IP and global limiters that already guard the
+pre-auth endpoints. When an account exceeds the ceiling within
+`--per-user-rate-window-secs`, further requests get **HTTP 429 (Too Many Requests)**.
+Left at `0`, the per-account limiter is disabled and only the per-IP/global limiter
+applies (today's behavior).
+
+### Self-serve signup email verification
+
+With `--require-email-verification` on, a new non-admin `toku sync signup` account is
+created **unverified** and cannot obtain a session until it confirms its email. The
+server emails a one-time link (built from `--public-base-url`); the client — or the
+operator — completes it against:
+
+| Endpoint | Body | Purpose |
+|----------|------|---------|
+| `POST /api/v1/account/verify-email` | `{"token": "…"}` | Redeem the one-time token and mark the account verified. |
+| `POST /api/v1/account/resend-verification` | `{"email": "…"}` | Re-issue a verification email (velocity-capped per email). |
+
+The first admin account is **always** auto-verified so bootstrap never gets stuck, and
+tokens are opaque account metadata — no library data is involved. When SMTP is not
+configured (dev / self-host), the verification link is logged instead of mailed.
+
+### Per-account encrypted backup & restore
+
+Two admin-scoped endpoints let an operator back up and restore a single account's data
+**as ciphertext**:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/v1/admin/users/{id}/backup` | Export a JSON bundle of the account's ciphertext ops + snapshots and opaque library metadata. |
+| `POST /api/v1/admin/users/{id}/backup/restore` | Idempotently re-ingest a previously exported bundle under the same account. |
+
+Both require an **admin session** bearer token (there is no unauthenticated surface).
+The bundle contains **no plaintext and no key material** — only the same ciphertext and
+routing metadata the relay already holds — so it is safe to store off-box without
+widening the zero-knowledge boundary. Restore is idempotent: ops de-dupe by `op_id`,
+snapshots by their natural key, and libraries re-attach to the same owner, so re-running
+a restore is a no-op. This is a targeted per-account path and is distinct from the
+whole-database volume backup in [Data persistence](#data-persistence).
+
+> **Metadata exposure (ADR-014 D7).** Quotas and per-account backups operate on ciphertext
+> **sizes and counts** and the routing metadata already listed in
+> [Zero-knowledge guarantee](#zero-knowledge-guarantee) — never on content. No new plaintext
+> is read, stored, or exported by any managed-tier control.
 
 ## Data persistence
 

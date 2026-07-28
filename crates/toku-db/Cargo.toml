@@ -19,5 +19,13 @@ refinery = { version = "0.9", features = ["rusqlite"] }
 directories = "6"
 base64 = "0.22"
 
+[features]
+# Optional at-rest database encryption via SQLCipher (ADR-016). OFF by default.
+# Selecting this swaps rusqlite's bundled standard SQLite for a bundled
+# SQLCipher build with vendored OpenSSL (no system OpenSSL dependency). Scoped
+# to this crate only: the default workspace build, the toku-sync relay, and the
+# CI `apple` cross-compile stay on standard SQLite.
+sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+
 [dev-dependencies]
 tempfile = "3"

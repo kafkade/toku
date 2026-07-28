@@ -215,6 +215,82 @@ pub unsafe extern "C" fn toku_open(path: *const c_char, out: *mut *mut TokuDb) -
     }))
 }
 
+/// Open (or create) an **encrypted** Toku database at `path`, unlocking it with
+/// a raw 256-bit key.
+///
+/// `key` must point to exactly 32 bytes (the Argon2id-derived key; the caller
+/// derives it from the user's passphrase). On success, writes a handle to
+/// `*out`. The caller must eventually call `toku_close`. A wrong key fails
+/// cleanly with `TokuStatus::ErrorDb` (see `toku_last_error`), never a crash.
+///
+/// This function is only functional in builds compiled with the `sqlcipher`
+/// feature; otherwise it returns `TokuStatus::ErrorDb` with an explanatory
+/// message. `toku_open` is unaffected and continues to open plaintext databases.
+///
+/// # Safety
+/// - `path` must be a valid NUL-terminated UTF-8 string.
+/// - `key` must point to `key_len` readable bytes.
+/// - `out` must be a valid pointer to a `*mut TokuDb`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn toku_open_encrypted(
+    path: *const c_char,
+    key: *const u8,
+    key_len: usize,
+    out: *mut *mut TokuDb,
+) -> TokuStatus {
+    ffi_guard(AssertUnwindSafe(|| {
+        clear_last_error();
+
+        if out.is_null() {
+            set_last_error("out pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        if key.is_null() {
+            set_last_error("key pointer is null");
+            return TokuStatus::ErrorNullPointer;
+        }
+        if key_len != 32 {
+            set_last_error("key must be exactly 32 bytes");
+            return TokuStatus::ErrorDb;
+        }
+
+        let path_str = match unsafe { cstr_to_str(path) } {
+            Ok(s) => s,
+            Err(status) => return status,
+        };
+
+        let key_bytes = unsafe { std::slice::from_raw_parts(key, key_len) };
+
+        #[cfg(feature = "sqlcipher")]
+        {
+            let sync_key = match toku_core::SyncKey::from_exported_bytes(key_bytes) {
+                Ok(k) => k,
+                Err(e) => {
+                    set_last_error(&format!("invalid key: {e}"));
+                    return TokuStatus::ErrorDb;
+                }
+            };
+            let db = match Database::open_encrypted(Path::new(path_str), &sync_key) {
+                Ok(db) => db,
+                Err(e) => {
+                    set_last_error(&format!("failed to open encrypted database: {e}"));
+                    return TokuStatus::ErrorDb;
+                }
+            };
+            let handle = Box::new(TokuDb { db });
+            unsafe { *out = Box::into_raw(handle) };
+            TokuStatus::Ok
+        }
+
+        #[cfg(not(feature = "sqlcipher"))]
+        {
+            let _ = (path_str, key_bytes);
+            set_last_error("this build does not include sqlcipher support");
+            TokuStatus::ErrorDb
+        }
+    }))
+}
+
 /// Close a Toku database handle and free its resources.
 /// After this call, the handle must not be used. Passing null is a safe no-op.
 ///

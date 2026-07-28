@@ -184,7 +184,7 @@ fn build_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 }
 
 fn open_db(data_dir: &Path) -> anyhow::Result<Database> {
-    Database::open(&data_dir.join("toku.db")).context("failed to open database")
+    Database::open_default(&data_dir.join("toku.db")).context("failed to open database")
 }
 
 fn require_sync(config: &toku_core::TokuConfig) -> anyhow::Result<&toku_core::SyncConfig> {

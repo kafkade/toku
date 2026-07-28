@@ -40,7 +40,7 @@ pub fn current() -> SyncIndicator {
         };
     }
 
-    let conflicts = Database::open_no_migrate(&dir.join("toku.db"))
+    let conflicts = Database::open_no_migrate_default(&dir.join("toku.db"))
         .ok()
         .and_then(|db| SyncRepository::new(&db).count_unresolved_conflicts().ok())
         .unwrap_or(0)

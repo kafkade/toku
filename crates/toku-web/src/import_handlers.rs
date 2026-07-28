@@ -176,7 +176,7 @@ pub async fn upload_csv(
     let source_clone = source_kind.clone();
 
     let report = tokio::task::spawn_blocking(move || -> Result<ImportReport, WebError> {
-        let db = toku_db::Database::open_no_migrate(&db_path)?;
+        let db = toku_db::Database::open_no_migrate_default(&db_path)?;
         match &source_clone {
             ImportSourceKind::Goodreads => {
                 let opts = toku_import::GoodreadsImportOptions { dry_run: true };
@@ -258,7 +258,7 @@ pub async fn submit_calibre_path(
     let cal_path = canonical.clone();
 
     let report = tokio::task::spawn_blocking(move || -> Result<ImportReport, WebError> {
-        let db = toku_db::Database::open_no_migrate(&db_path)?;
+        let db = toku_db::Database::open_no_migrate_default(&db_path)?;
         let opts = toku_import::CalibreImportOptions {
             dry_run: true,
             import_covers,
@@ -545,7 +545,7 @@ fn run_import(
     sessions: ImportSessions,
     session_id: &str,
 ) -> Result<ImportReport, WebError> {
-    let db = toku_db::Database::open_no_migrate(db_path)?;
+    let db = toku_db::Database::open_no_migrate_default(db_path)?;
 
     match source {
         ImportSourceKind::Goodreads => {

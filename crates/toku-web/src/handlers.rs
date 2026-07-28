@@ -78,7 +78,7 @@ fn gather_stats(
     db_path: &std::path::Path,
     year: Option<i32>,
 ) -> Result<(toku_core::ReadingStats, Vec<i32>), WebError> {
-    let db = Database::open_no_migrate(db_path)?;
+    let db = Database::open_no_migrate_default(db_path)?;
     let repo = BookRepository::new(&db);
 
     let books = repo.list_books()?;

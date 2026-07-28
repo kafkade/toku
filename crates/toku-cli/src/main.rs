@@ -284,6 +284,12 @@ enum Commands {
         action: OpdsAction,
     },
 
+    /// Manage at-rest database encryption (SQLCipher; opt-in, off by default)
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
+
     /// Manage work grouping (link editions of the same creative work)
     Work {
         #[command(subcommand)]
@@ -741,6 +747,33 @@ enum ExportTarget {
 }
 
 #[derive(Clone, Subcommand)]
+enum DbAction {
+    /// Encrypt the local database in place (plaintext → SQLCipher). Prompts for
+    /// a new passphrase. A verified backup of the original is kept until the
+    /// encrypted database is confirmed. Idempotent.
+    Encrypt {
+        /// Proceed without the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Also cache the passphrase in the OS keychain for future unlocks.
+        #[arg(long)]
+        remember: bool,
+    },
+    /// Decrypt the local database in place (SQLCipher → plaintext). Prompts for
+    /// the current passphrase. A verified backup is kept until confirmed.
+    /// Idempotent.
+    Decrypt {
+        /// Proceed without the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show whether the local database is encrypted and the KDF parameters.
+    Status,
+    /// Remove any DB passphrase cached in the OS keychain for this library.
+    Forget,
+}
+
+#[derive(Clone, Subcommand)]
 enum SyncAction {
     /// [Deprecated] Set up sync with a per-library passphrase. Prefer `signup`/`login`.
     Init {
@@ -996,6 +1029,25 @@ fn main() -> Result<()> {
     // Resolve command (default: Browse = TUI)
     let command = cli.command.unwrap_or(Commands::Browse);
 
+    #[cfg(feature = "sqlcipher")]
+    {
+        // Encrypted-DB unlock: for any command that touches the database, resolve
+        // the key once and install it process-wide so every open site (the CLI
+        // dispatch below, the web server, the sync client) opens keyed. Commands
+        // that need no DB — or that manage their own keying (`db`) — are skipped.
+        let needs_unlock = !matches!(
+            &command,
+            Commands::Config { .. }
+                | Commands::Completions { .. }
+                | Commands::Account { .. }
+                | Commands::Db { .. }
+        );
+        if needs_unlock {
+            let config = toku_core::TokuConfig::load(&data_dir).unwrap_or_default();
+            unlock_db_if_encrypted(&data_dir, &config)?;
+        }
+    }
+
     // Commands that don't need the database
     match &command {
         Commands::Config { path, edit } => return cmd_config(&data_dir, *path, *edit),
@@ -1033,6 +1085,9 @@ fn main() -> Result<()> {
         Commands::Opds { action } => {
             return cmd_opds(&data_dir, action);
         }
+        Commands::Db { action } => {
+            return cmd_db(&data_dir, action);
+        }
         Commands::Sync { action } => {
             return cmd_sync(&data_dir, action.clone(), &cli.format);
         }
@@ -1043,7 +1098,7 @@ fn main() -> Result<()> {
     }
 
     let db_path = data_dir.join("toku.db");
-    let db = Database::open(&db_path)
+    let db = Database::open_default(&db_path)
         .with_context(|| format!("failed to open database at {}", db_path.display()))?;
     let repo = BookRepository::new(&db);
 
@@ -1138,6 +1193,7 @@ fn main() -> Result<()> {
         | Commands::Completions { .. }
         | Commands::Serve { .. }
         | Commands::Opds { .. }
+        | Commands::Db { .. }
         | Commands::Sync { .. }
         | Commands::Account { .. } => {
             unreachable!()
@@ -1183,6 +1239,320 @@ fn cmd_config(data_dir: &Path, show_path: bool, open_edit: bool) -> Result<()> {
     let config = TokuConfig::load(data_dir).context("failed to load config")?;
     let toml_str = toml::to_string_pretty(&config).context("failed to serialize config")?;
     println!("{toml_str}");
+    Ok(())
+}
+
+/// Environment variable that supplies the DB unlock passphrase non-interactively
+/// (automation escape hatch for at-rest DB encryption). Opt-in by nature.
+#[cfg(feature = "sqlcipher")]
+#[cfg(feature = "sqlcipher")]
+const DB_PASSPHRASE_ENV: &str = "TOKU_DB_PASSPHRASE";
+
+/// Decode the stored base64 Argon2id salt into a fixed 16-byte array.
+#[cfg(feature = "sqlcipher")]
+fn decode_db_salt(salt_b64: &str) -> Result<[u8; 16]> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(salt_b64)
+        .context("invalid encryption salt in config")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("encryption salt must be 16 bytes"))
+}
+
+/// Resolve the DB unlock key for an already-encrypted database and install it
+/// process-wide. No-op when encryption is disabled or already unlocked.
+///
+/// Passphrase precedence (both caching layers are opt-in, never default):
+/// `TOKU_DB_PASSPHRASE` env → OS keychain (if the user cached it) →
+/// interactive prompt (the baseline).
+#[cfg(feature = "sqlcipher")]
+fn unlock_db_if_encrypted(data_dir: &Path, config: &TokuConfig) -> Result<()> {
+    let Some(enc) = config.encryption.as_ref().filter(|e| e.enabled) else {
+        return Ok(());
+    };
+    if toku_db::process_db_key().is_some() {
+        return Ok(());
+    }
+    let salt = decode_db_salt(&enc.salt)?;
+
+    let derive = |pass: &str| -> Result<toku_core::SyncKey> {
+        toku_core::SyncKey::derive(pass, &salt).map_err(|e| anyhow::anyhow!("{e}"))
+    };
+    let install = |key: toku_core::SyncKey| {
+        let _ = toku_db::set_process_db_key(key);
+    };
+
+    // 1. Env var (opt-in automation escape hatch).
+    if let Ok(pass) = std::env::var(DB_PASSPHRASE_ENV)
+        && !pass.is_empty()
+    {
+        let key = derive(&pass)?;
+        if toku_core::verify_db_key(&key, &enc.verifier) {
+            install(key);
+            return Ok(());
+        }
+        anyhow::bail!("incorrect passphrase from {DB_PASSPHRASE_ENV}");
+    }
+
+    // 2. OS keychain (opt-in — present only if the user cached it).
+    let token_store = sync::token_store::TokenStore::new(data_dir);
+    if let Some(pass) = token_store.load_db_passphrase() {
+        let key = derive(&pass)?;
+        if toku_core::verify_db_key(&key, &enc.verifier) {
+            install(key);
+            return Ok(());
+        }
+        eprintln!("warning: cached keychain passphrase is no longer valid; prompting instead");
+    }
+
+    // 3. Interactive prompt (baseline). Up to three attempts.
+    for attempt in 1..=3 {
+        let pass = read_password_prompt("Database passphrase: ")?;
+        if !pass.is_empty() {
+            let key = derive(&pass)?;
+            if toku_core::verify_db_key(&key, &enc.verifier) {
+                install(key);
+                return Ok(());
+            }
+        }
+        if attempt < 3 {
+            eprintln!("Incorrect passphrase, try again.");
+        }
+    }
+    anyhow::bail!("incorrect passphrase")
+}
+
+/// Handle `toku db` — manage at-rest database encryption.
+fn cmd_db(data_dir: &Path, action: &DbAction) -> Result<()> {
+    #[cfg(feature = "sqlcipher")]
+    {
+        match action {
+            DbAction::Encrypt { yes, remember } => cmd_db_encrypt(data_dir, *yes, *remember),
+            DbAction::Decrypt { yes } => cmd_db_decrypt(data_dir, *yes),
+            DbAction::Status => cmd_db_status(data_dir),
+            DbAction::Forget => {
+                let token_store = sync::token_store::TokenStore::new(data_dir);
+                token_store.forget_db_passphrase()?;
+                eprintln!("✓ Removed any cached DB passphrase from the OS keychain.");
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(not(feature = "sqlcipher"))]
+    {
+        let _ = (data_dir, action);
+        anyhow::bail!(
+            "this `toku` was built without at-rest encryption support.\n\
+             Rebuild with the `sqlcipher` feature: `cargo install toku-cli --features sqlcipher`."
+        )
+    }
+}
+
+#[cfg(feature = "sqlcipher")]
+fn cmd_db_status(data_dir: &Path) -> Result<()> {
+    let config = TokuConfig::load(data_dir).context("failed to load config")?;
+    match config.encryption.as_ref().filter(|e| e.enabled) {
+        Some(enc) => {
+            println!("At-rest encryption: ENABLED (SQLCipher)");
+            println!(
+                "KDF: Argon2id (m={} KiB, t={}, p={})",
+                enc.m_cost, enc.t_cost, enc.p_cost
+            );
+            println!("Lost passphrase = unrecoverable. There is no backdoor.");
+        }
+        None => {
+            println!("At-rest encryption: DISABLED (plaintext database)");
+            println!("Enable it with `toku db encrypt`.");
+        }
+    }
+    Ok(())
+}
+
+/// Read and confirm a NEW DB passphrase (env override, else prompt twice).
+#[cfg(feature = "sqlcipher")]
+fn read_new_db_passphrase() -> Result<String> {
+    if let Ok(pass) = std::env::var(DB_PASSPHRASE_ENV) {
+        if pass.is_empty() {
+            anyhow::bail!("{DB_PASSPHRASE_ENV} is set but empty");
+        }
+        return Ok(pass);
+    }
+    let pass = read_password_prompt("New database passphrase: ")?;
+    if pass.is_empty() {
+        anyhow::bail!("database passphrase cannot be empty");
+    }
+    let confirm = read_password_prompt("Confirm database passphrase: ")?;
+    if pass != confirm {
+        anyhow::bail!("passphrases do not match");
+    }
+    Ok(pass)
+}
+
+#[cfg(feature = "sqlcipher")]
+fn cmd_db_encrypt(data_dir: &Path, yes: bool, remember: bool) -> Result<()> {
+    let mut config = TokuConfig::load(data_dir).context("failed to load config")?;
+
+    // Idempotent: already encrypted.
+    if config.encryption.as_ref().is_some_and(|e| e.enabled) {
+        eprintln!("Database is already encrypted. Nothing to do.");
+        return Ok(());
+    }
+
+    let db_path = data_dir.join("toku.db");
+    if !db_path.exists() {
+        anyhow::bail!("no database found at {}", db_path.display());
+    }
+
+    if !yes {
+        eprintln!(
+            "This will encrypt {} in place.\n\
+             WARNING: if you lose the passphrase, the data is UNRECOVERABLE — there is no backdoor.",
+            db_path.display()
+        );
+        eprint!("Continue? [y/N]: ");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("failed to read confirmation")?;
+        if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let passphrase = read_new_db_passphrase()?;
+    let salt = toku_core::SyncKey::generate_salt().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let key = toku_core::SyncKey::derive(&passphrase, &salt).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Export plaintext → encrypted into a temp file, then swap.
+    let tmp_path = data_dir.join("toku.db.encrypting");
+    let _ = std::fs::remove_file(&tmp_path);
+    toku_db::crypt_migrate::encrypt_to(&db_path, &tmp_path, &key)
+        .context("failed to encrypt database")?;
+
+    // Verify the encrypted copy opens with the key before touching the original.
+    toku_db::Database::open_no_migrate_encrypted(&tmp_path, &key)
+        .context("verification of encrypted database failed")?;
+
+    // Keep a verified backup of the original until the swap is confirmed.
+    let backup_path = data_dir.join("toku.db.plaintext.bak");
+    std::fs::rename(&db_path, &backup_path).context("failed to back up the original database")?;
+    if let Err(e) = std::fs::rename(&tmp_path, &db_path) {
+        // Roll back: restore the original.
+        let _ = std::fs::rename(&backup_path, &db_path);
+        return Err(anyhow::anyhow!("failed to install encrypted database: {e}"));
+    }
+
+    // Persist the [encryption] descriptor (salt + params + verifier only).
+    use base64::Engine as _;
+    let verifier = toku_core::make_db_verifier(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
+    config.encryption = Some(toku_core::EncryptionConfig {
+        enabled: true,
+        salt: base64::engine::general_purpose::STANDARD.encode(salt),
+        m_cost: toku_core::ARGON2_M_COST,
+        t_cost: toku_core::ARGON2_T_COST,
+        p_cost: toku_core::ARGON2_P_COST,
+        verifier,
+    });
+    config.save(data_dir).context("failed to save config")?;
+
+    if remember {
+        let token_store = sync::token_store::TokenStore::new(data_dir);
+        match token_store.store_db_passphrase(&passphrase) {
+            Ok(()) => eprintln!("✓ Cached passphrase in the OS keychain."),
+            Err(e) => eprintln!("warning: could not cache passphrase in keychain: {e}"),
+        }
+    }
+
+    eprintln!("✓ Database encrypted.");
+    eprintln!(
+        "  A plaintext backup remains at {}. Delete it once you've confirmed access:",
+        backup_path.display()
+    );
+    eprintln!("    rm {}", backup_path.display());
+    eprintln!("  Lost passphrase = unrecoverable. There is no backdoor.");
+    Ok(())
+}
+
+#[cfg(feature = "sqlcipher")]
+fn cmd_db_decrypt(data_dir: &Path, yes: bool) -> Result<()> {
+    let mut config = TokuConfig::load(data_dir).context("failed to load config")?;
+
+    // Idempotent: already plaintext.
+    let Some(enc) = config.encryption.clone().filter(|e| e.enabled) else {
+        eprintln!("Database is not encrypted. Nothing to do.");
+        return Ok(());
+    };
+
+    let db_path = data_dir.join("toku.db");
+    if !db_path.exists() {
+        anyhow::bail!("no database found at {}", db_path.display());
+    }
+
+    if !yes {
+        eprintln!(
+            "This will decrypt {} in place, leaving it as plaintext.",
+            db_path.display()
+        );
+        eprint!("Continue? [y/N]: ");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("failed to read confirmation")?;
+        if !matches!(input.trim(), "y" | "Y" | "yes" | "Yes") {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // Resolve the current passphrase and verify against the stored verifier.
+    // Precedence mirrors unlock: env var → OS keychain → interactive prompt.
+    let salt = decode_db_salt(&enc.salt)?;
+    let passphrase = if let Ok(pass) = std::env::var(DB_PASSPHRASE_ENV) {
+        if pass.is_empty() {
+            anyhow::bail!("{DB_PASSPHRASE_ENV} is set but empty");
+        }
+        pass
+    } else if let Some(pass) = sync::token_store::TokenStore::new(data_dir).load_db_passphrase() {
+        pass
+    } else {
+        read_password_prompt("Current database passphrase: ")?
+    };
+    let key = toku_core::SyncKey::derive(&passphrase, &salt).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !toku_core::verify_db_key(&key, &enc.verifier) {
+        anyhow::bail!("incorrect passphrase");
+    }
+
+    let tmp_path = data_dir.join("toku.db.decrypting");
+    let _ = std::fs::remove_file(&tmp_path);
+    toku_db::crypt_migrate::decrypt_to(&db_path, &tmp_path, &key)
+        .context("failed to decrypt database")?;
+
+    // Verify the plaintext copy opens before touching the original.
+    toku_db::Database::open_no_migrate(&tmp_path)
+        .context("verification of decrypted database failed")?;
+
+    let backup_path = data_dir.join("toku.db.encrypted.bak");
+    std::fs::rename(&db_path, &backup_path).context("failed to back up the encrypted database")?;
+    if let Err(e) = std::fs::rename(&tmp_path, &db_path) {
+        let _ = std::fs::rename(&backup_path, &db_path);
+        return Err(anyhow::anyhow!("failed to install plaintext database: {e}"));
+    }
+
+    // Clear the [encryption] descriptor and drop any cached passphrase.
+    config.encryption = None;
+    config.save(data_dir).context("failed to save config")?;
+    let token_store = sync::token_store::TokenStore::new(data_dir);
+    let _ = token_store.forget_db_passphrase();
+
+    eprintln!("✓ Database decrypted (now plaintext).");
+    eprintln!(
+        "  An encrypted backup remains at {}. Delete it once you've confirmed access:",
+        backup_path.display()
+    );
+    eprintln!("    rm {}", backup_path.display());
     Ok(())
 }
 
@@ -5258,7 +5628,7 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
 
         SyncAction::Purge { days } => {
             let db_path = data_dir.join("toku.db");
-            let db = Database::open(&db_path).context("failed to open database")?;
+            let db = Database::open_default(&db_path).context("failed to open database")?;
             let repo = toku_db::BookRepository::new(&db);
             let purged = repo.purge_tombstones(days)?;
             match output_format {
@@ -5436,7 +5806,7 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
             let token = require_token(&token_store, server)?;
 
             let db_path = data_dir.join("toku.db");
-            let db = Database::open(&db_path).context("failed to open database")?;
+            let db = Database::open_default(&db_path).context("failed to open database")?;
             let sync_repo = toku_db::SyncRepository::new(&db);
             let snapshot_repo = toku_db::SnapshotRepository::new(&db);
             let client = sync::client::SyncClient::new(server)?;

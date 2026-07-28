@@ -14,4 +14,7 @@ pub enum DbError {
 
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
+
+    #[error("encryption error: {0}")]
+    Encryption(String),
 }

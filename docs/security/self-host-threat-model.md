@@ -50,17 +50,27 @@ multi-user mode, user ↔ admin and user ↔ user.
 ### Local device at rest (single-device / offline)
 
 The network model above concerns hosted sync. For the **default single-device, offline** use,
-the relevant adversary is **offline theft of the device or disk**. Today the local `toku.db`
+the relevant adversary is **offline theft of the device or disk**. By default the local `toku.db`
 is **plaintext at rest** — `toku-db` links standard SQLite, so confidentiality depends entirely
-on **OS full-disk encryption**. This is a known gap tracked in #204.
+on **OS full-disk encryption**.
 
-[ADR-016](../adr/016-at-rest-encryption.md) designs the mitigation: **optional, off-by-default**
-at-rest DB encryption (SQLCipher, feature-gated on `toku-db`), keyed by a dedicated passphrase
-through Argon2id — independent of sync. When enabled, an offline attacker who takes the disk sees
-only ciphertext; the disabled default path is byte-for-byte unchanged. The heavyweight SQLCipher
-dependency is **deferred to a follow-up implementation**; ADR-016 is the design gate.
+[ADR-016](../adr/016-at-rest-encryption.md) designed the mitigation and it now **ships**
+(issue #225): **optional, off-by-default** at-rest DB encryption (SQLCipher, behind the `toku-db`
+`sqlcipher` cargo feature), keyed by a dedicated passphrase through Argon2id (m=64 MiB, t=3, p=1)
+— independent of sync. Enable it on an existing library with `toku db encrypt`; check state with
+`toku db status`; revert with `toku db decrypt`. When enabled, an offline attacker who takes the
+disk sees only ciphertext. The disabled default path is byte-for-byte unchanged, and builds
+compiled without the `sqlcipher` feature behave exactly as before.
 
-Shipping now (from ADR-016 Decision C): **offline-only users can encrypt backups.**
+Key handling: the passphrase and derived key are **never persisted** — only the Argon2id salt,
+KDF parameters, and a verifier live in `config.toml`'s `[encryption]` section. Across short-lived
+CLI processes the key is resolved by (in order) the opt-in `TOKU_DB_PASSPHRASE` environment
+variable, an opt-in OS-keychain cache (`toku db encrypt --remember`), or an interactive prompt
+(the baseline). The env var is the weakest option — it can leak via `ps`, shell history, and CI
+logs — so prefer the prompt or the keychain. **A lost passphrase makes the database
+unrecoverable: there is no backdoor** (see [`recovery.md`](../recovery.md)).
+
+Shipping alongside (from ADR-016 Decision C): **offline-only users can encrypt backups.**
 `toku export backup --encrypt` without a sync account derives a key from a passphrase (Argon2id)
 and seals the archive with AES-256-GCM; the KDF salt/params travel **inside** the archive so it
 restores on any machine with only the passphrase (see [`recovery.md`](../recovery.md)). This does
@@ -213,9 +223,10 @@ for release are listed in [§9](#9-residual-risks-accepted).
 - Deployment must still provide TLS, 0600 DB perms, at-rest encryption, and NTP (F11); these are
   operator responsibilities documented in `sync-server.md`.
 - The local `toku.db` is plaintext at rest by default; single-device confidentiality relies on OS
-  full-disk encryption. Optional at-rest DB encryption is designed in
-  [ADR-016](../adr/016-at-rest-encryption.md) (opt-in, off by default) with the SQLCipher
-  implementation deferred; offline passphrase-encrypted backups ship now (#204).
+  full-disk encryption. Optional at-rest DB encryption
+  ([ADR-016](../adr/016-at-rest-encryption.md), opt-in, off by default) now ships (#225) behind the
+  `toku-db` `sqlcipher` feature — enable it with `toku db encrypt`. Offline passphrase-encrypted
+  backups also ship (#204). A lost DB passphrase is unrecoverable by design (no backdoor).
 
 ## 10. Sign-off
 

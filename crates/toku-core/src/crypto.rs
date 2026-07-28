@@ -274,6 +274,73 @@ pub fn decrypt_fields(
 }
 
 // ---------------------------------------------------------------------------
+// At-rest DB key verifier
+// ---------------------------------------------------------------------------
+
+/// Constant plaintext sealed to build an at-rest DB key verifier.
+const DB_VERIFIER_PLAINTEXT: &[u8] = b"toku-db-key-verifier-v1";
+
+/// Fixed domain-separator AAD for the DB key verifier.
+const DB_VERIFIER_AAD: &str = "kind=db-verifier,v=1";
+
+/// Build a verifier token that proves knowledge of the derived at-rest DB key
+/// **without** persisting the key or the passphrase.
+///
+/// The token is `base64(nonce || AES-256-GCM(key, DB_VERIFIER_PLAINTEXT))`.
+/// It is stored in `config.toml` under `[encryption]` so a wrong passphrase is
+/// rejected *before* the encrypted database is ever opened, and so the config
+/// can confirm it matches the key that unlocks the DB.
+pub fn make_db_verifier(key: &SyncKey) -> Result<String, TokuError> {
+    let cipher = Aes256Gcm::new_from_slice(key.as_bytes())
+        .map_err(|e| TokuError::Crypto(format!("cipher init: {e}")))?;
+
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::fill(&mut nonce_bytes)
+        .map_err(|e| TokuError::Crypto(format!("os rng failed for nonce: {e}")))?;
+    let nonce = Nonce::from(nonce_bytes);
+
+    let payload = Payload {
+        msg: DB_VERIFIER_PLAINTEXT,
+        aad: DB_VERIFIER_AAD.as_bytes(),
+    };
+    let ciphertext = cipher
+        .encrypt(&nonce, payload)
+        .map_err(|e| TokuError::Crypto(format!("verifier seal failed: {e}")))?;
+
+    let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(BASE64_STANDARD.encode(out))
+}
+
+/// True when `key` unseals the stored `verifier` token, i.e. the passphrase the
+/// key was derived from matches the one that created the verifier. Never panics;
+/// any malformed token or wrong key returns `false`.
+pub fn verify_db_key(key: &SyncKey, verifier: &str) -> bool {
+    let Ok(raw) = BASE64_STANDARD.decode(verifier) else {
+        return false;
+    };
+    if raw.len() < 12 {
+        return false;
+    }
+    let (nonce_bytes, ciphertext) = raw.split_at(12);
+    let Ok(nonce) = Nonce::try_from(nonce_bytes) else {
+        return false;
+    };
+    let Ok(cipher) = Aes256Gcm::new_from_slice(key.as_bytes()) else {
+        return false;
+    };
+    let payload = Payload {
+        msg: ciphertext,
+        aad: DB_VERIFIER_AAD.as_bytes(),
+    };
+    match cipher.decrypt(&nonce, payload) {
+        Ok(pt) => pt == DB_VERIFIER_PLAINTEXT,
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot encryption
 // ---------------------------------------------------------------------------
 
@@ -439,6 +506,42 @@ mod tests {
         let salt1 = SyncKey::generate_salt().unwrap();
         let salt2 = SyncKey::generate_salt().unwrap();
         assert_ne!(salt1, salt2, "two salts should not be equal");
+    }
+
+    // --- DB key verifier ---
+
+    #[test]
+    fn db_verifier_accepts_matching_key() {
+        let (key, _) = test_key_and_salt();
+        let verifier = make_db_verifier(&key).unwrap();
+        assert!(verify_db_key(&key, &verifier));
+    }
+
+    #[test]
+    fn db_verifier_rejects_wrong_key() {
+        let salt: [u8; 16] = [7; 16];
+        let key = SyncKey::derive("correct-passphrase", &salt).unwrap();
+        let wrong = SyncKey::derive("wrong-passphrase", &salt).unwrap();
+        let verifier = make_db_verifier(&key).unwrap();
+        assert!(!verify_db_key(&wrong, &verifier));
+    }
+
+    #[test]
+    fn db_verifier_rejects_malformed_token() {
+        let (key, _) = test_key_and_salt();
+        assert!(!verify_db_key(&key, ""));
+        assert!(!verify_db_key(&key, "not-base64!!!"));
+        assert!(!verify_db_key(&key, "c2hvcnQ=")); // "short" — < 12 bytes
+    }
+
+    #[test]
+    fn db_verifier_uses_random_nonce() {
+        let (key, _) = test_key_and_salt();
+        let a = make_db_verifier(&key).unwrap();
+        let b = make_db_verifier(&key).unwrap();
+        assert_ne!(a, b, "random nonce ⇒ distinct tokens");
+        assert!(verify_db_key(&key, &a));
+        assert!(verify_db_key(&key, &b));
     }
 
     #[test]

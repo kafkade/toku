@@ -10,6 +10,11 @@ repository.workspace = true
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+# Passthrough: enable at-rest DB encryption support (ADR-016). OFF by default.
+# Kept OFF in the CI `apple` cross-compile to avoid the OpenSSL build hazard.
+sqlcipher = ["toku-db/sqlcipher"]
+
 [dependencies]
 toku-core.workspace = true
 toku-db.workspace = true

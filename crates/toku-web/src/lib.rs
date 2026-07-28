@@ -224,7 +224,7 @@ pub async fn serve_on_with(
     secure_cookies: bool,
 ) -> Result<(), WebError> {
     // Run migrations once at startup
-    toku_db::Database::open(&db_path)
+    toku_db::Database::open_default(&db_path)
         .map_err(|e| WebError::Internal(format!("failed to open database: {e}")))?;
 
     // Create temp directory for uploads

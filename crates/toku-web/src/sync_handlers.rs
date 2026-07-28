@@ -61,8 +61,8 @@ pub async fn sync_page(State(state): State<AppState>) -> Result<Html<String>, We
             return Ok(SyncOverview::unconfigured());
         };
 
-        let db =
-            Database::open_no_migrate(&db_path).map_err(|e| WebError::Internal(e.to_string()))?;
+        let db = Database::open_no_migrate_default(&db_path)
+            .map_err(|e| WebError::Internal(e.to_string()))?;
         let repo = SyncRepository::new(&db);
 
         let pending_ops = repo

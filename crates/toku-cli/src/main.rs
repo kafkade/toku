@@ -4949,16 +4949,18 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
 
     /// Helper: get sync config or error with a helpful message.
     fn require_sync(config: &toku_core::TokuConfig) -> Result<&toku_core::SyncConfig> {
-        config
-            .sync
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("sync is not configured. Run `toku sync init` first."))
+        config.sync.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "sync is not configured. Run `toku sync signup` (new account) or \
+                 `toku sync enroll` (existing account) first."
+            )
+        })
     }
 
     /// Helper: get auth token for the configured server.
     fn require_token(token_store: &sync::token_store::TokenStore, server: &str) -> Result<String> {
         token_store.load(server)?.ok_or_else(|| {
-            anyhow::anyhow!("no auth token found for {server}. Run `toku sync init` first.")
+            anyhow::anyhow!("no auth token found for {server}. Run `toku sync login` first.")
         })
     }
 
@@ -5620,7 +5622,9 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
                 }
                 _ => {
                     eprintln!("Sync disabled. Local data preserved.");
-                    eprintln!("  Run `toku sync init` to re-enable.");
+                    eprintln!(
+                        "  Run `toku sync enroll` to re-enable (or `toku sync signup` for a new account)."
+                    );
                 }
             }
             Ok(())
@@ -5812,7 +5816,9 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
             let client = sync::client::SyncClient::new(server)?;
 
             let device = sync_repo.get_device()?.ok_or_else(|| {
-                anyhow::anyhow!("no device identity found. Run `toku sync init` first.")
+                anyhow::anyhow!(
+                    "no device identity found. Run `toku sync signup` or `toku sync enroll` first."
+                )
             })?;
             let mut clock = toku_core::HybridClock::new(&device.device_id);
             let hlc_str = clock.now().to_canonical();
@@ -5822,7 +5828,8 @@ fn cmd_sync(data_dir: &Path, action: SyncAction, output_format: &OutputFormat) -
             let key_bytes = token_store.load_sync_key(server)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "hosted sync requires client-side encryption but no key is configured.\n\
-                     Run `toku sync init --passphrase` to enroll this device with encryption."
+                     Run `toku sync login` to unlock your library key with your password and \
+                     Secret Key, or `toku sync enroll` to enroll this device into your account."
                 )
             })?;
             let key = toku_core::SyncKey::from_exported_bytes(&key_bytes)

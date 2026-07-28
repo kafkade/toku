@@ -72,7 +72,7 @@ Cargo workspace with 12 crates:
 
 ## CI / Infrastructure Dependency
 
-**Branch protection for this repo is managed via Terraform in `kafkade/github-infra` (`repo_toku.tf`).** The `required_status_checks` list must match the job names in `.github/workflows/ci.yml`. If you rename, add, or remove CI jobs that are used as merge gates (currently `Validate`), the corresponding IaC config must be updated or PRs will be permanently blocked. Always flag this when proposing workflow changes.
+**Branch protection for this repo is managed via Terraform in `kafkade/github-infra` (`repo_toku.tf`).** The `required_status_checks` list must match the job names in `.github/workflows/validate.yml`. If you rename, add, or remove CI jobs that are used as merge gates (currently `Validate`), the corresponding IaC config must be updated or PRs will be permanently blocked. Always flag this when proposing workflow changes.
 
 ## Releasing
 

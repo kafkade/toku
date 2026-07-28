@@ -188,16 +188,18 @@ fn open_db(data_dir: &Path) -> anyhow::Result<Database> {
 }
 
 fn require_sync(config: &toku_core::TokuConfig) -> anyhow::Result<&toku_core::SyncConfig> {
-    config
-        .sync
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("sync is not configured. Run sync init first."))
+    config.sync.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "sync is not configured. Run `toku sync signup` (new account) or \
+             `toku sync enroll` (existing account) first."
+        )
+    })
 }
 
 fn require_token(token_store: &TokenStore, server: &str) -> anyhow::Result<String> {
-    token_store
-        .load(server)?
-        .ok_or_else(|| anyhow::anyhow!("no auth token found for {server}. Run sync init first."))
+    token_store.load(server)?.ok_or_else(|| {
+        anyhow::anyhow!("no auth token found for {server}. Run `toku sync login` first.")
+    })
 }
 
 /// Load the client-side encryption key when encryption is enabled for this
@@ -407,7 +409,8 @@ pub fn init(
             // actionable error instead of registering an unusable device.
             Err(anyhow::anyhow!(
                 "hosted sync requires client-side encryption: a passphrase is mandatory.\n\
-                 Re-run with `toku sync init --passphrase` (you will be prompted securely).\n\
+                 Run `toku sync signup` (new account) or `toku sync enroll` (existing account) \
+                 to set up encryption.\n\
                  Local-only, single-device usage needs no sync and no passphrase."
             ))
         }
@@ -444,7 +447,8 @@ pub fn push(data_dir: &Path) -> anyhow::Result<PushOutcome> {
     let key = load_encryption_key(&token_store, server, sync_config)?.ok_or_else(|| {
         anyhow::anyhow!(
             "hosted sync requires client-side encryption but no key is configured.\n\
-             Re-run `toku sync init --passphrase` to enroll this device with encryption."
+             Run `toku sync login` to unlock your library key with your password and Secret Key, \
+             or `toku sync enroll` to enroll this device into your account."
         )
     })?;
     let wire_ops: Vec<WireOp> = unpushed
@@ -593,7 +597,8 @@ pub fn bootstrap(data_dir: &Path, reset_cursor: bool) -> anyhow::Result<Bootstra
         let key = load_encryption_key(&token_store, server, sync_config)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "downloaded an encrypted snapshot but no key is configured.\n\
-                 Re-run `toku sync init --passphrase` to enroll this device with encryption."
+                 Run `toku sync login` to unlock your library key with your password and \
+                 Secret Key, or `toku sync enroll` to enroll this device into your account."
             )
         })?;
         let envelope: toku_core::EncryptedEnvelope = serde_json::from_str(&snap.snapshot_json)

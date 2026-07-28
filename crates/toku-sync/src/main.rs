@@ -1,8 +1,12 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use clap::Parser;
 
-use toku_sync::build_router;
 use toku_sync::config::Config;
 use toku_sync::db::SyncDatabase;
+use toku_sync::mailer::{LoggingMailer, Mailer, SmtpMailer};
+use toku_sync::{ManagedRuntime, build_router_with};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,11 +21,17 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(&config.log_level);
     let db_path = config.db_path();
 
-    // Run migrations once at startup
-    SyncDatabase::open(&db_path)
+    // Run migrations once at startup, then project the managed-tier operator
+    // knobs into `instance_config` so the DB-driven enforcement paths (quotas,
+    // email verification) observe this process's configuration.
+    let db = SyncDatabase::open(&db_path)
         .map_err(|e| anyhow::anyhow!("failed to initialize database: {e}"))?;
+    seed_instance_config(&db, &config)
+        .map_err(|e| anyhow::anyhow!("failed to apply managed config: {e}"))?;
+    drop(db);
 
-    let app = build_router(db_path);
+    let managed = build_managed_runtime(&config)?;
+    let app = build_router_with(db_path, managed);
     let addr = config.bind_addr();
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -38,6 +48,59 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// Project the managed-tier operator knobs from [`Config`] into the singleton
+/// `instance_config` row. These are deployment-level settings, so config is the
+/// source of truth on every boot. Admin-managed flags (e.g. `registration_open`)
+/// are intentionally left untouched.
+fn seed_instance_config(db: &SyncDatabase, config: &Config) -> anyhow::Result<()> {
+    db.conn.execute(
+        "UPDATE instance_config
+         SET require_email_verification = ?1,
+             default_max_user_bytes = ?2,
+             default_max_user_ops = ?3,
+             updated_at = datetime('now')
+         WHERE id = 1",
+        rusqlite::params![
+            i64::from(config.require_email_verification),
+            config.default_max_user_bytes,
+            config.default_max_user_ops,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Assemble the [`ManagedRuntime`] from config. Defaults reproduce the
+/// self-hosted relay (logging mailer, disabled per-user limiter). Fails fast if
+/// email verification is required without a way to deliver the link.
+fn build_managed_runtime(config: &Config) -> anyhow::Result<ManagedRuntime> {
+    let mailer: Arc<dyn Mailer> = match (&config.smtp_url, &config.smtp_from) {
+        (Some(url), Some(from)) => Arc::new(
+            SmtpMailer::from_config(url, from)
+                .map_err(|e| anyhow::anyhow!("failed to configure SMTP mailer: {e}"))?,
+        ),
+        (None, None) => Arc::new(LoggingMailer),
+        _ => {
+            anyhow::bail!("--smtp-url and --smtp-from must be set together");
+        }
+    };
+
+    if config.require_email_verification
+        && (config.smtp_url.is_none() || config.public_base_url.is_none())
+    {
+        anyhow::bail!(
+            "--require-email-verification needs --smtp-url, --smtp-from, and --public-base-url so \
+             verification links can be delivered"
+        );
+    }
+
+    Ok(ManagedRuntime::new(
+        mailer,
+        config.public_base_url.clone(),
+        config.per_user_rate_max,
+        Duration::from_secs(config.per_user_rate_window_secs),
+    ))
 }
 
 /// Initialise the tracing subscriber. `RUST_LOG` takes precedence; otherwise the
@@ -102,6 +165,7 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use toku_sync::build_router;
     use tower::ServiceExt;
 
     fn test_db_path() -> PathBuf {

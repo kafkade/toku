@@ -220,6 +220,11 @@ pub struct SignupResponse {
     /// Relay devices adopted under this account during first-admin bootstrap.
     #[serde(default)]
     pub adopted_devices: i64,
+    /// `true` when the instance requires email verification (ADR-014 D4) and this
+    /// account must confirm its address before it can log in. `false` for the
+    /// default self-hosted relay, which never gates on verification.
+    #[serde(default)]
+    pub email_verification_required: bool,
 }
 
 /// `POST /api/v1/account/challenge` — start a user SRP login.
@@ -391,4 +396,85 @@ pub struct AccountKeysResponse {
     pub wrapped_private_key: String,
     /// JSON-serialized `toku_core::WrappedDataKey`.
     pub wrapped_data_key: String,
+}
+
+// ── Signup email verification (issue #206, ADR-014 D4) ───────────────────────
+
+/// `POST /api/v1/account/verify-email` — confirm control of a signup email.
+#[derive(Debug, Deserialize)]
+pub struct VerifyEmailRequest {
+    /// The opaque one-time token delivered by email.
+    pub token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyEmailResponse {
+    pub verified: bool,
+}
+
+/// `POST /api/v1/account/resend-verification` — re-issue a verification email.
+#[derive(Debug, Deserialize)]
+pub struct ResendVerificationRequest {
+    pub email: String,
+}
+
+// ── Per-user encrypted backup (issue #206, ADR-014 D6) ───────────────────────
+
+/// Opaque library metadata carried in a per-user backup. No plaintext content.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BackupLibrary {
+    pub id: String,
+    pub salt: Option<String>,
+    pub created_at: String,
+}
+
+/// A single stored op in a per-user backup. `payload` is the verbatim stored
+/// ciphertext envelope string (or `"null"`); every other field is opaque
+/// metadata the relay already holds in the clear.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BackupOp {
+    pub op_id: String,
+    pub library_id: String,
+    pub device_id: String,
+    pub hlc: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub op_type: String,
+    pub payload: String,
+    pub received_at: String,
+}
+
+/// A single stored snapshot in a per-user backup. `snapshot_json` is verbatim
+/// ciphertext.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BackupSnapshot {
+    pub library_id: String,
+    pub snapshot_json: String,
+    pub hlc_at_snapshot: String,
+    pub created_by_device: String,
+    pub created_at: String,
+}
+
+/// A per-account encrypted backup bundle (ADR-014 D6): ciphertext ops +
+/// snapshots plus opaque library metadata, scoped by ownership. Contains **no**
+/// plaintext user content and **no** key material — the zero-knowledge boundary
+/// is preserved end-to-end, including in the backup.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserBackupBundle {
+    /// Bundle format version.
+    pub version: u32,
+    pub user_id: String,
+    pub email: String,
+    pub exported_at: String,
+    pub libraries: Vec<BackupLibrary>,
+    pub ops: Vec<BackupOp>,
+    pub snapshots: Vec<BackupSnapshot>,
+}
+
+/// Response to `POST /api/v1/admin/users/{id}/backup/restore`.
+#[derive(Debug, Serialize)]
+pub struct RestoreBackupResponse {
+    pub libraries_restored: usize,
+    pub ops_restored: usize,
+    pub snapshots_restored: usize,
 }

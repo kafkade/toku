@@ -226,3 +226,97 @@ pub async fn rate_limit(
     }
     Ok(next.run(req).await)
 }
+
+// ── Per-authenticated-user rate limiting (issue #206, ADR-014 D3) ─────────────
+
+/// A fixed-window limiter keyed by an arbitrary string identity (the resolved
+/// `user_id`), layered *above* the per-IP [`RateLimiter`]. Per-IP limiting is
+/// insufficient at scale — many users share an IP (NAT, mobile carriers) and one
+/// abusive account behind rotating IPs evades an IP bucket entirely — so the
+/// managed tier keys a second window on the authenticated user.
+///
+/// A `max` of `0` disables the limiter entirely, which is the self-hosted
+/// default: the per-IP + global limiter remains as defense-in-depth.
+pub struct UserRateLimiter {
+    inner: Mutex<KeyedWindow>,
+    per_key_max: u32,
+    window: Duration,
+}
+
+struct KeyedWindow {
+    started: Instant,
+    per_key: HashMap<String, u32>,
+}
+
+impl UserRateLimiter {
+    /// Create a per-user limiter. `per_key_max == 0` means "disabled".
+    pub fn new(per_key_max: u32, window: Duration) -> Self {
+        Self {
+            inner: Mutex::new(KeyedWindow {
+                started: Instant::now(),
+                per_key: HashMap::new(),
+            }),
+            per_key_max,
+            window,
+        }
+    }
+
+    /// True when this limiter enforces anything at all.
+    pub fn enabled(&self) -> bool {
+        self.per_key_max > 0
+    }
+
+    /// Record a request from identity `key`. Returns `Some(retry_after_secs)`
+    /// when the request should be rejected, or `None` when it is allowed. A
+    /// disabled limiter always allows.
+    pub fn check(&self, key: &str) -> Option<u64> {
+        if self.per_key_max == 0 {
+            return None;
+        }
+        let mut w = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if w.started.elapsed() >= self.window {
+            w.started = Instant::now();
+            w.per_key.clear();
+        }
+        let retry_after = self.window.saturating_sub(w.started.elapsed()).as_secs() + 1;
+
+        let entry = w.per_key.entry(key.to_string()).or_insert(0);
+        if *entry >= self.per_key_max {
+            return Some(retry_after);
+        }
+        *entry += 1;
+        None
+    }
+}
+
+/// Axum middleware enforcing [`UserRateLimiter`]. Runs *after* the auth
+/// middleware (so [`crate::auth::AuthDevice`] / [`crate::auth::AuthUser`] are in
+/// the request extensions) and keys its window on the resolved `user_id`.
+/// Requests without a resolved owning user (legacy unowned relay devices) are
+/// not per-user limited — they still pass through the per-IP limiter.
+pub async fn user_rate_limit(
+    limiter: Arc<UserRateLimiter>,
+    req: Request,
+    next: Next,
+) -> Result<Response, SyncError> {
+    if limiter.enabled()
+        && let Some(user_id) = resolved_user_id(&req)
+        && let Some(retry_after) = limiter.check(&user_id)
+    {
+        return Err(SyncError::RateLimited {
+            retry_after: format!("{retry_after}s"),
+        });
+    }
+    Ok(next.run(req).await)
+}
+
+/// Extract the resolved owning `user_id` from request extensions, from either an
+/// authenticated user session or an authenticated device that belongs to a user.
+fn resolved_user_id(req: &Request) -> Option<String> {
+    if let Some(user) = req.extensions().get::<crate::auth::AuthUser>() {
+        return Some(user.user_id.clone());
+    }
+    req.extensions()
+        .get::<crate::auth::AuthDevice>()
+        .and_then(|d| d.user_id.clone())
+}

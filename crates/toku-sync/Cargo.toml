@@ -17,6 +17,10 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 chrono.workspace = true
+# SMTP delivery for account email verification (#206). Optional at runtime: the
+# server logs the verification link when no SMTP relay is configured. rustls TLS
+# avoids a system OpenSSL build dependency in CI.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls-tls", "pool"] }
 hex = "0.4"
 rand = "0.10"
 rusqlite.workspace = true
@@ -42,6 +46,7 @@ base64 = "0.22"
 hex = "0.4"
 rand = "0.10"
 reqwest = { workspace = true, features = ["json", "blocking"] }
+rusqlite.workspace = true
 sha2.workspace = true
 srp = { version = "=0.7.0-rc.3", features = ["getrandom"] }
 tower = "0.5"

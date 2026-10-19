@@ -24,7 +24,7 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 hex = "0.4"
 rand = "0.10"
 rusqlite.workspace = true
-refinery = { version = "0.9", features = ["rusqlite"] }
+refinery = { version = "0.10", features = ["rusqlite"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
